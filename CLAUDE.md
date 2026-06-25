@@ -53,6 +53,9 @@ tests/         # Unit & integration tests
 
 **Benchmark (Phase 2)**: `python -m src.eval.benchmark --games 500`
 
+**Play vs the AI**: `python -m src.eval.play` (matplotlib window; you are RED, the trained
+agent is BLUE; type a move number, click "Next turn" to let the AI play)
+
 **Lint**: `flake8 src/ tests/`
 
 ## Code Quality

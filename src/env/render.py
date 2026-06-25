@@ -94,7 +94,7 @@ def _player_hand_lines(state, color):
     return f"{color.value}: VP={vps}  DevCards={dev_cards}  " + " ".join(parts)
 
 
-def render_board(game, ax=None, title=None):
+def render_board(game, ax=None, title=None, label_nodes=False, show_info=True):
     """Draw the current board state of a ``catanatron.game.Game``.
 
     Args:
@@ -102,6 +102,10 @@ def render_board(game, ax=None, title=None):
         ax: optional matplotlib Axes to draw into (cleared first). Creates a
             new figure/axes if omitted.
         title: optional title override (defaults to turn/player info).
+        label_nodes: if True, draw each node's id on the board (so a textual
+            action like ``BUILD_ROAD edge (12,13)`` can be located visually).
+        show_info: if True, draw the built-in dice/hands info panel. Set False
+            when the caller renders its own (e.g. a god-mode panel).
 
     Returns:
         The matplotlib Axes drawn into.
@@ -179,16 +183,27 @@ def render_board(game, ax=None, title=None):
                 )
             )
 
-    dice = _last_dice_roll(state)
-    dice_text = f"Dice: {dice[0]} + {dice[1]} = {sum(dice)}" if dice else "Dice: --"
-    hand_lines = [_player_hand_lines(state, c) for c in state.colors]
-    info_text = dice_text + "\n" + "\n".join(hand_lines)
-    ax.text(
-        0.0, 1.0, info_text,
-        transform=ax.transAxes, ha="left", va="top", fontsize=9,
-        family="monospace",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
-    )
+    if label_nodes:
+        for node_id, (x, y) in node_pos.items():
+            ax.text(
+                x, y, str(node_id),
+                ha="center", va="center", fontsize=6, color="black",
+                zorder=7,
+                bbox=dict(boxstyle="round,pad=0.05", facecolor="white",
+                          edgecolor="none", alpha=0.6),
+            )
+
+    if show_info:
+        dice = _last_dice_roll(state)
+        dice_text = f"Dice: {dice[0]} + {dice[1]} = {sum(dice)}" if dice else "Dice: --"
+        hand_lines = [_player_hand_lines(state, c) for c in state.colors]
+        info_text = dice_text + "\n" + "\n".join(hand_lines)
+        ax.text(
+            0.0, 1.0, info_text,
+            transform=ax.transAxes, ha="left", va="top", fontsize=9,
+            family="monospace",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+        )
 
     if title is None:
         current_color = state.colors[state.current_turn_index]
