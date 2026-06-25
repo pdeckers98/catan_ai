@@ -16,12 +16,21 @@ Two things happen here:
    that sequences multiple discarders after the first one discards hardcodes ``> 7``
    (state.py:489). With a non-7 limit that wrongly forces a player holding 8-9 cards
    to discard. We recompute that transition correctly using ``state.discard_limit``.
+
+3. **Smart (non-random) discard.** Stock Catanatron has a single ``(DISCARD, None)``
+   action and then discards a *random* half of the hand. We instead drop from the
+   player's largest stacks (surplus) first, so a bot never throws away scarce cards.
+   This keeps the action space (and the trained model) unchanged: the policy still
+   just emits "DISCARD"; we pick *which* cards. A caller that supplies an explicit
+   ``DISCARD`` value (e.g. a human choosing cards) bypasses this untouched.
 """
 
 import catanatron.game as _game_mod
 import catanatron.state as _state_mod
-from catanatron.state import generate_playable_actions, player_num_resource_cards
-from catanatron.models.enums import ActionType, ActionPrompt
+from catanatron.state import (
+    generate_playable_actions, player_num_resource_cards, player_key,
+)
+from catanatron.models.enums import Action, ActionType, ActionPrompt, RESOURCES
 
 DISCARD_LIMIT = 9
 
@@ -66,6 +75,9 @@ def _patch_discard_recheck() -> None:
     orig_apply = _state_mod.apply_action
 
     def patched_apply(state, action):
+        # Turn a random "DISCARD None" into a chosen-cards discard before applying.
+        if action.action_type == ActionType.DISCARD and action.value is None:
+            action = _smart_discard_action(state, action)
         result = orig_apply(state, action)
         if action.action_type == ActionType.DISCARD:
             _fix_discard_transition(state, action)
@@ -73,6 +85,23 @@ def _patch_discard_recheck() -> None:
 
     _state_mod.apply_action = patched_apply
     _game_mod.apply_action = patched_apply
+
+
+def _smart_discard_action(state, action):
+    """Pick cards to discard: drop from the largest stacks (surplus) first.
+
+    Returns a DISCARD action with an explicit list, so the engine discards those
+    exact cards instead of a random half.
+    """
+    key = player_key(state, action.color)
+    counts = {r: state.player_state[f"{key}_{r}_IN_HAND"] for r in RESOURCES}
+    num_to_discard = sum(counts.values()) // 2
+    discarded = []
+    for _ in range(num_to_discard):
+        resource = max(RESOURCES, key=lambda r: (counts[r], -RESOURCES.index(r)))
+        counts[resource] -= 1
+        discarded.append(resource)
+    return Action(action.color, ActionType.DISCARD, tuple(discarded))
 
 
 def _fix_discard_transition(state, action) -> None:
