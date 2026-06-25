@@ -1,7 +1,7 @@
 # Phase 2 — Build the AI (deep RL)
 
 **Goal:** train a strong 1v1 agent that beats the built-in bots, then push further with self-play.
-**Status:** ⏳ not started (Phase 1 complete).
+**Status:** ⏳ in progress — self-play infrastructure + MaskablePPO baseline built.
 
 ## Why action masking is non-negotiable
 
@@ -9,19 +9,30 @@ The action space is `Discrete(290)` but only a handful of actions are legal each
 opening). An unmasked policy spends ~all its probability mass on illegal actions and never learns.
 Always feed the mask from `src/env/catan_env.py:valid_action_mask` into the policy.
 
+## What was built
+
+- `src/agent/train.py` — main training loop (MaskablePPO + self-play + W&B logging).
+  - Trains for `--total-steps` (default 1M), evals every `--eval-interval` (default 50k).
+  - Uses rotating checkpoint pool (keep 3 most recent, prune older) for self-play.
+  - Opponent sampled from pool or defaults to WeightedRandomPlayer.
+  - Logs to W&B: step, win rate vs. current opponent, checkpoint markers.
+  - Run: `python -m src.agent.train --total-steps 1000000 --w-b-project catan-ai`
+
+- `src/agent/checkpoint_manager.py` — checkpoint I/O and pruning.
+  - `save_checkpoint(model, step)` — save SB3 model.
+  - `list_checkpoints()` — list all saved checkpoints.
+  - `prune_checkpoints(keep_n=3)` — delete all but N most recent.
+
+- `src/agent/opponent.py` — `PolicyPlayer` wrapper to use trained models as opponents.
+  - Frozen policy plugs into `config["enemies"]` for env init.
+
 ## Track A (start here): MaskablePPO baseline
 
-`sb3_contrib.MaskablePPO` is PyTorch under the hood and handles masking out of the box.
+`sb3_contrib.MaskablePPO` is PyTorch under the hood, handles masking out of the box. Policy is
+small MLP `[64, 64]` to train quickly on CPU. Start training with:
 
-```python
-from sb3_contrib import MaskablePPO
-from sb3_contrib.common.wrappers import ActionMasker
-from src.env.catan_env import make_1v1_env, valid_action_mask
-
-env = ActionMasker(make_1v1_env(), valid_action_mask)
-model = MaskablePPO("MlpPolicy", env, verbose=1, device="cpu")  # small MLP; CPU is fine
-model.learn(total_timesteps=2_000_000)
-model.save("checkpoints/maskppo_v0")
+```bash
+python -m src.agent.train --total-steps 1000000 --eval-interval 50000 --w-b-project "catan-ai"
 ```
 
 **First milestone:** beat `WeightedRandomPlayer` clearly (>70% win rate). This validates env,
