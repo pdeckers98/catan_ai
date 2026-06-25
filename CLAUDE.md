@@ -21,6 +21,8 @@ the agent and, later, the web integration.
 - **Custom rules**: `src/env/rules.py` monkeypatches Catanatron at import time — discard on a
   7 only triggers above **9** cards (`discard_limit=9`, vs. stock 7), and fixes an upstream
   re-check bug that hardcoded `> 7`. Applied automatically via `src/env/catan_env.py`.
+- **Reward shaping**: training wraps the env in `RewardShapingWrapper` for a dense **exponential
+  VP** reward (late VPs worth exponentially more) on top of the sparse win/loss signal.
 - **Action masking**: mandatory — most actions are illegal each turn; always respect
   `info["valid_actions"]` / `env.unwrapped.get_valid_actions()`
 - **Training hardware**: high-core CPU cloud instance (RL here is CPU-bound — parallel game

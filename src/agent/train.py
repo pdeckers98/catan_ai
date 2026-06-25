@@ -20,7 +20,9 @@ from catanatron.players.weighted_random import WeightedRandomPlayer
 from src.agent.checkpoint_manager import (
     list_checkpoints, prune_checkpoints, save_checkpoint,
 )
-from src.env.catan_env import make_1v1_env, valid_action_mask, TurnLimitWrapper
+from src.env.catan_env import (
+    make_1v1_env, valid_action_mask, TurnLimitWrapper, RewardShapingWrapper,
+)
 
 
 class GameTurnCallback(BaseCallback):
@@ -35,11 +37,17 @@ class GameTurnCallback(BaseCallback):
     def __init__(self, verbose: int = 0):
         super().__init__(verbose)
         self._turns: list[int] = []
+        self._vps: list[int] = []
+        self._opp_vps: list[int] = []
 
     def _on_step(self) -> bool:
         for info in self.locals.get("infos", []):
             if "game_turns" in info:
                 self._turns.append(info["game_turns"])
+            if "final_vp" in info:
+                self._vps.append(info["final_vp"])
+            if "opp_vp" in info:
+                self._opp_vps.append(info["opp_vp"])
         return True
 
     def _on_rollout_end(self) -> None:
@@ -47,13 +55,22 @@ class GameTurnCallback(BaseCallback):
             return
         mean_turns = float(np.mean(self._turns))
         self.logger.record("rollout/mean_game_turns", mean_turns)
+        log = {
+            "train/mean_game_turns": mean_turns,
+            "train/games_finished": len(self._turns),
+            "step": self.num_timesteps,
+        }
+        if self._vps:
+            mean_vp = float(np.mean(self._vps))
+            self.logger.record("rollout/mean_agent_vp", mean_vp)
+            log["train/mean_agent_vp"] = mean_vp
+        if self._opp_vps:
+            mean_opp_vp = float(np.mean(self._opp_vps))
+            self.logger.record("rollout/mean_opp_vp", mean_opp_vp)
+            log["train/mean_opp_vp"] = mean_opp_vp
         if wandb.run is not None:
-            wandb.log({
-                "train/mean_game_turns": mean_turns,
-                "train/games_finished": len(self._turns),
-                "step": self.num_timesteps,
-            })
-        self._turns = []
+            wandb.log(log)
+        self._turns, self._vps, self._opp_vps = [], [], []
 
 
 def make_vec_env(num_envs: int, enemy=None):
@@ -73,6 +90,7 @@ def make_vec_env(num_envs: int, enemy=None):
         def _init():
             env = make_1v1_env(enemy=enemy)
             env = TurnLimitWrapper(ActionMasker(env, valid_action_mask), max_turns=200)
+            env = RewardShapingWrapper(env)
             return env
         return _init
 

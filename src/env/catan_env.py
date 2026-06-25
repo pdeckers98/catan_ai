@@ -94,6 +94,57 @@ class TurnLimitWrapper(Wrapper):
         return self.env.reset(**kwargs)
 
 
+class RewardShapingWrapper(Wrapper):
+    """Add exponential VP-based reward shaping on top of the sparse win/loss reward.
+
+    Each step adds ``vp_scale * (base**new_vp - base**prev_vp)`` for the controlled
+    player (P0). Since ``base**v`` is convex, climbing 13->14 VP is rewarded far more
+    than 3->4, pushing the agent to actually close out games rather than stall. With
+    the defaults (base 1.3, scale 0.02) a full 2->15 VP climb sums to ~+1.0, on par
+    with the terminal win bonus.
+
+    On episode end it records final VPs in ``info`` (``final_vp``, ``opp_vp``) so a
+    callback can stream per-game VP averages to W&B.
+
+    Place this OUTSIDE TurnLimitWrapper so it observes turn-limit truncations too.
+    """
+
+    def __init__(self, env, agent_color=Color.BLUE, vp_base=1.3, vp_scale=0.02):
+        super().__init__(env)
+        self.agent_color = agent_color
+        self.vp_base = vp_base
+        self.vp_scale = vp_scale
+        self._prev_potential = 0.0
+
+    def _actual_vp(self, color):
+        state = self.env.unwrapped.game.state
+        key = f"P{state.color_to_index[color]}"
+        return state.player_state[f"{key}_ACTUAL_VICTORY_POINTS"]
+
+    def _potential(self, vp):
+        return self.vp_base ** vp
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._prev_potential = self._potential(self._actual_vp(self.agent_color))
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        vp = self._actual_vp(self.agent_color)
+        potential = self._potential(vp)
+        reward += self.vp_scale * (potential - self._prev_potential)
+        self._prev_potential = potential
+        if terminated or truncated:
+            opponent = next(
+                c for c in self.env.unwrapped.game.state.colors
+                if c != self.agent_color
+            )
+            info["final_vp"] = vp
+            info["opp_vp"] = self._actual_vp(opponent)
+        return obs, reward, terminated, truncated, info
+
+
 def valid_action_mask(env):
     """Boolean mask over the full action space for SB3-Contrib's ActionMasker.
 

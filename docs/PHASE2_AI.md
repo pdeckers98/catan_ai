@@ -22,10 +22,11 @@ Always feed the mask from `src/env/catan_env.py:valid_action_mask` into the poli
   - Trains for `--total-steps` (default 500k), evals every `--eval-interval` (default 50k).
   - Uses rotating checkpoint pool (keep 3 most recent, prune older) for self-play.
   - Opponent sampled from pool or defaults to WeightedRandomPlayer; swapped every 2 evals.
-  - `GameTurnCallback` logs **mean game length (turns)** each rollout to the console table
-    (`rollout/mean_game_turns`) and W&B (`train/mean_game_turns`). It should trend *down* as
-    the agent learns to win efficiently.
-  - Logs to W&B: step, win rate vs. current opponent, checkpoint markers, mean game turns.
+  - `GameTurnCallback` logs per-rollout aggregates to the console table and W&B:
+    mean game length (`rollout/mean_game_turns` / `train/mean_game_turns`, should trend
+    *down*), and mean end-of-game VPs for the agent and opponent
+    (`train/mean_agent_vp`, `train/mean_opp_vp`, should trend *up* for the agent).
+  - Logs to W&B: step, win rate, checkpoint markers, mean game turns, mean agent/opp VPs.
   - Run: `python -m src.agent.train --total-steps 500000 --w-b-project catan-ai`
 
 - `src/agent/opponent.py` — `PolicyPlayer` wraps a frozen checkpoint as a Catanatron
@@ -63,9 +64,23 @@ local inference (GTX 1660 Super), and the Phase 3 colonist.io bridge.
 
 ## Reward shaping
 
-Default reward is sparse (`+1/-1` at game end). Pass a custom `reward_function(game, p0_color)`
-via `make_1v1_env(reward_function=...)` to add dense signals (VP gained, longest road / largest
-army, production potential). Keep it swappable and A/B it against the sparse baseline.
+The Catanatron reward is sparse (`+1/-1` at game end), which stalls learning when games rarely
+resolve (e.g. 15 VP within a turn cap). Training therefore wraps the env in
+`RewardShapingWrapper` (`src/env/catan_env.py`), which adds a dense **exponential VP** signal on
+top of the sparse reward:
+
+```
+shaping = vp_scale * (vp_base**new_vp - vp_base**prev_vp)   # per step, agent (P0) only
+```
+
+Because `vp_base**v` is convex, late VPs are worth far more than early ones — with the defaults
+(`vp_base=1.3`, `vp_scale=0.02`) gaining your **14th VP is ~14× the reward of your 4th**, and a
+full 2→15 climb sums to ~`+1.0` (on par with the terminal win bonus, so it guides without
+drowning out winning). Tune via the wrapper args. The wrapper also emits `final_vp`/`opp_vp` in
+`info` on episode end for the W&B VP metrics.
+
+For other signals (longest road / largest army, production potential) you can still pass a custom
+`reward_function(game, p0_color)` via `make_1v1_env(reward_function=...)`.
 
 ## Self-play (the strength ceiling)
 
