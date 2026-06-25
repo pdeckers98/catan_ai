@@ -1,7 +1,7 @@
 """Phase 2 training: MaskablePPO with self-play and W&B logging.
 
 Usage:
-    python -m src.agent.train --total-steps 1000000 --eval-interval 50000 --w-b-project "catan-ai"
+    python -m src.agent.train --total-steps 500000 --eval-interval 50000 --w-b-project "catan-ai"
 """
 
 import argparse
@@ -126,7 +126,7 @@ def evaluate(model, opponent, num_games: int = 50) -> float:
 
 def main():
     parser = argparse.ArgumentParser(description="Train MaskablePPO agent with self-play.")
-    parser.add_argument("--total-steps", type=int, default=1_000_000)
+    parser.add_argument("--total-steps", type=int, default=500_000)
     parser.add_argument("--eval-interval", type=int, default=50_000)
     parser.add_argument("--w-b-project", type=str, default="catan-ai")
     parser.add_argument("--seed", type=int, default=0)

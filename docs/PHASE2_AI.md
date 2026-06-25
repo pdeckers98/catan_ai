@@ -19,14 +19,14 @@ Always feed the mask from `src/env/catan_env.py:valid_action_mask` into the poli
 
 - `src/agent/train.py` — main training loop (MaskablePPO + self-play + W&B logging).
   - Runs **8 games in parallel** via `SubprocVecEnv` (one worker per subprocess).
-  - Trains for `--total-steps` (default 1M), evals every `--eval-interval` (default 50k).
+  - Trains for `--total-steps` (default 500k), evals every `--eval-interval` (default 50k).
   - Uses rotating checkpoint pool (keep 3 most recent, prune older) for self-play.
   - Opponent sampled from pool or defaults to WeightedRandomPlayer; swapped every 2 evals.
   - `GameTurnCallback` logs **mean game length (turns)** each rollout to the console table
     (`rollout/mean_game_turns`) and W&B (`train/mean_game_turns`). It should trend *down* as
     the agent learns to win efficiently.
   - Logs to W&B: step, win rate vs. current opponent, checkpoint markers, mean game turns.
-  - Run: `python -m src.agent.train --total-steps 1000000 --w-b-project catan-ai`
+  - Run: `python -m src.agent.train --total-steps 500000 --w-b-project catan-ai`
 
 - `src/agent/opponent.py` — `PolicyPlayer` wraps a frozen checkpoint as a Catanatron
   `Player` for self-play. Builds its own 614-dim observation + action mask from the live
@@ -48,7 +48,7 @@ Always feed the mask from `src/env/catan_env.py:valid_action_mask` into the poli
 small MLP `[64, 64]` to train quickly on CPU. Start training with:
 
 ```bash
-python -m src.agent.train --total-steps 1000000 --eval-interval 50000 --w-b-project "catan-ai"
+python -m src.agent.train --total-steps 500000 --eval-interval 50000 --w-b-project "catan-ai"
 ```
 
 **First milestone:** beat `WeightedRandomPlayer` clearly (>70% win rate). This validates env,
