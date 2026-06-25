@@ -135,7 +135,7 @@ def main():
             "eval/win_rate": win_rate,
             "eval/opponent": opponent.__class__.__name__,
         })
-        print(f" ✓ win_rate={win_rate:.2%}")
+        print(f" OK win_rate={win_rate:.2%}")
 
         if eval_step % 2 == 0:
             print(f"[Checkpoint] Saving model at step {steps_done}")
