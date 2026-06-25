@@ -36,6 +36,29 @@ REVIEW = "review"      # human ended turn; waiting for "Next turn" click
 OVER = "over"          # game finished
 
 
+def _recent_rolls(state, n=2):
+    """The last ``n`` dice rolls as (color, (d1, d2)), most recent first."""
+    rolls = []
+    for action in reversed(state.actions):
+        if action.action_type == ActionType.ROLL and action.value is not None:
+            rolls.append((action.color, action.value))
+            if len(rolls) == n:
+                break
+    return rolls
+
+
+def _dice_lines(state):
+    """Two display lines: the latest roll and the previous one."""
+    rolls = _recent_rolls(state, 2)
+    labels = ["Last roll", "Prev roll"]
+    lines = []
+    for label, (color, (d1, d2)) in zip(labels, rolls):
+        lines.append(f"{label}: {color.value:<4} {d1}+{d2} = {d1 + d2}")
+    if not lines:
+        lines.append("Last roll: --")
+    return lines
+
+
 def _fmt_action(action):
     """Compact one-line action label, e.g. 'BUILD_ROAD (12, 13)' or 'END_TURN'."""
     name = action.action_type.name
@@ -151,7 +174,8 @@ class HumanVsAI:
         self.ax_side.clear()
         self.ax_side.axis("off")
 
-        header = [
+        header = _dice_lines(state) + [
+            "",
             _hand_text(state, AI, "AI"),
             "",
             _hand_text(state, HUMAN, "YOU"),
