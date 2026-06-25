@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+.conda/
+
+# Model checkpoints & training artifacts
+checkpoints/
+*.pt
+*.zip
+runs/
+tensorboard/
+logs/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Phase 3 secrets (never commit colonist.io credentials)
+.env
+secrets.json

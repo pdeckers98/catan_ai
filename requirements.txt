@@ -1,0 +1,18 @@
+# Core Catan engine + RL environment.
+# NOTE: the Gymnasium env lives in the SEPARATE catanatron-gym package.
+# Pin 4.0.0 — the 3.2.1 gym package depends on the legacy `gym` lib, which
+# fails to build on Python 3.14. 4.0.0 uses gymnasium and pins it to 0.29.1.
+catanatron==3.2.1
+catanatron-gym==4.0.0
+gymnasium==0.29.1   # pinned by catanatron-gym 4.0.0; SB3 2.9 works with it
+
+# Deep RL (PyTorch under the hood)
+torch>=2.12
+stable-baselines3==2.9.0
+sb3-contrib==2.9.0   # MaskablePPO + ActionMasker (action masking is mandatory)
+
+# Tooling
+flake8
+
+# Phase 3 (colonist.io bridge) — uncomment when reaching Phase 3
+# playwright
