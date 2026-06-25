@@ -148,6 +148,8 @@ def main():
     parser.add_argument("--eval-interval", type=int, default=50_000)
     parser.add_argument("--w-b-project", type=str, default="catan-ai")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--n-steps", type=int, default=2048,
+                        help="PPO rollout length per env before each update.")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -162,6 +164,7 @@ def main():
             "policy": "MlpPolicy",
             "net_arch": [64, 64],
             "num_envs": 8,
+            "n_steps": args.n_steps,
         },
     )
 
@@ -170,6 +173,7 @@ def main():
     model = MaskablePPO(
         "MlpPolicy",
         env,
+        n_steps=args.n_steps,
         policy_kwargs={"net_arch": [64, 64]},
         verbose=1,
         device="cpu",
