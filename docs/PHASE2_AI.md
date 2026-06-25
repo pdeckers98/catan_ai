@@ -9,6 +9,12 @@ The action space is `Discrete(290)` but only a handful of actions are legal each
 opening). An unmasked policy spends ~all its probability mass on illegal actions and never learns.
 Always feed the mask from `src/env/catan_env.py:valid_action_mask` into the policy.
 
+## Setup
+
+- Install: `pip install -r requirements.txt` (includes `wandb`).
+- W&B: requires a free account at https://wandb.ai. Login once with `wandb login` (saved to `~/.netrc`).
+- Each training run is logged to your W&B project in real-time (metrics, checkpoints, hyperparams).
+
 ## What was built
 
 - `src/agent/train.py` — main training loop (MaskablePPO + self-play + W&B logging).
