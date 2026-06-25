@@ -14,6 +14,7 @@ Key facts about the underlying env (catanatron-gym 4.0.0):
 """
 
 import gymnasium as gym
+from gymnasium import Wrapper
 import numpy as np
 
 import catanatron_gym  # noqa: F401  -- registers the "catanatron-v1" env id
@@ -26,7 +27,7 @@ ENV_ID = "catanatron-v1"
 def make_1v1_env(
     enemy=None,
     map_type="BASE",
-    vps_to_win=10,
+    vps_to_win=15,
     representation="vector",
     reward_function=None,
 ):
@@ -36,7 +37,7 @@ def make_1v1_env(
         enemy: opponent Player instance (must not be Color.BLUE). Defaults to a
             WeightedRandomPlayer on RED -- a slightly stronger-than-random bot.
         map_type: "BASE" (full board) or "MINI" (faster iteration).
-        vps_to_win: victory points to win; 10 matches colonist.io 1v1.
+        vps_to_win: victory points to win; 15 for extended gameplay.
         representation: "vector" (flat Box) or "mixed" (board tensor + numeric).
         reward_function: optional callable(game, p0_color) -> float. Defaults to
             the env's built-in win/loss/draw reward.
@@ -57,6 +58,29 @@ def make_1v1_env(
         config["reward_function"] = reward_function
 
     return gym.make(ENV_ID, config=config)
+
+
+class TurnLimitWrapper(Wrapper):
+    """Enforce a maximum turn limit; truncates when exceeded.
+
+    Args:
+        env: the base environment.
+        max_turns: maximum turns; game truncates (draw) if exceeded.
+    """
+
+    def __init__(self, env, max_turns):
+        super().__init__(env)
+        self.max_turns = max_turns
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        # Truncate if turn limit exceeded
+        if self.env.unwrapped.game.state.num_turns >= self.max_turns:
+            truncated = True
+        return obs, reward, terminated, truncated, info
+
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
 
 
 def valid_action_mask(env):

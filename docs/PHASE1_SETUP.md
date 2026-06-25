@@ -41,9 +41,10 @@
 - **Valid actions / masking:** `env.unwrapped.get_valid_actions()` returns the legal action ints;
   also exposed as `info["valid_actions"]` after `reset()`/`step()`.
 - **`config` keys** (with defaults): `enemies` (`[RandomPlayer(RED)]`), `map_type` (`"BASE"`),
-  `vps_to_win` (`10`), `representation` (`"vector"`), `reward_function` (built-in win/loss/draw),
+  `vps_to_win` (`15`), `representation` (`"vector"`), `reward_function` (built-in win/loss/draw),
   `invalid_action_reward` (`-1`).
-- **Reward:** built-in `simple_reward` → `+1` win / `-1` loss / `0` otherwise.
+- **Reward:** built-in `simple_reward` → `+1` win / `-1` loss / `0` draw (or truncation at turn 1000).
+- **Turn limit:** games truncate (draw) if neither player reaches VP goal by turn 1000.
 
 ## Available opponent bots (important limitation)
 
@@ -60,7 +61,7 @@ installing from Catanatron source/experimental or implementing one ourselves.
 ## What was built
 
 - `src/env/catan_env.py`
-  - `make_1v1_env(enemy=None, map_type="BASE", vps_to_win=10, representation="vector",
+  - `make_1v1_env(enemy=None, map_type="BASE", vps_to_win=15, representation="vector",
     reward_function=None)` — constructs the 1v1 env (default enemy: `WeightedRandomPlayer(RED)`).
   - `valid_action_mask(env)` — boolean mask of shape `(action_space.n,)` for SB3-Contrib's
     `ActionMasker`.

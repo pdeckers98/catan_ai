@@ -1,0 +1,32 @@
+Using cpu device
+Wrapping the env with a `Monitor` wrapper
+Wrapping the env in a DummyVecEnv.
+Traceback (most recent call last):
+  File "<frozen runpy>", line 203, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\pdeck\Desktop\Python\Catan\src\agent\train.py", line 127, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\pdeck\Desktop\Python\Catan\src\agent\train.py", line 98, in main
+    model.learn(total_timesteps=interval, progress_bar=True)
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\pdeck\.conda\envs\catan\Lib\site-packages\sb3_contrib\ppo_mask\ppo_mask.py", line 440, in learn
+    total_timesteps, callback = self._setup_learn(
+                                ~~~~~~~~~~~~~~~~~^
+        total_timesteps,
+        ^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        progress_bar,
+        ^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\pdeck\.conda\envs\catan\Lib\site-packages\stable_baselines3\common\base_class.py", line 434, in _setup_learn
+    callback = self._init_callback(callback, progress_bar)
+  File "C:\Users\pdeck\.conda\envs\catan\Lib\site-packages\stable_baselines3\common\base_class.py", line 378, in _init_callback
+    callback = CallbackList([callback, ProgressBarCallback()])
+                                       ~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\pdeck\.conda\envs\catan\Lib\site-packages\stable_baselines3\common\callbacks.py", line 710, in __init__
+    raise ImportError(
+    ...<3 lines>...
+    )
+ImportError: You must install tqdm and rich in order to use the progress bar callback. It is included if you install stable-baselines with the extra packages: `pip install stable-baselines3[extra]`

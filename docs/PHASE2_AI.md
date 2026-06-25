@@ -18,10 +18,11 @@ Always feed the mask from `src/env/catan_env.py:valid_action_mask` into the poli
 ## What was built
 
 - `src/agent/train.py` — main training loop (MaskablePPO + self-play + W&B logging).
+  - Runs **8 games in parallel** via `SubprocVecEnv` (one worker per subprocess).
   - Trains for `--total-steps` (default 1M), evals every `--eval-interval` (default 50k).
   - Uses rotating checkpoint pool (keep 3 most recent, prune older) for self-play.
-  - Opponent sampled from pool or defaults to WeightedRandomPlayer.
-  - Logs to W&B: step, win rate vs. current opponent, checkpoint markers.
+  - Opponent sampled from pool or defaults to WeightedRandomPlayer; swapped every 2 evals.
+  - Logs to W&B: step, win rate vs. current opponent, checkpoint markers, num_envs config.
   - Run: `python -m src.agent.train --total-steps 1000000 --w-b-project catan-ai`
 
 - `src/agent/checkpoint_manager.py` — checkpoint I/O and pruning.
@@ -63,14 +64,21 @@ The packaged bots top out at `VictoryPointPlayer` (greedy). To go beyond, period
 current policy and use it as the (frozen) `enemies` opponent, refreshing every N updates. Wrap the
 snapshot policy in a `catanatron` `Player` subclass so it plugs into `config["enemies"]`.
 
-## Cloud training (CPU-bound)
+## Parallel game collection
 
-This workload is **CPU-bound** — throughput is dominated by stepping game simulations, and the net
-is a small MLP. Provision a **high-core-count CPU instance** and run many envs in parallel with
-`stable_baselines3.common.vec_env.SubprocVecEnv`. Self-play generates data on the fly, so there is
-little to pre-upload. **Decide the exact sync mechanism (block volume vs. plain checkpoint `scp`)
-during this phase**, once we see iteration speed and checkpoint sizes. Pull the final `.pt` /
-`.zip` down for local inference on the GTX 1660 Super.
+Training runs **8 games in parallel** via `SubprocVecEnv`, one worker per subprocess. Each worker
+runs independent games with its own environment and random seed. This is critical since the workload
+is **CPU-bound** — throughput is dominated by stepping game simulations, not policy computation.
+
+To adjust parallelism, edit `num_envs` in `src/agent/train.py:main()`. The value should match your
+CPU core count (or slightly higher for some oversubscription if I/O permits).
+
+## Cloud training
+
+Self-play generates data on the fly, so there is little to pre-upload. **Decide the exact sync
+mechanism (block volume vs. plain checkpoint `scp`) during deployment**, once we see checkpoint
+sizes and iteration speed. Pull the final `.pt` / `.zip` down for local inference on the GTX 1660
+Super.
 
 ## Evaluation harness (`src/eval/`)
 

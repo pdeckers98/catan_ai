@@ -1,0 +1,44 @@
+{
+  "os": "Windows-11-10.0.26200-SP0",
+  "python": "CPython 3.14.6",
+  "startedAt": "2026-06-25T15:06:00.744048Z",
+  "args": [
+    "--total-steps",
+    "1000000",
+    "--eval-interval",
+    "50000"
+  ],
+  "program": "-m src.agent.train",
+  "git": {
+    "remote": "https://github.com/pdeckers98/catan_ai.git",
+    "commit": "14727f822690f4adf5b5e56b58e1aba507c826a0"
+  },
+  "email": "patrickje12@gmail.com",
+  "root": "C:\\Users\\pdeck\\Desktop\\Python\\Catan",
+  "host": "Pats-PC",
+  "executable": "C:\\Users\\pdeck\\.conda\\envs\\catan\\python.exe",
+  "cpu_count": 6,
+  "cpu_count_logical": 12,
+  "gpu": "NVIDIA GeForce GTX 1660 SUPER",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "510737248256",
+      "used": "467731349504"
+    }
+  },
+  "memory": {
+    "total": "17026187264"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce GTX 1660 SUPER",
+      "memoryTotal": "6442450944",
+      "cudaCores": 1408,
+      "architecture": "Turing",
+      "uuid": "GPU-fbe49815-f9c2-8252-21f5-ed70cd3a1019"
+    }
+  ],
+  "cudaVersion": "12.6",
+  "writerId": "2yypfpampq92c11103bzttq35jsx2onq"
+}

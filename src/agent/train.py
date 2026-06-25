@@ -12,13 +12,37 @@ import numpy as np
 import wandb
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from catanatron import Color
 from catanatron.players.weighted_random import WeightedRandomPlayer
 from src.agent.checkpoint_manager import (
     list_checkpoints, prune_checkpoints, save_checkpoint,
 )
-from src.env.catan_env import make_1v1_env, valid_action_mask
+from src.env.catan_env import make_1v1_env, valid_action_mask, TurnLimitWrapper
+
+
+def make_vec_env(num_envs: int, enemy=None):
+    """Create a vectorized environment with num_envs parallel games.
+
+    Args:
+        num_envs: number of parallel environments.
+        enemy: opponent Player instance. Defaults to WeightedRandomPlayer.
+
+    Returns:
+        SubprocVecEnv with num_envs workers.
+    """
+    if enemy is None:
+        enemy = WeightedRandomPlayer(Color.RED)
+
+    def make_env():
+        def _init():
+            env = make_1v1_env(enemy=enemy)
+            env = TurnLimitWrapper(ActionMasker(env, valid_action_mask), max_turns=200)
+            return env
+        return _init
+
+    return SubprocVecEnv([make_env() for _ in range(num_envs)])
 
 
 def sample_opponent():
@@ -79,10 +103,12 @@ def main():
             "model": "MaskablePPO",
             "policy": "MlpPolicy",
             "net_arch": [64, 64],
+            "num_envs": 8,
         },
     )
 
-    env = ActionMasker(make_1v1_env(), valid_action_mask)
+    num_envs = 8
+    env = make_vec_env(num_envs=num_envs)
     model = MaskablePPO(
         "MlpPolicy",
         env,
@@ -95,11 +121,13 @@ def main():
     eval_step = 0
     while steps_done < args.total_steps:
         interval = min(args.eval_interval, args.total_steps - steps_done)
+        print(f"\n[Training] Steps {steps_done}->{steps_done + interval} / {args.total_steps}")
         model.learn(total_timesteps=interval, progress_bar=True)
         steps_done += interval
         eval_step += 1
 
         opponent = sample_opponent()
+        print(f"[Eval] Testing against {opponent.__class__.__name__}...", end="", flush=True)
         win_rate = evaluate(model, opponent, num_games=50)
 
         wandb.log({
@@ -107,15 +135,17 @@ def main():
             "eval/win_rate": win_rate,
             "eval/opponent": opponent.__class__.__name__,
         })
-        print(f"Step {steps_done}: win_rate={win_rate:.2%} vs {opponent.__class__.__name__}")
+        print(f" ✓ win_rate={win_rate:.2%}")
 
         if eval_step % 2 == 0:
+            print(f"[Checkpoint] Saving model at step {steps_done}")
             save_checkpoint(model, steps_done)
             prune_checkpoints(keep_n=3)
             wandb.log({"checkpoint/step": steps_done})
 
         opponent = sample_opponent()
-        env = ActionMasker(make_1v1_env(enemy=opponent), valid_action_mask)
+        print(f"[Self-play] Swapping to {opponent.__class__.__name__}")
+        env = make_vec_env(num_envs=num_envs, enemy=opponent)
         model.set_env(env)
 
     model.save(str(Path("checkpoints") / "agent_final"))

@@ -1,0 +1,66 @@
+_wandb:
+    value:
+        cli_version: 0.28.0
+        e:
+            1dbp33zk5xua5dpdhoas0tvh2ghkmkfw:
+                args:
+                    - --total-steps
+                    - "1000000"
+                    - --eval-interval
+                    - "50000"
+                cpu_count: 6
+                cpu_count_logical: 12
+                cudaVersion: "12.6"
+                disk:
+                    /:
+                        total: "510737248256"
+                        used: "467707170816"
+                email: patrickje12@gmail.com
+                executable: C:\Users\pdeck\.conda\envs\catan\python.exe
+                git:
+                    commit: 26644e4449f97714d0e4d5ba7609e878f32b981c
+                    remote: https://github.com/pdeckers98/catan_ai.git
+                gpu: NVIDIA GeForce GTX 1660 SUPER
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Turing
+                      cudaCores: 1408
+                      memoryTotal: "6442450944"
+                      name: NVIDIA GeForce GTX 1660 SUPER
+                      uuid: GPU-fbe49815-f9c2-8252-21f5-ed70cd3a1019
+                host: Pats-PC
+                memory:
+                    total: "17026187264"
+                os: Windows-11-10.0.26200-SP0
+                program: -m src.agent.train
+                python: CPython 3.14.6
+                root: C:\Users\pdeck\Desktop\Python\Catan
+                startedAt: "2026-06-25T15:04:40.402609Z"
+                writerId: 1dbp33zk5xua5dpdhoas0tvh2ghkmkfw
+        m: []
+        python_version: 3.14.6
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 16
+            "4": 3.14.6
+            "5": 0.28.0
+            "8":
+                - 3
+            "12": 0.28.0
+            "13": windows-amd64
+eval_interval:
+    value: 50000
+model:
+    value: MaskablePPO
+net_arch:
+    value:
+        - 64
+        - 64
+policy:
+    value: MlpPolicy
+total_steps:
+    value: 1000000

@@ -17,7 +17,7 @@ the agent and, later, the web integration.
   Catan simulator with a Gymnasium env, action masking, and strong baseline bots
 - **RL framework**: PyTorch via `stable-baselines3` + `sb3-contrib` (`MaskablePPO`); optional
   raw-PyTorch PPO later
-- **Game mode**: 1v1 (`enemies=[one bot]`, `map_type="BASE"`, `vps_to_win=10`)
+- **Game mode**: 1v1 (`enemies=[one bot]`, `map_type="BASE"`, `vps_to_win=15`)
 - **Action masking**: mandatory — most actions are illegal each turn; always respect
   `info["valid_actions"]` / `env.unwrapped.get_valid_actions()`
 - **Training hardware**: high-core CPU cloud instance (RL here is CPU-bound — parallel game
