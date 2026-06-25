@@ -11,8 +11,9 @@ torch>=2.12
 stable-baselines3==2.9.0
 sb3-contrib==2.9.0   # MaskablePPO + ActionMasker (action masking is mandatory)
 
-# Tooling
+# Tooling & logging
 flake8
+wandb
 
 # Phase 3 (colonist.io bridge) — uncomment when reaching Phase 3
 # playwright
