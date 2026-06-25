@@ -65,6 +65,11 @@ installing from Catanatron source/experimental or implementing one ourselves.
   - `valid_action_mask(env)` — boolean mask of shape `(action_space.n,)` for SB3-Contrib's
     `ActionMasker`.
 - `src/env/smoke_test.py` — plays N full games choosing uniformly among `info["valid_actions"]`.
+- `src/env/render.py` / `src/env/visual_test.py` — matplotlib board renderer (no visualizer ships
+  with the pip package; the official web UI is a separate Docker-only Flask+React app). Draws
+  hexes/numbers/robber/roads/settlements (circles) vs. cities (squares), plus a per-player panel
+  with dice, VP, dev cards, and resource hand. Run `python -m src.env.visual_test` to watch a
+  legal-random game live (`--redraw-every`, `--pause`, `--seed` flags).
 
 ## Verification (reproduce)
 
