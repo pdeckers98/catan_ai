@@ -21,7 +21,13 @@ import catanatron_gym  # noqa: F401  -- registers the "catanatron-v1" env id
 from catanatron import Color
 from catanatron.players.weighted_random import WeightedRandomPlayer
 
+from src.env.rules import apply_rule_patches
+
 ENV_ID = "catanatron-v1"
+
+# Install custom 1v1 rules (discard only on >9 cards) at import time. This module is
+# imported by every env constructor, so the patch lands in SubprocVecEnv workers too.
+apply_rule_patches()
 
 
 def make_1v1_env(
@@ -74,9 +80,14 @@ class TurnLimitWrapper(Wrapper):
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
+        num_turns = self.env.unwrapped.game.state.num_turns
         # Truncate if turn limit exceeded
-        if self.env.unwrapped.game.state.num_turns >= self.max_turns:
+        if num_turns >= self.max_turns:
             truncated = True
+        # Expose the game length when an episode ends, so a callback can track how
+        # many turns games take (should fall as the agent gets more efficient).
+        if terminated or truncated:
+            info["game_turns"] = num_turns
         return obs, reward, terminated, truncated, info
 
     def reset(self, **kwargs):

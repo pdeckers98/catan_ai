@@ -1,39 +1,59 @@
 """Opponent Player wrapper around a frozen trained policy.
 
-Allows a trained agent to be plugged into config["enemies"] for self-play.
+Lets a trained MaskablePPO checkpoint act as a Catanatron ``Player`` so it can be
+dropped into ``config["enemies"]`` for self-play. Works inside ``SubprocVecEnv``
+workers: the player (and its policy) is pickled to each worker, and ``decide`` builds
+the observation/mask itself from the live ``Game`` -- no env handle required.
 """
 
+import numpy as np
+
 from catanatron import Player
-from src.env.catan_env import valid_action_mask
+from catanatron_gym.features import create_sample_vector, get_feature_ordering
+from catanatron_gym.envs.catanatron_env import (
+    ACTION_SPACE_SIZE, to_action_space, from_action_space,
+)
 
 
 class PolicyPlayer(Player):
-    """A catanatron Player that acts via a frozen SB3 policy."""
+    """A catanatron Player that acts via a frozen SB3 MaskablePPO policy."""
 
-    def __init__(self, color, policy_model):
+    def __init__(self, color, policy_model, map_type="BASE", num_players=2):
         """Initialize.
 
         Args:
             color: catanatron.Color enum.
-            policy_model: trained SB3 model with .predict(obs, deterministic=True).
+            policy_model: trained MaskablePPO with ``.predict(obs, action_masks=...)``.
+            map_type: board type the policy was trained on (feature ordering depends
+                on it).
+            num_players: player count the policy was trained on (614-dim obs for 2p).
         """
         super().__init__(color)
         self.policy = policy_model
+        # Feature ordering must match training (defaults to 4 players otherwise).
+        self._features = get_feature_ordering(num_players, map_type)
 
     def decide(self, game, playable_actions):
         """Choose an action via the trained policy.
 
         Args:
             game: catanatron.game.Game instance.
-            playable_actions: list of valid ActionType values (unused; we read the mask).
+            playable_actions: list of legal catanatron Actions this turn.
 
         Returns:
-            Chosen action (catanatron Action enum value).
+            One of ``playable_actions`` (a catanatron Action), as the engine expects.
         """
-        from catanatron_gym import CatanEnv
-        env = CatanEnv(config={"enemies": []})
-        obs, info = env.reset()
-        obs, info = env._sync_from_game(game)
-        mask = valid_action_mask(env)
-        action, _ = self.policy.predict(obs, action_masks=mask, deterministic=True)
-        return action
+        if len(playable_actions) == 1:
+            return playable_actions[0]
+
+        obs = np.array(
+            create_sample_vector(game, self.color, self._features), dtype=float
+        )
+        mask = np.zeros(ACTION_SPACE_SIZE, dtype=bool)
+        for action in playable_actions:
+            mask[to_action_space(action)] = True
+
+        action_int, _ = self.policy.predict(
+            obs, action_masks=mask, deterministic=True
+        )
+        return from_action_space(int(action_int), playable_actions)

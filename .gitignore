@@ -17,6 +17,7 @@ checkpoints/
 runs/
 tensorboard/
 logs/
+wandb/
 
 # OS / editor
 .DS_Store

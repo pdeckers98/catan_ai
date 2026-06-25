@@ -22,8 +22,17 @@ Always feed the mask from `src/env/catan_env.py:valid_action_mask` into the poli
   - Trains for `--total-steps` (default 1M), evals every `--eval-interval` (default 50k).
   - Uses rotating checkpoint pool (keep 3 most recent, prune older) for self-play.
   - Opponent sampled from pool or defaults to WeightedRandomPlayer; swapped every 2 evals.
-  - Logs to W&B: step, win rate vs. current opponent, checkpoint markers, num_envs config.
+  - `GameTurnCallback` logs **mean game length (turns)** each rollout to the console table
+    (`rollout/mean_game_turns`) and W&B (`train/mean_game_turns`). It should trend *down* as
+    the agent learns to win efficiently.
+  - Logs to W&B: step, win rate vs. current opponent, checkpoint markers, mean game turns.
   - Run: `python -m src.agent.train --total-steps 1000000 --w-b-project catan-ai`
+
+- `src/agent/opponent.py` — `PolicyPlayer` wraps a frozen checkpoint as a Catanatron
+  `Player` for self-play. Builds its own 614-dim observation + action mask from the live
+  `Game` (`create_sample_vector` + `to_action_space`) and returns a real `Action`, so it works
+  inside `SubprocVecEnv` workers (earlier version imported a non-existent `CatanEnv` and
+  crashed every worker).
 
 - `src/agent/checkpoint_manager.py` — checkpoint I/O and pruning.
   - `save_checkpoint(model, step)` — save SB3 model.

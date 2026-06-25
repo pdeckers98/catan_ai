@@ -12,6 +12,7 @@ import numpy as np
 import wandb
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from catanatron import Color
@@ -20,6 +21,39 @@ from src.agent.checkpoint_manager import (
     list_checkpoints, prune_checkpoints, save_checkpoint,
 )
 from src.env.catan_env import make_1v1_env, valid_action_mask, TurnLimitWrapper
+
+
+class GameTurnCallback(BaseCallback):
+    """Track how many turns games last and log the rolling mean.
+
+    Reads the ``game_turns`` field that ``TurnLimitWrapper`` injects into ``info``
+    when an episode ends. If the agent is learning to win efficiently, this mean
+    should trend *down* over training. Logged to both the SB3 table (visible in the
+    console) and W&B.
+    """
+
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose)
+        self._turns: list[int] = []
+
+    def _on_step(self) -> bool:
+        for info in self.locals.get("infos", []):
+            if "game_turns" in info:
+                self._turns.append(info["game_turns"])
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if not self._turns:
+            return
+        mean_turns = float(np.mean(self._turns))
+        self.logger.record("rollout/mean_game_turns", mean_turns)
+        if wandb.run is not None:
+            wandb.log({
+                "train/mean_game_turns": mean_turns,
+                "train/games_finished": len(self._turns),
+                "step": self.num_timesteps,
+            })
+        self._turns = []
 
 
 def make_vec_env(num_envs: int, enemy=None):
@@ -46,7 +80,13 @@ def make_vec_env(num_envs: int, enemy=None):
 
 
 def sample_opponent():
-    """Sample an opponent: either WeightedRandom or a random checkpoint from pool."""
+    """Sample an opponent: either WeightedRandom or a random checkpoint from pool.
+
+    30% of the time (or whenever the pool is empty) use the built-in
+    WeightedRandomPlayer; otherwise wrap a saved checkpoint in PolicyPlayer for
+    self-play. PolicyPlayer builds its own observation from the live game, so it
+    works inside SubprocVecEnv workers.
+    """
     checkpoints = list_checkpoints()
     if not checkpoints or random.random() < 0.3:
         return WeightedRandomPlayer(Color.RED)
@@ -117,12 +157,19 @@ def main():
         device="cpu",
     )
 
+    turn_callback = GameTurnCallback()
+
     steps_done = 0
     eval_step = 0
     while steps_done < args.total_steps:
         interval = min(args.eval_interval, args.total_steps - steps_done)
         print(f"\n[Training] Steps {steps_done}->{steps_done + interval} / {args.total_steps}")
-        model.learn(total_timesteps=interval, progress_bar=True)
+        model.learn(
+            total_timesteps=interval,
+            progress_bar=True,
+            callback=turn_callback,
+            reset_num_timesteps=False,
+        )
         steps_done += interval
         eval_step += 1
 
