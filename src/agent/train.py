@@ -89,7 +89,7 @@ def make_vec_env(num_envs: int, enemy=None):
     def make_env():
         def _init():
             env = make_1v1_env(enemy=enemy)
-            env = TurnLimitWrapper(ActionMasker(env, valid_action_mask), max_turns=200)
+            env = TurnLimitWrapper(ActionMasker(env, valid_action_mask), max_turns=300)
             env = RewardShapingWrapper(env)
             return env
         return _init
