@@ -69,6 +69,10 @@ class GameTurnCallback(BaseCallback):
             mean_opp_vp = float(np.mean(self._opp_vps))
             self.logger.record("rollout/mean_opp_vp", mean_opp_vp)
             log["train/mean_opp_vp"] = mean_opp_vp
+        if self.model is not None:
+            lr = self.model.lr_schedule(self.model._current_progress_remaining)
+            self.logger.record("train/learning_rate", lr)
+            log["train/learning_rate"] = lr
         if wandb.run is not None:
             wandb.log(log)
         self._turns, self._vps, self._opp_vps = [], [], []
