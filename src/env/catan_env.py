@@ -144,6 +144,11 @@ class RewardShapingWrapper(Wrapper):
         key = f"P{state.color_to_index[color]}"
         return state.player_state[f"{key}_SETTLEMENTS_AVAILABLE"]
 
+    def _roads_built(self, color):
+        state = self.env.unwrapped.game.state
+        key = f"P{state.color_to_index[color]}"
+        return 15 - state.player_state[f"{key}_ROADS_AVAILABLE"]
+
     def _potential(self, vp):
         return self.vp_base ** vp
 
@@ -183,6 +188,7 @@ class RewardShapingWrapper(Wrapper):
             info["final_vp"] = vp
             info["opp_vp"] = self._actual_vp(opponent)
             info["settlements_built"] = self._settlements_built
+            info["roads_built"] = self._roads_built(self.agent_color)
         return obs, reward, terminated, truncated, info
 
 

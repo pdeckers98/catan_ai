@@ -41,6 +41,7 @@ class GameTurnCallback(BaseCallback):
         self._vps: list[int] = []
         self._opp_vps: list[int] = []
         self._settlements: list[int] = []
+        self._roads: list[int] = []
 
     def _on_step(self) -> bool:
         for info in self.locals.get("infos", []):
@@ -52,6 +53,8 @@ class GameTurnCallback(BaseCallback):
                 self._opp_vps.append(info["opp_vp"])
             if "settlements_built" in info:
                 self._settlements.append(info["settlements_built"])
+            if "roads_built" in info:
+                self._roads.append(info["roads_built"])
         return True
 
     def _on_rollout_end(self) -> None:
@@ -76,16 +79,21 @@ class GameTurnCallback(BaseCallback):
             mean_settlements = float(np.mean(self._settlements))
             self.logger.record("rollout/mean_settlements_built", mean_settlements)
             log["train/mean_settlements_built"] = mean_settlements
+        if self._roads:
+            mean_roads = float(np.mean(self._roads))
+            self.logger.record("rollout/mean_roads_built", mean_roads)
+            log["train/mean_roads_built"] = mean_roads
         if self.model is not None:
             lr = self.model.lr_schedule(self.model._current_progress_remaining)
             self.logger.record("train/learning_rate", lr)
             log["train/learning_rate"] = lr
         if wandb.run is not None:
             wandb.log(log)
-        self._turns, self._vps, self._opp_vps, self._settlements = [], [], [], []
+        self._turns, self._vps, self._opp_vps, self._settlements, self._roads = \
+            [], [], [], [], []
 
 
-def make_vec_env(num_envs: int, enemy=None, building_bonus: float = 0.05):
+def make_vec_env(num_envs: int, enemy=None, building_bonus: float = 0.2):
     """Create a vectorized environment with num_envs parallel games.
 
     Args:
@@ -173,7 +181,7 @@ def main():
                              "collapsing to road-heavy policies).")
     parser.add_argument("--net-arch", type=int, nargs="+", default=[32, 32, 32],
                         help="Hidden layer sizes, e.g. --net-arch 256 256.")
-    parser.add_argument("--building-bonus", type=float, default=0.05,
+    parser.add_argument("--building-bonus", type=float, default=0.2,
                         help="Reward added each time the agent places a settlement or city. "
                              "Counteracts the incentive to road-rush for longest road.")
     parser.add_argument("--resume", type=str, default=None,
