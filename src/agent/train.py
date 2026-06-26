@@ -42,6 +42,7 @@ class GameTurnCallback(BaseCallback):
         self._opp_vps: list[int] = []
         self._settlements: list[int] = []
         self._roads: list[int] = []
+        self._cities: list[int] = []
 
     def _on_step(self) -> bool:
         for info in self.locals.get("infos", []):
@@ -55,6 +56,8 @@ class GameTurnCallback(BaseCallback):
                 self._settlements.append(info["settlements_built"])
             if "roads_built" in info:
                 self._roads.append(info["roads_built"])
+            if "cities_built" in info:
+                self._cities.append(info["cities_built"])
         return True
 
     def _on_rollout_end(self) -> None:
@@ -83,14 +86,18 @@ class GameTurnCallback(BaseCallback):
             mean_roads = float(np.mean(self._roads))
             self.logger.record("rollout/mean_roads_built", mean_roads)
             log["train/mean_roads_built"] = mean_roads
+        if self._cities:
+            mean_cities = float(np.mean(self._cities))
+            self.logger.record("rollout/mean_cities_built", mean_cities)
+            log["train/mean_cities_built"] = mean_cities
         if self.model is not None:
             lr = self.model.lr_schedule(self.model._current_progress_remaining)
             self.logger.record("train/learning_rate", lr)
             log["train/learning_rate"] = lr
         if wandb.run is not None:
             wandb.log(log)
-        self._turns, self._vps, self._opp_vps, self._settlements, self._roads = \
-            [], [], [], [], []
+        self._turns, self._vps, self._opp_vps, self._settlements, self._roads, \
+            self._cities = [], [], [], [], [], []
 
 
 def make_vec_env(num_envs: int, enemy=None, building_bonus: float = 0.2):
