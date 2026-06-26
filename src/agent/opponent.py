@@ -10,9 +10,9 @@ import numpy as np
 
 from catanatron import Player
 from catanatron_gym.features import create_sample_vector, get_feature_ordering
-from catanatron_gym.envs.catanatron_env import (
-    ACTION_SPACE_SIZE, to_action_space, from_action_space,
-)
+# Imported as a module so the (monkeypatched) expanded action space is seen at
+# call time rather than frozen at import.
+import catanatron_gym.envs.catanatron_env as cenv
 
 
 class PolicyPlayer(Player):
@@ -49,11 +49,11 @@ class PolicyPlayer(Player):
         obs = np.array(
             create_sample_vector(game, self.color, self._features), dtype=float
         )
-        mask = np.zeros(ACTION_SPACE_SIZE, dtype=bool)
+        mask = np.zeros(cenv.ACTION_SPACE_SIZE, dtype=bool)
         for action in playable_actions:
-            mask[to_action_space(action)] = True
+            mask[cenv.to_action_space(action)] = True
 
         action_int, _ = self.policy.predict(
             obs, action_masks=mask, deterministic=True
         )
-        return from_action_space(int(action_int), playable_actions)
+        return cenv.from_action_space(int(action_int), playable_actions)

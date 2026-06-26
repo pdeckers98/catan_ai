@@ -23,15 +23,14 @@ from sb3_contrib import MaskablePPO
 import src.env.catan_env  # noqa: F401  -- applies custom rules (discard_limit=9)
 from catanatron import Game, Color
 from catanatron.models.player import RandomPlayer
-from catanatron.models.enums import Action, ActionType, RESOURCES, DEVELOPMENT_CARDS
+from catanatron.models.enums import (
+    ActionType, ActionPrompt, RESOURCES, DEVELOPMENT_CARDS,
+)
 from src.agent.opponent import PolicyPlayer
 from src.env.render import render_board
 
 HUMAN = Color.RED
 AI = Color.BLUE
-
-# 2-letter resource prefixes for typing discards (e.g. "wo wo wh").
-RESOURCE_PREFIX = {r[:2]: r for r in RESOURCES}
 
 # Controller modes.
 HUMAN_TURN = "human"   # waiting for the human to pick a move
@@ -111,7 +110,6 @@ class HumanVsAI:
         )
         self.mode = HUMAN_TURN
         self.message = ""
-        self._discard_buffer = []  # cards picked so far this discard (one at a time)
         self._build_ui()
         # AI (P0/BLUE) moves first in the opening; advance to the first human
         # decision before handing control over.
@@ -146,9 +144,6 @@ class HumanVsAI:
     def _on_submit(self, text):
         if self.mode != HUMAN_TURN:
             return
-        if self._is_human_discard():
-            self._submit_discard(text)
-            return
 
         actions = self.game.state.playable_actions
         try:
@@ -182,57 +177,9 @@ class HumanVsAI:
         # else: still the human's decision this turn -> keep prompting.
         self._render()
 
-    # ---- discard (choose your own cards) ---------------------------------
-    def _is_human_discard(self):
-        actions = self.game.state.playable_actions
-        return (self.game.state.current_color() == HUMAN
-                and len(actions) == 1
-                and actions[0].action_type == ActionType.DISCARD)
-
-    def _human_owned(self):
-        state = self.game.state
-        key = f"P{state.color_to_index[HUMAN]}"
-        return {r: state.player_state[f"{key}_{r}_IN_HAND"] for r in RESOURCES}
-
-    def _discard_need(self):
-        return sum(self._human_owned().values()) // 2
-
-    def _discard_menu(self):
-        """Resources still available to pick (owned minus what's already buffered)."""
-        owned = self._human_owned()
-        buf = self._discard_buffer
-        return [r for r in RESOURCES if owned[r] - buf.count(r) > 0]
-
-    def _submit_discard(self, text):
-        """Pick ONE card to discard; apply once enough have been picked."""
-        menu = self._discard_menu()
-        token = text.strip()
-        if token.isdigit() and int(token) < len(menu):
-            res = menu[int(token)]
-        else:
-            res = RESOURCE_PREFIX.get(token[:2].upper())
-        if res is None or res not in menu:
-            self._discard_error("Type the number of a resource you still hold.")
-            return
-
-        self._discard_buffer.append(res)
-        self.text_box.set_val("")
-        self.message = ""
-
-        if len(self._discard_buffer) < self._discard_need():
-            self._render()  # keep collecting one at a time
-            return
-
-        action = Action(HUMAN, ActionType.DISCARD, tuple(self._discard_buffer))
-        self._discard_buffer = []
-        # Explicit-value discards aren't in playable_actions, so skip validation.
-        self.game.execute(action, validate_action=False)
-        self._after_human_action(ended_turn=False)
-
-    def _discard_error(self, msg):
-        self.message = msg
-        self.text_box.set_val("")
-        self._render()
+    def _is_discard_prompt(self):
+        """True when the human is being asked to discard a card (after a 7)."""
+        return self.game.state.current_prompt == ActionPrompt.DISCARD
 
     def _on_next(self, _event):
         if self.mode != REVIEW:
@@ -261,25 +208,13 @@ class HumanVsAI:
             "-" * 36,
         ]
         winner = self.game.winning_color()
-        is_discard = winner is None and self.mode == HUMAN_TURN and self._is_human_discard()
         if winner is not None:
             who = "YOU WIN!" if winner == HUMAN else "AI WINS."
             header.append(f"GAME OVER -- {who}")
         elif self.mode == REVIEW:
             header.append(self.message)
-        elif is_discard:
-            owned = self._human_owned()
-            need = sum(owned.values()) // 2
-            buf = self._discard_buffer
-            remaining = need - len(buf)
-            header.append(f"7 ROLLED -- discard {need} cards, one at a time.")
-            if buf:
-                header.append("Discarded so far: " + " ".join(r[:2] for r in buf))
-            header.append(f"Pick card {len(buf) + 1} of {need} "
-                          f"({remaining} left) -- type its number:")
-            for i, r in enumerate(self._discard_menu()):
-                have = owned[r] - buf.count(r)
-                header.append(f"  {i}: {r}  (have {have})")
+        elif self.mode == HUMAN_TURN and self._is_discard_prompt():
+            header.append("7 ROLLED -- discard one card; pick its number:")
             if self.message:
                 header.append(self.message)
         else:
@@ -292,7 +227,7 @@ class HumanVsAI:
         )
 
         # Numbered legal moves, in up to 3 columns so long opening lists fit.
-        if self.mode == HUMAN_TURN and winner is None and not is_discard:
+        if self.mode == HUMAN_TURN and winner is None:
             actions = self.game.state.playable_actions
             labels = [f"{i:>2}: {_fmt_action(a, self.game)}" for i, a in enumerate(actions)]
             per_col = 32
