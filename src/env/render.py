@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, RegularPolygon, Rectangle
 
 from catanatron.models.enums import RESOURCES, ActionType
-from catanatron.models.map import NodeRef
+from catanatron.models.map import NodeRef, EdgeRef
 from catanatron.models.player import Color
 
 HEX_SIZE = 1.0
@@ -72,6 +72,34 @@ def _node_positions(board):
                 cy + HEX_SIZE * math.sin(angle),
             )
     return positions
+
+
+PORT_COLORS = {
+    **RESOURCE_COLORS,
+    None: "#dfe8f5",  # 3:1 ports: light blue (distinct from desert cream)
+}
+
+
+def _draw_harbors(ax, board, node_pos):
+    """Draw each port's coast edge and a 2:1 / 3:1 label."""
+    for port in board.map.ports_by_id.values():
+        edge_ref = EdgeRef(port.direction.value)
+        n1, n2 = port.edges[edge_ref]
+        if n1 not in node_pos or n2 not in node_pos:
+            continue
+        x1, y1 = node_pos[n1]
+        x2, y2 = node_pos[n2]
+        color = PORT_COLORS[port.resource]
+        ax.plot([x1, x2], [y1, y2], color=color, linewidth=7,
+                solid_capstyle="round", zorder=3)
+        label = f"2:1\n{port.resource[:3]}" if port.resource else "3:1"
+        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+        ax.text(
+            mx, my, label, ha="center", va="center",
+            fontsize=6.5, fontweight="bold", color="black", zorder=8,
+            bbox=dict(boxstyle="round,pad=0.15", facecolor=color,
+                      edgecolor="black", linewidth=0.5, alpha=0.95),
+        )
 
 
 def _last_dice_roll(state):
@@ -149,6 +177,8 @@ def render_board(game, ax=None, title=None, label_nodes=False, show_info=True):
             )
         if coordinate == board.robber_coordinate:
             ax.add_patch(Circle((cx, cy), HEX_SIZE * 0.3, facecolor="black", zorder=5))
+
+    _draw_harbors(ax, board, node_pos)
 
     drawn_edges = set()
     for edge, color in board.roads.items():
