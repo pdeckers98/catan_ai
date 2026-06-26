@@ -99,15 +99,14 @@ def make_vec_env(num_envs: int, enemy=None):
 
 
 def sample_opponent():
-    """Sample an opponent: either WeightedRandom or a random checkpoint from pool.
+    """Sample an opponent from the checkpoint pool, or WeightedRandom if empty.
 
-    30% of the time (or whenever the pool is empty) use the built-in
-    WeightedRandomPlayer; otherwise wrap a saved checkpoint in PolicyPlayer for
-    self-play. PolicyPlayer builds its own observation from the live game, so it
-    works inside SubprocVecEnv workers.
+    Uses WeightedRandom only as a bootstrap before any checkpoint exists.
+    Once the pool has at least one entry, always sample from it so the agent
+    trains against its own past policies rather than a fixed bot.
     """
     checkpoints = list_checkpoints()
-    if not checkpoints or random.random() < 0.3:
+    if not checkpoints:
         return WeightedRandomPlayer(Color.RED)
 
     checkpoint = random.choice(checkpoints)
