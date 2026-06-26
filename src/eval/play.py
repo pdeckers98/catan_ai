@@ -15,6 +15,7 @@ Run: ``python -m src.eval.play``  (optional ``--model PATH`` / ``--seed N``)
 """
 
 import argparse
+import random
 
 import matplotlib.pyplot as plt
 from matplotlib.widgets import TextBox, Button
@@ -101,13 +102,12 @@ class HumanVsAI:
     """Drives a manual game loop: human (RED) vs frozen policy (BLUE)."""
 
     def __init__(self, model_path, seed=None):
-        model = MaskablePPO.load(model_path, device="cpu")
+        model = MaskablePPO.load(model_path, device="cpu", custom_objects={"n_steps": 1})
         self.ai = PolicyPlayer(AI, model)
-        self.game = Game(
-            players=[RandomPlayer(AI), RandomPlayer(HUMAN)],
-            seed=seed,
-            vps_to_win=15,
-        )
+        players = [RandomPlayer(AI), RandomPlayer(HUMAN)]
+        if random.random() < 0.5:
+            players = [RandomPlayer(HUMAN), RandomPlayer(AI)]
+        self.game = Game(players=players, seed=seed, vps_to_win=15)
         self.mode = HUMAN_TURN
         self.message = ""
         self._build_ui()
@@ -128,6 +128,7 @@ class HumanVsAI:
         self.text_box.on_submit(self._on_submit)
         self.next_btn = Button(ax_btn, "Next turn")
         self.next_btn.on_clicked(self._on_next)
+        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
     # ---- game progression ------------------------------------------------
     def _run_ai_until_human(self):
@@ -141,7 +142,15 @@ class HumanVsAI:
         else:
             self.mode = HUMAN_TURN
 
+    def _on_key(self, event):
+        if event.key == "enter" and self.mode == REVIEW:
+            self._on_next(None)
+
     def _on_submit(self, text):
+        if not text.strip():
+            if self.mode == REVIEW:
+                self._on_next(None)
+            return
         if self.mode != HUMAN_TURN:
             return
 

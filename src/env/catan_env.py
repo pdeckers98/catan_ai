@@ -123,7 +123,9 @@ class RewardShapingWrapper(Wrapper):
         self._settlements_built = 0
         self._prev_settlements_avail = 5
         self._3rd_settlement_bonus_given = False
+        self._4th_settlement_bonus_given = False
         self._1st_city_bonus_given = False
+        self._2nd_city_bonus_given = False
 
     def _actual_vp(self, color):
         state = self.env.unwrapped.game.state
@@ -151,7 +153,9 @@ class RewardShapingWrapper(Wrapper):
         self._settlements_built = 0
         self._prev_settlements_avail = self._settlements_available(self.agent_color)
         self._3rd_settlement_bonus_given = False
+        self._4th_settlement_bonus_given = False
         self._1st_city_bonus_given = False
+        self._2nd_city_bonus_given = False
         return obs, info
 
     def step(self, action):
@@ -172,9 +176,18 @@ class RewardShapingWrapper(Wrapper):
             reward += 0.05
             self._3rd_settlement_bonus_given = True
 
-        if self._cities_built(self.agent_color) >= 1 and not self._1st_city_bonus_given:
+        if self._settlements_built >= 4 and not self._4th_settlement_bonus_given:
+            reward += 0.05
+            self._4th_settlement_bonus_given = True
+
+        cities = self._cities_built(self.agent_color)
+        if cities >= 1 and not self._1st_city_bonus_given:
             reward += 0.05
             self._1st_city_bonus_given = True
+
+        if cities >= 2 and not self._2nd_city_bonus_given:
+            reward += 0.05
+            self._2nd_city_bonus_given = True
 
         if terminated or truncated:
             opponent = next(
