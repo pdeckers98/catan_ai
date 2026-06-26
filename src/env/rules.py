@@ -23,12 +23,12 @@ Four things happen here:
    never runs; we sequence discarders off ``state.discard_limit``.
 
 4. **Colonist.io 1v1 robber restrictions.** Two constraints on MOVE_ROBBER:
-   - You may never place the robber on a tile where you have a settlement or city
-     on any corner node.
    - You may only place the robber on a tile that has an opponent building if the
-     opponent has placed ≥3 settlements OR built ≥1 city. This prevents camping the
-     robber immediately after the initial setup when each player has exactly 2
-     settlements and is still building out.
+     opponent has placed ≥3 settlements on the board OR built ≥1 city. This prevents
+     camping the robber immediately after the initial setup.
+   - You may only place the robber on a tile where YOU have a building if you
+     yourself have >2 settlements on the board OR ≥1 city. Once you have expanded
+     beyond the initial 2 settlements, self-robbing is a legal strategic choice.
    If all tiles are excluded by both rules (degenerate edge case), the filter is
    lifted so the engine always has at least one legal action.
 """
@@ -187,11 +187,19 @@ def _patch_robber_placement() -> None:
 
         # Identify the single opponent (1v1 only).
         opponent = next(c for c in state.colors if c != color)
+
+        my_key = player_key(state, color)
         opp_key = player_key(state, opponent)
+
         # Settlements on the board = pieces placed out (cities return the piece).
-        opp_settlements_on_board = 5 - state.player_state[f"{opp_key}_SETTLEMENTS_AVAILABLE"]
-        opp_cities_on_board = 4 - state.player_state[f"{opp_key}_CITIES_AVAILABLE"]
-        opp_can_be_robbed = opp_settlements_on_board >= 3 or opp_cities_on_board >= 1
+        my_settlements = 5 - state.player_state[f"{my_key}_SETTLEMENTS_AVAILABLE"]
+        my_cities = 4 - state.player_state[f"{my_key}_CITIES_AVAILABLE"]
+        opp_settlements = 5 - state.player_state[f"{opp_key}_SETTLEMENTS_AVAILABLE"]
+        opp_cities = 4 - state.player_state[f"{opp_key}_CITIES_AVAILABLE"]
+
+        # Self-robbing is only legal once you've expanded beyond initial setup.
+        self_rob_allowed = my_settlements > 2 or my_cities >= 1
+        opp_can_be_robbed = opp_settlements >= 3 or opp_cities >= 1
 
         # Build a set of tile coordinates that are off-limits.
         excluded = set()
@@ -205,7 +213,7 @@ def _patch_robber_placement() -> None:
                         has_own = True
                     else:
                         has_opp = True
-            if has_own:
+            if has_own and not self_rob_allowed:
                 excluded.add(coord)
             elif has_opp and not opp_can_be_robbed:
                 excluded.add(coord)
