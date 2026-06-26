@@ -54,11 +54,18 @@ def apply_rule_patches(discard_limit: int = DISCARD_LIMIT) -> None:
 
 
 def _patch_discard_limit(discard_limit: int) -> None:
-    """Default ``Game``'s ``discard_limit`` to our value when unspecified."""
+    """Default ``Game``'s ``discard_limit`` to our value when unspecified.
+
+    Game.__init__ signature is (players, seed, discard_limit, ...), so
+    discard_limit is positional index 2 (excluding self). game.copy() calls
+    Game([], None, None, initialize=False), passing None as the third
+    positional arg. We must not also inject it as a keyword in that case.
+    """
     orig_init = _game_mod.Game.__init__
 
     def patched_init(self, *args, **kwargs):
-        kwargs.setdefault("discard_limit", discard_limit)
+        if len(args) <= 2 and "discard_limit" not in kwargs:
+            kwargs["discard_limit"] = discard_limit
         orig_init(self, *args, **kwargs)
 
     _game_mod.Game.__init__ = patched_init
