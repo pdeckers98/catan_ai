@@ -145,7 +145,7 @@ def evaluate(model, opponent, num_games: int = 50) -> float:
 def main():
     parser = argparse.ArgumentParser(description="Train MaskablePPO agent with self-play.")
     parser.add_argument("--total-steps", type=int, default=500_000)
-    parser.add_argument("--eval-interval", type=int, default=50_000)
+    parser.add_argument("--eval-interval", type=int, default=100_000)
     parser.add_argument("--w-b-project", type=str, default="catan-ai")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n-steps", type=int, default=2048,
@@ -162,7 +162,7 @@ def main():
             "eval_interval": args.eval_interval,
             "model": "MaskablePPO",
             "policy": "MlpPolicy",
-            "net_arch": [64, 64],
+            "net_arch": [32, 32, 32],
             "num_envs": 8,
             "n_steps": args.n_steps,
         },
@@ -174,7 +174,7 @@ def main():
         "MlpPolicy",
         env,
         n_steps=args.n_steps,
-        policy_kwargs={"net_arch": [64, 64]},
+        policy_kwargs={"net_arch": [32, 32, 32]},
         verbose=1,
         device="cpu",
     )
