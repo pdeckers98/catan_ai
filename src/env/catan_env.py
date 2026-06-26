@@ -107,6 +107,10 @@ class RewardShapingWrapper(Wrapper):
      12 VP -> +0.50
     The base env still provides +1 on win and -1 on loss.
 
+    Two additional one-time building bonuses:
+      3rd settlement placed -> +0.05
+      1st city built        -> +0.05
+
     On episode end, records final VPs and build counts in ``info`` for W&B.
 
     Place this OUTSIDE TurnLimitWrapper so it observes turn-limit truncations too.
@@ -118,6 +122,8 @@ class RewardShapingWrapper(Wrapper):
         self._milestones_reached: set = set()
         self._settlements_built = 0
         self._prev_settlements_avail = 5
+        self._3rd_settlement_bonus_given = False
+        self._1st_city_bonus_given = False
 
     def _actual_vp(self, color):
         state = self.env.unwrapped.game.state
@@ -144,6 +150,8 @@ class RewardShapingWrapper(Wrapper):
         self._milestones_reached = set()
         self._settlements_built = 0
         self._prev_settlements_avail = self._settlements_available(self.agent_color)
+        self._3rd_settlement_bonus_given = False
+        self._1st_city_bonus_given = False
         return obs, info
 
     def step(self, action):
@@ -159,6 +167,14 @@ class RewardShapingWrapper(Wrapper):
         if avail < self._prev_settlements_avail:
             self._settlements_built += self._prev_settlements_avail - avail
         self._prev_settlements_avail = avail
+
+        if self._settlements_built >= 3 and not self._3rd_settlement_bonus_given:
+            reward += 0.05
+            self._3rd_settlement_bonus_given = True
+
+        if self._cities_built(self.agent_color) >= 1 and not self._1st_city_bonus_given:
+            reward += 0.05
+            self._1st_city_bonus_given = True
 
         if terminated or truncated:
             opponent = next(
