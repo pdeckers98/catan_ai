@@ -98,14 +98,14 @@ def make_vec_env(num_envs: int, enemy=None):
     return SubprocVecEnv([make_env() for _ in range(num_envs)])
 
 
-def sample_opponent():
+def sample_opponent(checkpoint_dir):
     """Sample an opponent from the checkpoint pool, or WeightedRandom if empty.
 
     Uses WeightedRandom only as a bootstrap before any checkpoint exists.
     Once the pool has at least one entry, always sample from it so the agent
     trains against its own past policies rather than a fixed bot.
     """
-    checkpoints = list_checkpoints()
+    checkpoints = list_checkpoints(checkpoint_dir)
     if not checkpoints:
         return WeightedRandomPlayer(Color.RED)
 
@@ -147,6 +147,9 @@ def main():
     parser.add_argument("--total-steps", type=int, default=500_000)
     parser.add_argument("--eval-interval", type=int, default=100_000)
     parser.add_argument("--w-b-project", type=str, default="catan-ai")
+    parser.add_argument("--run-name", type=str, default=None,
+                        help="Subdirectory under checkpoints/ for this run. "
+                             "Defaults to the W&B run name.")
     parser.add_argument("--seed", type=int, default=None,
                         help="RNG seed. Omit to pick one randomly.")
     parser.add_argument("--n-steps", type=int, default=4096,
@@ -155,20 +158,22 @@ def main():
                         help="PPO minibatch size. Must divide n_steps * num_envs.")
     parser.add_argument("--ent-coef", type=float, default=0.01,
                         help="Entropy bonus coefficient.")
+    parser.add_argument("--net-arch", type=int, nargs="+", default=[32, 32, 32],
+                        help="Hidden layer sizes, e.g. --net-arch 256 256.")
     args = parser.parse_args()
 
     seed = args.seed if args.seed is not None else random.randint(0, 2**31 - 1)
     random.seed(seed)
     np.random.seed(seed)
 
-    wandb.init(
+    run = wandb.init(
         project=args.w_b_project,
         config={
             "total_steps": args.total_steps,
             "eval_interval": args.eval_interval,
             "model": "MaskablePPO",
             "policy": "MlpPolicy",
-            "net_arch": [32, 32, 32],
+            "net_arch": args.net_arch,
             "num_envs": 8,
             "n_steps": args.n_steps,
             "batch_size": args.batch_size,
@@ -176,6 +181,11 @@ def main():
             "seed": seed,
         },
     )
+
+    run_name = args.run_name or run.name
+    checkpoint_dir = Path("checkpoints") / run_name
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[Run] Checkpoints -> {checkpoint_dir}")
 
     num_envs = 8
     env = make_vec_env(num_envs=num_envs)
@@ -185,7 +195,7 @@ def main():
         n_steps=args.n_steps,
         batch_size=args.batch_size,
         ent_coef=args.ent_coef,
-        policy_kwargs={"net_arch": [32, 32, 32]},
+        policy_kwargs={"net_arch": args.net_arch},
         verbose=1,
         device="cpu",
     )
@@ -208,7 +218,7 @@ def main():
         steps_done += interval
         eval_step += 1
 
-        opponent = sample_opponent()
+        opponent = sample_opponent(checkpoint_dir)
         print(f"[Eval] Testing against {opponent.__class__.__name__}...", end="", flush=True)
         win_rate = evaluate(model, opponent, num_games=25)
 
@@ -221,18 +231,18 @@ def main():
 
         if eval_step % 2 == 0:
             print(f"[Checkpoint] Saving model at step {steps_done}")
-            save_checkpoint(model, steps_done)
-            prune_checkpoints(keep_n=3)
+            save_checkpoint(model, steps_done, checkpoint_dir)
+            prune_checkpoints(checkpoint_dir, keep_n=3)
             wandb.log({"checkpoint/step": steps_done})
 
-        opponent = sample_opponent()
+        opponent = sample_opponent(checkpoint_dir)
         print(f"[Self-play] Swapping to {opponent.__class__.__name__}")
         env = make_vec_env(num_envs=num_envs, enemy=opponent)
         model.set_env(env)
 
-    model.save(str(Path("checkpoints") / "agent_final"))
+    model.save(str(checkpoint_dir / "agent_final"))
     wandb.finish()
-    print("Training complete. Model saved to checkpoints/agent_final")
+    print(f"Training complete. Model saved to {checkpoint_dir / 'agent_final'}")
 
 
 if __name__ == "__main__":
