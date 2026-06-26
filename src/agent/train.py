@@ -148,13 +148,19 @@ def main():
     parser.add_argument("--total-steps", type=int, default=500_000)
     parser.add_argument("--eval-interval", type=int, default=100_000)
     parser.add_argument("--w-b-project", type=str, default="catan-ai")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--n-steps", type=int, default=2048,
+    parser.add_argument("--seed", type=int, default=None,
+                        help="RNG seed. Omit to pick one randomly.")
+    parser.add_argument("--n-steps", type=int, default=4096,
                         help="PPO rollout length per env before each update.")
+    parser.add_argument("--batch-size", type=int, default=256,
+                        help="PPO minibatch size. Must divide n_steps * num_envs.")
+    parser.add_argument("--ent-coef", type=float, default=0.01,
+                        help="Entropy bonus coefficient.")
     args = parser.parse_args()
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
+    seed = args.seed if args.seed is not None else random.randint(0, 2**31 - 1)
+    random.seed(seed)
+    np.random.seed(seed)
 
     wandb.init(
         project=args.w_b_project,
@@ -166,6 +172,9 @@ def main():
             "net_arch": [32, 32, 32],
             "num_envs": 8,
             "n_steps": args.n_steps,
+            "batch_size": args.batch_size,
+            "ent_coef": args.ent_coef,
+            "seed": seed,
         },
     )
 
@@ -175,6 +184,8 @@ def main():
         "MlpPolicy",
         env,
         n_steps=args.n_steps,
+        batch_size=args.batch_size,
+        ent_coef=args.ent_coef,
         policy_kwargs={"net_arch": [32, 32, 32]},
         verbose=1,
         device="cpu",
