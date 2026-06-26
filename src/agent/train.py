@@ -210,7 +210,7 @@ def main():
 
         opponent = sample_opponent()
         print(f"[Eval] Testing against {opponent.__class__.__name__}...", end="", flush=True)
-        win_rate = evaluate(model, opponent, num_games=50)
+        win_rate = evaluate(model, opponent, num_games=25)
 
         wandb.log({
             "step": steps_done,
