@@ -40,6 +40,7 @@ class GameTurnCallback(BaseCallback):
         self._turns: list[int] = []
         self._vps: list[int] = []
         self._opp_vps: list[int] = []
+        self._settlements: list[int] = []
 
     def _on_step(self) -> bool:
         for info in self.locals.get("infos", []):
@@ -49,6 +50,8 @@ class GameTurnCallback(BaseCallback):
                 self._vps.append(info["final_vp"])
             if "opp_vp" in info:
                 self._opp_vps.append(info["opp_vp"])
+            if "settlements_built" in info:
+                self._settlements.append(info["settlements_built"])
         return True
 
     def _on_rollout_end(self) -> None:
@@ -69,21 +72,26 @@ class GameTurnCallback(BaseCallback):
             mean_opp_vp = float(np.mean(self._opp_vps))
             self.logger.record("rollout/mean_opp_vp", mean_opp_vp)
             log["train/mean_opp_vp"] = mean_opp_vp
+        if self._settlements:
+            mean_settlements = float(np.mean(self._settlements))
+            self.logger.record("rollout/mean_settlements_built", mean_settlements)
+            log["train/mean_settlements_built"] = mean_settlements
         if self.model is not None:
             lr = self.model.lr_schedule(self.model._current_progress_remaining)
             self.logger.record("train/learning_rate", lr)
             log["train/learning_rate"] = lr
         if wandb.run is not None:
             wandb.log(log)
-        self._turns, self._vps, self._opp_vps = [], [], []
+        self._turns, self._vps, self._opp_vps, self._settlements = [], [], [], []
 
 
-def make_vec_env(num_envs: int, enemy=None):
+def make_vec_env(num_envs: int, enemy=None, building_bonus: float = 0.05):
     """Create a vectorized environment with num_envs parallel games.
 
     Args:
         num_envs: number of parallel environments.
         enemy: opponent Player instance. Defaults to WeightedRandomPlayer.
+        building_bonus: reward added each time the agent places a settlement or city.
 
     Returns:
         SubprocVecEnv with num_envs workers.
@@ -95,7 +103,7 @@ def make_vec_env(num_envs: int, enemy=None):
         def _init():
             env = make_1v1_env(enemy=enemy)
             env = TurnLimitWrapper(ActionMasker(env, valid_action_mask), max_turns=300)
-            env = RewardShapingWrapper(env)
+            env = RewardShapingWrapper(env, building_bonus=building_bonus)
             return env
         return _init
 
@@ -160,10 +168,17 @@ def main():
                         help="PPO rollout length per env before each update.")
     parser.add_argument("--batch-size", type=int, default=256,
                         help="PPO minibatch size. Must divide n_steps * num_envs.")
-    parser.add_argument("--ent-coef", type=float, default=0.01,
-                        help="Entropy bonus coefficient.")
+    parser.add_argument("--ent-coef", type=float, default=0.05,
+                        help="Entropy bonus coefficient (raised from 0.01 to discourage "
+                             "collapsing to road-heavy policies).")
     parser.add_argument("--net-arch", type=int, nargs="+", default=[32, 32, 32],
                         help="Hidden layer sizes, e.g. --net-arch 256 256.")
+    parser.add_argument("--building-bonus", type=float, default=0.05,
+                        help="Reward added each time the agent places a settlement or city. "
+                             "Counteracts the incentive to road-rush for longest road.")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to a checkpoint zip to resume from. "
+                             "Step count is parsed from the filename (agent_step_XXXXXXXX).")
     args = parser.parse_args()
 
     seed = args.seed if args.seed is not None else random.randint(0, 2**31 - 1)
@@ -182,6 +197,7 @@ def main():
             "n_steps": args.n_steps,
             "batch_size": args.batch_size,
             "ent_coef": args.ent_coef,
+            "building_bonus": args.building_bonus,
             "seed": seed,
         },
     )
@@ -192,23 +208,35 @@ def main():
     print(f"[Run] Checkpoints -> {checkpoint_dir}")
 
     num_envs = 8
-    env = make_vec_env(num_envs=num_envs)
-    model = MaskablePPO(
-        "MlpPolicy",
-        env,
-        n_steps=args.n_steps,
-        batch_size=args.batch_size,
-        ent_coef=args.ent_coef,
-        policy_kwargs={"net_arch": args.net_arch},
-        verbose=1,
-        device="cpu",
-    )
+    env = make_vec_env(num_envs=num_envs, building_bonus=args.building_bonus)
+
+    if args.resume:
+        resume_path = Path(args.resume)
+        model = MaskablePPO.load(str(resume_path), env=env, device="cpu")
+        # Parse step count from filename, e.g. agent_step_01200000[.zip]
+        stem = resume_path.stem  # strips .zip if present
+        try:
+            steps_done = int(stem.split("_")[-1])
+        except ValueError:
+            steps_done = 0
+        print(f"[Resume] Loaded {resume_path}, continuing from step {steps_done}")
+    else:
+        model = MaskablePPO(
+            "MlpPolicy",
+            env,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            ent_coef=args.ent_coef,
+            policy_kwargs={"net_arch": args.net_arch},
+            verbose=1,
+            device="cpu",
+        )
+        steps_done = 0
 
     turn_callback = GameTurnCallback()
     wandb_callback = WandbCallback(verbose=0)
     callbacks = CallbackList([turn_callback, wandb_callback])
 
-    steps_done = 0
     eval_step = 0
     while steps_done < args.total_steps:
         interval = min(args.eval_interval, args.total_steps - steps_done)
@@ -241,7 +269,7 @@ def main():
 
         opponent = sample_opponent(checkpoint_dir)
         print(f"[Self-play] Swapping to {opponent.__class__.__name__}")
-        env = make_vec_env(num_envs=num_envs, enemy=opponent)
+        env = make_vec_env(num_envs=num_envs, enemy=opponent, building_bonus=args.building_bonus)
         model.set_env(env)
 
     model.save(str(checkpoint_dir / "agent_final"))

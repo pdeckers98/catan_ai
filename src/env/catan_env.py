@@ -103,23 +103,46 @@ class RewardShapingWrapper(Wrapper):
     the defaults (base 1.3, scale 0.02) a full 2->15 VP climb sums to ~+1.0, on par
     with the terminal win bonus.
 
+    A small ``building_bonus`` fires each time the agent places a settlement or
+    upgrades to a city. This counteracts the incentive to road-rush for longest road
+    (which also jumps VP by 2) and encourages the agent to convert roads into
+    structures rather than accumulating them indefinitely.
+
     On episode end it records final VPs in ``info`` (``final_vp``, ``opp_vp``) so a
     callback can stream per-game VP averages to W&B.
 
     Place this OUTSIDE TurnLimitWrapper so it observes turn-limit truncations too.
     """
 
-    def __init__(self, env, agent_color=Color.BLUE, vp_base=1.3, vp_scale=0.02):
+    def __init__(self, env, agent_color=Color.BLUE, vp_base=1.3, vp_scale=0.02,
+                 building_bonus=0.05):
         super().__init__(env)
         self.agent_color = agent_color
         self.vp_base = vp_base
         self.vp_scale = vp_scale
+        self.building_bonus = building_bonus
         self._prev_potential = 0.0
+        self._prev_buildings = 0
+        self._settlements_built = 0       # cumulative settlement placements this episode
+        self._prev_settlements_avail = 5  # decrements on placement, ticks up on city upgrade
 
     def _actual_vp(self, color):
         state = self.env.unwrapped.game.state
         key = f"P{state.color_to_index[color]}"
         return state.player_state[f"{key}_ACTUAL_VICTORY_POINTS"]
+
+    def _buildings_placed(self, color):
+        """Total settlements + cities placed so far (counts up from 0)."""
+        state = self.env.unwrapped.game.state
+        key = f"P{state.color_to_index[color]}"
+        settlements_placed = 5 - state.player_state[f"{key}_SETTLEMENTS_AVAILABLE"]
+        cities_placed = 4 - state.player_state[f"{key}_CITIES_AVAILABLE"]
+        return settlements_placed + cities_placed
+
+    def _settlements_available(self, color):
+        state = self.env.unwrapped.game.state
+        key = f"P{state.color_to_index[color]}"
+        return state.player_state[f"{key}_SETTLEMENTS_AVAILABLE"]
 
     def _potential(self, vp):
         return self.vp_base ** vp
@@ -127,6 +150,9 @@ class RewardShapingWrapper(Wrapper):
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self._prev_potential = self._potential(self._actual_vp(self.agent_color))
+        self._prev_buildings = self._buildings_placed(self.agent_color)
+        self._settlements_built = 0
+        self._prev_settlements_avail = self._settlements_available(self.agent_color)
         return obs, info
 
     def step(self, action):
@@ -135,6 +161,20 @@ class RewardShapingWrapper(Wrapper):
         potential = self._potential(vp)
         reward += self.vp_scale * (potential - self._prev_potential)
         self._prev_potential = potential
+
+        buildings = self._buildings_placed(self.agent_color)
+        if buildings > self._prev_buildings:
+            reward += self.building_bonus * (buildings - self._prev_buildings)
+        self._prev_buildings = buildings
+
+        # Count settlement placements: SETTLEMENTS_AVAILABLE drops by 1 each time a
+        # settlement is placed, and rises by 1 when a city is built (piece returned).
+        # Tracking decreases only gives total placements regardless of later upgrades.
+        avail = self._settlements_available(self.agent_color)
+        if avail < self._prev_settlements_avail:
+            self._settlements_built += self._prev_settlements_avail - avail
+        self._prev_settlements_avail = avail
+
         if terminated or truncated:
             opponent = next(
                 c for c in self.env.unwrapped.game.state.colors
@@ -142,6 +182,7 @@ class RewardShapingWrapper(Wrapper):
             )
             info["final_vp"] = vp
             info["opp_vp"] = self._actual_vp(opponent)
+            info["settlements_built"] = self._settlements_built
         return obs, reward, terminated, truncated, info
 
 
