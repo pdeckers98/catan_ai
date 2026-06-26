@@ -10,9 +10,10 @@ from pathlib import Path
 
 import numpy as np
 import wandb
+from wandb.integration.sb3 import WandbCallback
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from catanatron import Color
@@ -180,6 +181,8 @@ def main():
     )
 
     turn_callback = GameTurnCallback()
+    wandb_callback = WandbCallback(verbose=0)
+    callbacks = CallbackList([turn_callback, wandb_callback])
 
     steps_done = 0
     eval_step = 0
@@ -189,7 +192,7 @@ def main():
         model.learn(
             total_timesteps=interval,
             progress_bar=True,
-            callback=turn_callback,
+            callback=callbacks,
             reset_num_timesteps=False,
         )
         steps_done += interval
