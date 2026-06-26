@@ -4,7 +4,7 @@ We keep these as monkeypatches (not edits to the installed package) so the chang
 lives in version control and is reapplied automatically in every process -- including
 the fresh interpreters that ``SubprocVecEnv`` spawns for parallel training.
 
-Three things happen here:
+Four things happen here:
 
 1. **Discard threshold raised to 9.** Stock Catanatron makes you discard on a 7
    when you hold *more than 7* cards (``discard_limit=7``). The gym env builds
@@ -21,6 +21,16 @@ Three things happen here:
 3. **Correct multi-discarder sequencing.** Because we fully own the discard
    transition now, the buggy upstream re-check (``state.py:489`` hardcoded ``> 7``)
    never runs; we sequence discarders off ``state.discard_limit``.
+
+4. **Colonist.io 1v1 robber restrictions.** Two constraints on MOVE_ROBBER:
+   - You may never place the robber on a tile where you have a settlement or city
+     on any corner node.
+   - You may only place the robber on a tile that has an opponent building if the
+     opponent has placed ≥3 settlements OR built ≥1 city. This prevents camping the
+     robber immediately after the initial setup when each player has exactly 2
+     settlements and is still building out.
+   If all tiles are excluded by both rules (degenerate edge case), the filter is
+   lifted so the engine always has at least one legal action.
 """
 
 import gymnasium.spaces as _spaces
@@ -49,6 +59,7 @@ def apply_rule_patches(discard_limit: int = DISCARD_LIMIT) -> None:
         return
     _patch_discard_limit(discard_limit)
     _patch_sequential_discard()
+    _patch_robber_placement()
     _patch_gym_action_space()
     setattr(_game_mod, _PATCH_FLAG, True)
 
@@ -162,6 +173,48 @@ def _largest_stack(state, color):
     key = player_key(state, color)
     counts = {r: state.player_state[f"{key}_{r}_IN_HAND"] for r in RESOURCES}
     return max(RESOURCES, key=lambda r: (counts[r], -RESOURCES.index(r)))
+
+
+# --------------------------------------------------------------------------
+# Colonist.io 1v1 robber placement restrictions
+# --------------------------------------------------------------------------
+def _patch_robber_placement() -> None:
+    """Filter MOVE_ROBBER actions to enforce Colonist.io 1v1 robber rules."""
+    orig_robber = _actions_mod.robber_possibilities
+
+    def patched_robber(state, color):
+        actions = orig_robber(state, color)
+
+        # Identify the single opponent (1v1 only).
+        opponent = next(c for c in state.colors if c != color)
+        opp_key = player_key(state, opponent)
+        # Settlements on the board = pieces placed out (cities return the piece).
+        opp_settlements_on_board = 5 - state.player_state[f"{opp_key}_SETTLEMENTS_AVAILABLE"]
+        opp_cities_on_board = 4 - state.player_state[f"{opp_key}_CITIES_AVAILABLE"]
+        opp_can_be_robbed = opp_settlements_on_board >= 3 or opp_cities_on_board >= 1
+
+        # Build a set of tile coordinates that are off-limits.
+        excluded = set()
+        for coord, tile in state.board.map.land_tiles.items():
+            has_own = False
+            has_opp = False
+            for node_id in tile.nodes.values():
+                building = state.board.buildings.get(node_id)
+                if building is not None:
+                    if building[0] == color:
+                        has_own = True
+                    else:
+                        has_opp = True
+            if has_own:
+                excluded.add(coord)
+            elif has_opp and not opp_can_be_robbed:
+                excluded.add(coord)
+
+        filtered = [a for a in actions if a.value[0] not in excluded]
+        # Fallback: never leave the engine with zero legal robber moves.
+        return filtered if filtered else actions
+
+    _actions_mod.robber_possibilities = patched_robber
 
 
 # --------------------------------------------------------------------------
