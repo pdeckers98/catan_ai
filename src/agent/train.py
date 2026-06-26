@@ -100,13 +100,12 @@ class GameTurnCallback(BaseCallback):
             self._cities = [], [], [], [], [], []
 
 
-def make_vec_env(num_envs: int, enemy=None, building_bonus: float = 0.2):
+def make_vec_env(num_envs: int, enemy=None):
     """Create a vectorized environment with num_envs parallel games.
 
     Args:
         num_envs: number of parallel environments.
         enemy: opponent Player instance. Defaults to WeightedRandomPlayer.
-        building_bonus: reward added each time the agent places a settlement or city.
 
     Returns:
         SubprocVecEnv with num_envs workers.
@@ -118,7 +117,7 @@ def make_vec_env(num_envs: int, enemy=None, building_bonus: float = 0.2):
         def _init():
             env = make_1v1_env(enemy=enemy)
             env = TurnLimitWrapper(ActionMasker(env, valid_action_mask), max_turns=300)
-            env = RewardShapingWrapper(env, building_bonus=building_bonus)
+            env = RewardShapingWrapper(env)
             return env
         return _init
 
@@ -188,9 +187,6 @@ def main():
                              "collapsing to road-heavy policies).")
     parser.add_argument("--net-arch", type=int, nargs="+", default=[32, 32, 32],
                         help="Hidden layer sizes, e.g. --net-arch 256 256.")
-    parser.add_argument("--building-bonus", type=float, default=0.2,
-                        help="Reward added each time the agent places a settlement or city. "
-                             "Counteracts the incentive to road-rush for longest road.")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to a checkpoint zip to resume from. "
                              "Step count is parsed from the filename (agent_step_XXXXXXXX).")
@@ -212,7 +208,6 @@ def main():
             "n_steps": args.n_steps,
             "batch_size": args.batch_size,
             "ent_coef": args.ent_coef,
-            "building_bonus": args.building_bonus,
             "seed": seed,
         },
     )
@@ -223,7 +218,7 @@ def main():
     print(f"[Run] Checkpoints -> {checkpoint_dir}")
 
     num_envs = 8
-    env = make_vec_env(num_envs=num_envs, building_bonus=args.building_bonus)
+    env = make_vec_env(num_envs=num_envs)
 
     if args.resume:
         resume_path = Path(args.resume)
@@ -284,7 +279,7 @@ def main():
 
         opponent = sample_opponent(checkpoint_dir)
         print(f"[Self-play] Swapping to {opponent.__class__.__name__}")
-        env = make_vec_env(num_envs=num_envs, enemy=opponent, building_bonus=args.building_bonus)
+        env = make_vec_env(num_envs=num_envs, enemy=opponent)
         model.set_env(env)
 
     model.save(str(checkpoint_dir / "agent_final"))
