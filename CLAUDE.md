@@ -19,19 +19,18 @@ the agent and, later, the web integration.
   self-play, where PUCT tree search supplies the improved policy target. `src/agent/train_az.py`.
   The older `MaskablePPO` (`stable-baselines3` + `sb3-contrib`) loop is kept as a legacy
   baseline in `src/agent/train.py`.
-- **Game mode**: 1v1 (`enemies=[one bot]`, `map_type="BASE"`, `vps_to_win=7`)
+- **Game mode**: 1v1 (`enemies=[one bot]`, `map_type="BASE"`, `vps_to_win=8`)
 - **Custom rules**: `src/env/rules.py` monkeypatches Catanatron at import time. Applied
-  automatically via `src/env/catan_env.py`. Eight patches:
+  automatically via `src/env/catan_env.py`. Seven patches:
   1. discard on a 7 only above **9** cards (`discard_limit=9`, vs. stock 7)
   2. per-resource, one-card-at-a-time discard the policy actually chooses
      (expands the action space 290 → **294**)
   3. correct multi-discarder sequencing (fixes an upstream `> 7` hardcode)
   4. Colonist.io 1v1 robber placement restrictions
   5. **Longest Road awards no VP** (length still tracked, `HAS_ROAD` never set)
-  6. **Largest Army awards no VP** (knights still counted, `HAS_ARMY` never set)
-  7. a dev card **cannot be played the turn it was bought** (one-per-turn is already
+  6. a dev card **cannot be played the turn it was bought** (one-per-turn is already
      enforced upstream)
-  8. `_discard_remaining` survives `State.copy()` — required for MCTS
+  7. `_discard_remaining` survives `State.copy()` — required for MCTS
 - **Reward shaping**: only on the legacy PPO track (`RewardShapingWrapper`, milestone VP
   bonuses). AlphaZero trains on the sparse win/loss outcome; search provides the dense signal.
 - **Action masking**: mandatory — most of the 294 actions are illegal each turn; always respect

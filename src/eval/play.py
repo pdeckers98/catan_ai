@@ -1,7 +1,7 @@
 """Play a 1v1 game against the trained agent in a matplotlib window.
 
 You are RED; the trained agent is BLUE -- the side it trained on (P0). Both hands
-are shown god-mode (resources AND dev cards). Games are to 7 VP with no Longest
+are shown god-mode (resources AND dev cards). Games are to 8 VP with no Longest
 Road bonus, matching training.
 
 Flow:

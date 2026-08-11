@@ -4,7 +4,7 @@ We keep these as monkeypatches (not edits to the installed package) so the chang
 lives in version control and is reapplied automatically in every process -- including
 the fresh interpreters that ``SubprocVecEnv`` spawns for parallel training.
 
-Eight things happen here:
+Seven things happen here:
 
 1. **Discard threshold raised to 9.** Stock Catanatron makes you discard on a 7
    when you hold *more than 7* cards (``discard_limit=7``). The gym env builds
@@ -33,24 +33,20 @@ Eight things happen here:
    lifted so the engine always has at least one legal action.
 
 5. **Longest Road awards no victory points.** Stock Catanatron grants +2 VP to the
-   holder of the longest road. In a short 7-VP 1v1 game that single swing is close
+   holder of the longest road. In a short 8-VP 1v1 game that single swing is close
    to a third of the win condition and it rewards exactly the degenerate road-spam
    behaviour we are trying to train away from. ``LONGEST_ROAD_LENGTH`` is still
    tracked (it stays in the observation vector); only the VP award and the
    ``HAS_ROAD`` flag are suppressed.
 
-6. **Largest Army awards no victory points.** Same reasoning as patch 5, and for
-   now only a parking measure: with 7 VP to win, a +2 swing decides too much.
-   ``PLAYED_KNIGHT`` is still counted, so the feature stays in the observation.
-
-7. **A development card cannot be played on the turn it was bought.** Stock
+6. **A development card cannot be played on the turn it was bought.** Stock
    ``buy_dev_card`` records only that a card entered the hand, never when, so a
    knight could be bought and played immediately. We count purchases per turn and
    subtract them from the hand when judging playability. The related "one dev card
    per turn" rule needs no patch -- upstream already enforces it through
    ``HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN``.
 
-8. **``_discard_remaining`` survives ``State.copy()``.** Patch 2 stores the
+7. **``_discard_remaining`` survives ``State.copy()``.** Patch 2 stores the
    per-player discard quota on a custom state attribute, but upstream
    ``State.copy`` enumerates the fields it copies explicitly and therefore drops
    it. That is harmless when copies are only taken by accumulators, but MCTS
@@ -88,7 +84,6 @@ def apply_rule_patches(discard_limit: int = DISCARD_LIMIT) -> None:
     _patch_state_copy()
     _patch_robber_placement()
     _patch_no_longest_road()
-    _patch_no_largest_army()
     _patch_dev_card_summoning_sickness()
     _patch_gym_action_space()
     setattr(_game_mod, _PATCH_FLAG, True)
@@ -293,30 +288,6 @@ def _patch_no_longest_road() -> None:
 
     _state_mod.mantain_longest_road = patched_mantain
     _state_functions_mod.mantain_longest_road = patched_mantain
-
-
-# --------------------------------------------------------------------------
-# Largest Army grants no victory points
-# --------------------------------------------------------------------------
-def _patch_no_largest_army() -> None:
-    """Suppress the +2 VP for Largest Army, mirroring the Longest Road patch.
-
-    Knight counts are untouched: ``play_dev_card`` increments ``PLAYED_KNIGHT``
-    itself, so the feature stays in the observation and the robber still works.
-    Only the award is removed -- with 7 VP to win, a single +2 swing is nearly a
-    third of the win condition.
-
-    Unlike ``mantain_longest_road`` this one needs a single rebinding: only
-    ``state_functions.play_dev_card`` calls it, and it resolves the name from its
-    own module globals at call time. ``get_largest_army`` consequently always
-    reports ``(None, None)``, which is harmless -- its sole consumer is the
-    function being replaced here.
-    """
-
-    def patched_mantain(state, color, previous_army_color, previous_army_size):
-        return None
-
-    _state_functions_mod.mantain_largets_army = patched_mantain  # upstream typo
 
 
 # --------------------------------------------------------------------------

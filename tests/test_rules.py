@@ -17,9 +17,9 @@ def test_action_space_expanded_to_one_discard_per_resource():
     assert action_size() == 294
 
 
-def test_games_are_played_to_seven_points():
-    assert VPS_TO_WIN == 7
-    assert make_1v1_game().vps_to_win == 7
+def test_games_are_played_to_eight_points():
+    assert VPS_TO_WIN == 8
+    assert make_1v1_game().vps_to_win == 8
 
 
 def test_discard_limit_is_nine():
@@ -257,21 +257,29 @@ def test_only_one_development_card_may_be_played_per_turn():
     assert state_functions.player_can_play_dev(state, color, "MONOPOLY")
 
 
-def test_largest_army_awards_no_victory_points():
-    """Three knights must not move VPs or set HAS_ARMY; the count still rises."""
+def test_largest_army_awards_two_victory_points():
+    """Largest Army is deliberately left ON, unlike Longest Road.
+
+    Worth pinning explicitly: this project patches the *other* +2 bonus out, so
+    a reader could reasonably assume both go, and an over-eager patch would be
+    caught here rather than silently changing what the agent is optimising.
+    """
     import catanatron.state_functions as state_functions
 
     game, state, color, key = _start_turn_with_dev_card_money(seed=7)
     before = state.player_state[f"{key}_ACTUAL_VICTORY_POINTS"]
 
-    for _ in range(3):
+    for knights in range(1, 4):
         state_functions.player_clean_turn(state, color)
         state.player_state[f"{key}_KNIGHT_IN_HAND"] = 1
         state_functions.play_dev_card(state, color, "KNIGHT")
+        # The award lands on the third knight, not before.
+        expected = 2 if knights == 3 else 0
+        gained = state.player_state[f"{key}_ACTUAL_VICTORY_POINTS"] - before
+        assert gained == expected, f"after {knights} knight(s)"
 
     assert state.player_state[f"{key}_PLAYED_KNIGHT"] == 3
-    assert state.player_state[f"{key}_HAS_ARMY"] is False
-    assert state.player_state[f"{key}_ACTUAL_VICTORY_POINTS"] == before
+    assert state.player_state[f"{key}_HAS_ARMY"] is True
 
 
 def test_bought_this_turn_counter_survives_state_copy():

@@ -12,7 +12,7 @@ Key facts about the underlying env (catanatron-gym 4.0.0):
   DISCARD slot into one per resource; most actions are illegal each turn, so the
   valid-action mask is mandatory for any learning agent.
 - Default observation is the 614-dim ``"vector"`` representation.
-- Games are played to 7 VP with no Longest Road bonus (see ``src.env.rules``).
+- Games are played to 8 VP with no Longest Road bonus (see ``src.env.rules``).
 """
 
 import random
@@ -32,9 +32,9 @@ from src.env.rules import apply_rule_patches
 ENV_ID = "catanatron-v1"
 
 # Victory points needed to win. Short games keep the RL horizon (and the MCTS
-# search depth) manageable; with Longest Road disabled, 7 VP is reached through
+# search depth) manageable; with Longest Road disabled, 8 VP is reached through
 # settlements, cities, VP dev cards and Largest Army.
-VPS_TO_WIN = 7
+VPS_TO_WIN = 8
 
 # Safety net so a degenerate policy cannot stall a game forever.
 MAX_TURNS = 300
@@ -147,8 +147,10 @@ class TurnLimitWrapper(Wrapper):
         return self.env.reset(**kwargs)
 
 
-# Milestone VP thresholds and their one-time bonus rewards, scaled to a 7-VP game.
-_VP_MILESTONES = {3: 0.1, 5: 0.25, 6: 0.5}
+# Milestone VP thresholds and their one-time bonus rewards, scaled to an 8-VP
+# game. The top milestone tracks "one VP short of winning", so it moves with
+# VPS_TO_WIN; leaving it at 6 would have paid the largest bonus two VP early.
+_VP_MILESTONES = {3: 0.1, 5: 0.25, 7: 0.5}
 
 
 class RewardShapingWrapper(Wrapper):

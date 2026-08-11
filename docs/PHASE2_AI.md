@@ -57,10 +57,10 @@ Treat Stage 0 as directional.
 
 Both set in `src/env/` and applied to every code path:
 
-- **7 VP to win** (`VPS_TO_WIN` in `src/env/catan_env.py`). Games resolve in ~80-150 turns instead
+- **8 VP to win** (`VPS_TO_WIN` in `src/env/catan_env.py`). Games resolve in ~80-150 turns instead
   of stretching past a turn cap, which shortens the credit-assignment horizon and lets search see
   terminal states from realistic positions.
-- **Longest Road awards no victory points** (`_patch_no_longest_road`). At 7 VP a 2-point swing is
+- **Longest Road awards no victory points** (`_patch_no_longest_road`). At 8 VP a 2-point swing is
   nearly a third of the win condition, and it pays out for exactly the road-spam behaviour we are
   training away from. `LONGEST_ROAD_LENGTH` is still tracked and still appears in the observation
   vector; only the VP award and the `HAS_ROAD` flag are suppressed.
@@ -299,7 +299,7 @@ Gate every training change on this harness.
 **That ladder is not actually ordered under these house rules.** Measured over 200 games each, the
 same checkpoint scored 70.8% vs `WeightedRandomPlayer` and 71.8% vs `VictoryPointPlayer` —
 statistically identical (±3.2%). `VictoryPointPlayer` is supposed to be the harder rung. Two likely
-reasons: with Longest Road awarding no VP it loses a chunk of what it normally chases, and at 7 VP
+reasons: with Longest Road awarding no VP it loses a chunk of what it normally chases, and at 8 VP
 the game is short enough that greedy myopia costs less than usual. Do not assume a result against
 one transfers to the other, and re-derive any threshold that was set assuming the ordering held.
 
@@ -356,6 +356,6 @@ fall as games get shorter, since the losing seat ends with fewer VP.
 ## Legacy track: MaskablePPO
 
 `src/agent/train.py` still runs the original loop (`SubprocVecEnv` × 8, rotating self-play
-checkpoint pool, `RewardShapingWrapper` with milestone VP bonuses rescaled to the 7-VP game). It is
+checkpoint pool, `RewardShapingWrapper` with milestone VP bonuses rescaled to the 8-VP game). It is
 kept so old checkpoints stay loadable and so `src/eval/stage0.py` has a baseline to diagnose. New
 work goes on the AlphaZero track.
