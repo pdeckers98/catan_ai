@@ -42,7 +42,7 @@ class MatchResult:
 
     __slots__ = ("wins", "losses", "draws", "games", "mean_turns",
                  "mean_vp", "mean_opp_vp", "mean_settlements", "mean_cities",
-                 "mean_roads")
+                 "mean_roads", "mean_knights")
 
     def __init__(self, **kwargs):
         for key in self.__slots__:
@@ -63,7 +63,8 @@ class MatchResult:
             f"(score {self.score:.1%}) | "
             f"avg turns {self.mean_turns:.0f}, VP {self.mean_vp:.1f} vs "
             f"{self.mean_opp_vp:.1f}, built {self.mean_settlements:.1f} settlements / "
-            f"{self.mean_cities:.1f} cities / {self.mean_roads:.1f} roads"
+            f"{self.mean_cities:.1f} cities / {self.mean_roads:.1f} roads, "
+            f"played {self.mean_knights:.1f} knights"
         )
 
 
@@ -74,6 +75,12 @@ def _player_stats(state, color) -> dict:
         "settlements": 5 - state.player_state[f"{key}_SETTLEMENTS_AVAILABLE"],
         "cities": 4 - state.player_state[f"{key}_CITIES_AVAILABLE"],
         "roads": 15 - state.player_state[f"{key}_ROADS_AVAILABLE"],
+        # Knights *played*, not bought -- an unplayed knight is worth nothing and
+        # counts toward nothing. With Longest Road disabled, Largest Army is the
+        # only +2 on the board, so this is the tell for whether the agent has
+        # found that route: three knights is the threshold, and a mean well under
+        # 3 means it is buying development cards without cashing them in.
+        "knights": state.player_state[f"{key}_PLAYED_KNIGHT"],
     }
 
 
@@ -123,6 +130,8 @@ def _play_one_game(challenger_factory, opponent_factory, index: int, seed: int) 
         "settlements": mine["settlements"],
         "cities": mine["cities"],
         "roads": mine["roads"],
+        "knights": mine["knights"],
+        "opp_knights": theirs["knights"],
     }
 
 
@@ -138,7 +147,7 @@ def _collect(records, num_games: int) -> MatchResult:
         draws=outcomes.count("draw"), games=num_games,
         mean_turns=mean("turns"), mean_vp=mean("vp"), mean_opp_vp=mean("opp_vp"),
         mean_settlements=mean("settlements"), mean_cities=mean("cities"),
-        mean_roads=mean("roads"),
+        mean_roads=mean("roads"), mean_knights=mean("knights"),
     )
 
 

@@ -194,3 +194,35 @@ def test_policy_player_needs_a_policy_or_a_path():
 
     with pytest.raises(ValueError):
         PolicyPlayer(Color.RED)
+
+
+# --------------------------------------------------------------------------
+# Match telemetry
+# --------------------------------------------------------------------------
+def test_knights_played_is_reported_per_match():
+    """Knights are the Largest Army tell, and Largest Army is the only +2 left."""
+    from src.agent.arena import AgentSpec, play_match
+
+    result = play_match(
+        AgentSpec(kind="weighted"), AgentSpec(kind="random"), 6, seed=4,
+    )
+    assert result.mean_knights >= 0
+    assert "knights" in result.summary()
+
+
+def test_knights_counts_played_cards_not_bought_ones():
+    """An unplayed knight scores nothing and must not be counted."""
+    from catanatron.state_functions import player_key
+    from src.agent.arena import _player_stats
+    from src.env.catan_env import make_1v1_game
+
+    game = make_1v1_game(seed=2)
+    state = game.state
+    color = state.current_color()
+    key = player_key(state, color)
+
+    state.player_state[f"{key}_KNIGHT_IN_HAND"] = 3
+    assert _player_stats(state, color)["knights"] == 0
+
+    state.player_state[f"{key}_PLAYED_KNIGHT"] = 2
+    assert _player_stats(state, color)["knights"] == 2

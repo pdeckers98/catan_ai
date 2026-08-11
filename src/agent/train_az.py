@@ -284,6 +284,7 @@ def main():
             log["eval/settlements_vs_weighted_random"] = baseline.mean_settlements
             log["eval/cities_vs_weighted_random"] = baseline.mean_cities
             log["eval/roads_vs_weighted_random"] = baseline.mean_roads
+            log["eval/knights_vs_weighted_random"] = baseline.mean_knights
             print(f"[Iter {iteration}] vs best {arena.score:.1%} "
                   f"({'promoted' if promoted else 'kept'}), "
                   f"vs weighted-random {baseline.summary()}")

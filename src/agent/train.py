@@ -235,6 +235,7 @@ def evaluate(model_path, num_games: int, workers: int = 0, seed=None,
         "eval/settlements": baseline.mean_settlements,
         "eval/cities": baseline.mean_cities,
         "eval/roads": baseline.mean_roads,
+        "eval/knights_played": baseline.mean_knights,
     }
     # The failure mode this whole re-test is about. Roads per victory point is
     # the sharpest single tell: feas02 improved 2.41 -> 1.54 as it learned.
