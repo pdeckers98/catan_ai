@@ -144,8 +144,22 @@ def main():
                         help="MCTS leaves per network call. >1 amortizes the "
                              "forward pass across a batch using virtual loss.")
     parser.add_argument("--eval-every", type=int, default=5)
-    parser.add_argument("--eval-games", type=int, default=40)
+    parser.add_argument("--eval-games", type=int, default=150,
+                        help="Games in the promotion gate. The standard error on "
+                             "a win rate is 0.5/sqrt(n): at 40 games that is 7.9%%, "
+                             "so a 55%% threshold cannot tell a better net from a "
+                             "coin flip. Separating 55%% from 50%% properly wants "
+                             "~380 games; 150 (SE 4.1%%) is the affordable "
+                             "compromise, and a false promotion is much cheaper "
+                             "here than a false rejection.")
     parser.add_argument("--eval-simulations", type=int, default=100)
+    parser.add_argument("--gauntlet-every", type=int, default=0,
+                        help="Iterations between gauntlet matches against bare "
+                             "PUCT search. Defaults to 0 (off) -- see the note on "
+                             "the gauntlet block below before enabling it.")
+    parser.add_argument("--gauntlet-games", type=int, default=60)
+    parser.add_argument("--gauntlet-simulations", type=int, default=400,
+                        help="Playouts for the uniform-prior opponent.")
     parser.add_argument("--eval-workers", type=int, default=0,
                         help="Processes for arena matches. Eval is otherwise "
                              "serial and quickly dominates an iteration.")
@@ -256,10 +270,13 @@ def main():
                 best_net.load_state_dict(net.state_dict())
                 net.save(checkpoint_dir / BEST_MODEL)
 
+            # Cheap and mostly a behaviour probe: the opponent does no search, so
+            # only our side costs anything. Capped so raising the promotion gate
+            # does not drag this along with it.
             baseline = play_match(
                 challenger_spec,
                 AgentSpec(kind="weighted"),
-                max(args.eval_games // 2, 2),
+                max(min(args.eval_games // 2, 50), 2),
                 seed=int(rng.integers(2**31 - 1)),
                 workers=args.eval_workers,
             )
@@ -270,6 +287,37 @@ def main():
             print(f"[Iter {iteration}] vs best {arena.score:.1%} "
                   f"({'promoted' if promoted else 'kept'}), "
                   f"vs weighted-random {baseline.summary()}")
+
+        # The scripted bots are a bad thermometer: under these house rules
+        # weighted-random and the value player are statistically tied (70.8% vs
+        # 71.8% over 200 games each), so neither can grade an agent above roughly
+        # that mark. This was meant to be the yardstick that fixes that -- but it
+        # is NOT one yet, which is why it defaults to off.
+        #
+        # ``UniformEvaluator`` returns value 0 at every leaf, so bare PUCT gets
+        # signal only from terminal nodes. In a ~140-turn game at a few hundred
+        # simulations it essentially never reaches one, so every backup is zero
+        # and visits spread near-uniformly by the exploration term: the opponent
+        # is a random player with extra steps. Measured, a PPO net beat it 97.5%
+        # while scoring 92.8% against weighted-random -- an *easier* opponent,
+        # which is the tell.
+        #
+        # To make this real, give the search a rollout-based value (classic MCTS
+        # playouts to a terminal state) or replace it with self-relative Elo
+        # against frozen past checkpoints.
+        if args.gauntlet_every and iteration % args.gauntlet_every == 0:
+            gauntlet = play_match(
+                AgentSpec.from_net(net, args.eval_simulations, args.search_batch),
+                AgentSpec(kind="mcts", simulations=args.gauntlet_simulations,
+                          batch_size=args.search_batch),
+                args.gauntlet_games,
+                seed=int(rng.integers(2**31 - 1)),
+                workers=args.eval_workers,
+            )
+            log["eval/score_vs_mcts"] = gauntlet.score
+            log["eval/turns_vs_mcts"] = gauntlet.mean_turns
+            print(f"[Iter {iteration}] gauntlet vs mcts@"
+                  f"{args.gauntlet_simulations}: {gauntlet.summary()}")
 
         wandb.log(log)
         print(f"[Iter {iteration}/{args.iterations}] "
