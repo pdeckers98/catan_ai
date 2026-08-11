@@ -31,9 +31,7 @@ import torch.nn.functional as F
 
 import wandb
 
-from catanatron.players.weighted_random import WeightedRandomPlayer
-
-from src.agent.arena import net_factory, play_match
+from src.agent.arena import AgentSpec, play_match
 from src.agent.net import AlphaZeroNet, masked_policy_loss
 from src.agent.selfplay import SelfPlayConfig, generate_games
 
@@ -142,18 +140,31 @@ def main():
                         help="Weight on the final game outcome vs. the n-step "
                              "bootstrap. 1.0 is textbook AlphaZero.")
     parser.add_argument("--temperature-moves", type=int, default=20)
+    parser.add_argument("--search-batch", type=int, default=1,
+                        help="MCTS leaves per network call. >1 amortizes the "
+                             "forward pass across a batch using virtual loss.")
     parser.add_argument("--eval-every", type=int, default=5)
     parser.add_argument("--eval-games", type=int, default=40)
     parser.add_argument("--eval-simulations", type=int, default=100)
+    parser.add_argument("--eval-workers", type=int, default=0,
+                        help="Processes for arena matches. Eval is otherwise "
+                             "serial and quickly dominates an iteration.")
     parser.add_argument("--promote-threshold", type=float, default=0.55)
-    parser.add_argument("--min-buffer", type=int, default=5_000,
-                        help="Samples required before the first gradient step.")
+    parser.add_argument("--min-buffer", type=int, default=None,
+                        help="Samples required before the first gradient step. "
+                             "Defaults to ~one iteration of self-play, scaled "
+                             "off --games-per-iter.")
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--w-b-project", type=str, default="catan-ai")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to a .pt checkpoint to continue from.")
     args = parser.parse_args()
+
+    # A fixed floor strands small runs: at ~130 samples/game, 32 games/iter never
+    # reaches a hardcoded 5000 and the first iteration silently trains on nothing.
+    if args.min_buffer is None:
+        args.min_buffer = max(1_000, int(args.games_per_iter * 100))
 
     seed = args.seed if args.seed is not None else random.randint(0, 2**31 - 1)
     random.seed(seed)
@@ -190,6 +201,7 @@ def main():
         temperature_moves=args.temperature_moves,
         value_nstep=args.value_nstep,
         value_mix=args.value_mix,
+        batch_size=args.search_batch,
     )
 
     for iteration in range(1, args.iterations + 1):
@@ -224,11 +236,17 @@ def main():
         net.save(checkpoint_dir / LATEST_MODEL)
 
         if iteration % args.eval_every == 0:
+            challenger_spec = AgentSpec.from_net(
+                net, args.eval_simulations, args.search_batch
+            )
             arena = play_match(
-                net_factory(net, args.eval_simulations),
-                net_factory(best_net, args.eval_simulations),
+                challenger_spec,
+                AgentSpec.from_net(
+                    best_net, args.eval_simulations, args.search_batch
+                ),
                 args.eval_games,
                 seed=int(rng.integers(2**31 - 1)),
+                workers=args.eval_workers,
             )
             log["eval/score_vs_best"] = arena.score
             log["eval/turns_vs_best"] = arena.mean_turns
@@ -239,10 +257,11 @@ def main():
                 net.save(checkpoint_dir / BEST_MODEL)
 
             baseline = play_match(
-                net_factory(net, args.eval_simulations),
-                lambda color: WeightedRandomPlayer(color),
+                challenger_spec,
+                AgentSpec(kind="weighted"),
                 max(args.eval_games // 2, 2),
                 seed=int(rng.integers(2**31 - 1)),
+                workers=args.eval_workers,
             )
             log["eval/score_vs_weighted_random"] = baseline.score
             log["eval/settlements_vs_weighted_random"] = baseline.mean_settlements

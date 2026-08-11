@@ -7,7 +7,16 @@ comparison in the project runs the same alternating-seat protocol.
 Seats alternate between games. In 1v1 Catan the first player picks first in the
 initial placement, which is a real edge; without alternation a benchmark mostly
 measures who got P0.
+
+**Matches can run across processes.** Games are independent, so ``workers`` fans
+them over a pool. That needs agents to survive pickling, which the factory
+closures below do not -- hence :class:`AgentSpec`, a declarative description each
+worker rebuilds locally. Serial play still accepts plain factories.
 """
+
+import os
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -68,68 +77,146 @@ def _player_stats(state, color) -> dict:
     }
 
 
-def play_match(challenger_factory, opponent_factory, num_games: int,
-               seed=None, progress=False) -> MatchResult:
-    """Play ``num_games`` alternating-seat games between two agent factories.
+def _play_one_game(challenger_factory, opponent_factory, index: int, seed: int) -> dict:
+    """Play game ``index`` and return its record from the challenger's side.
+
+    Seat is decided by index parity and the seed is drawn per index, so splitting
+    games across processes never changes which seat or seed a given game gets.
+
+    That is *not* enough to make a match bit-reproducible, and it is worth knowing
+    which knobs actually control that. Measured:
+
+    - same seed, same ``workers``, ``PYTHONHASHSEED`` pinned -- identical.
+    - hash seed unpinned -- differs; catanatron's action generation iterates
+      hash-ordered containers, so per-process string hashing reorders equal-value
+      actions and the argmax tie-break lands elsewhere.
+    - different ``workers`` -- differs; games are not fully independent, as engine
+      global RNG state survives between games in a process.
+
+    So pin both ``--workers`` and ``PYTHONHASHSEED`` to reproduce a number, and
+    otherwise treat match results as samples with real variance.
+    """
+    challenger_color = Color.BLUE if index % 2 == 0 else Color.RED
+    opponent_color = Color.RED if index % 2 == 0 else Color.BLUE
+    challenger = challenger_factory(challenger_color)
+    opponent = opponent_factory(opponent_color)
+    players = (
+        [challenger, opponent]
+        if challenger_color == Color.BLUE
+        else [opponent, challenger]
+    )
+
+    game = make_1v1_game(players=players, seed=seed)
+    while game.winning_color() is None and game.state.num_turns < MAX_TURNS:
+        game.play_tick()
+
+    winner = game.winning_color()
+    mine = _player_stats(game.state, challenger_color)
+    theirs = _player_stats(game.state, opponent_color)
+    return {
+        "index": index,
+        "outcome": ("win" if winner == challenger_color
+                    else "draw" if winner is None else "loss"),
+        "turns": game.state.num_turns,
+        "vp": mine["vp"],
+        "opp_vp": theirs["vp"],
+        "settlements": mine["settlements"],
+        "cities": mine["cities"],
+        "roads": mine["roads"],
+    }
+
+
+def _collect(records, num_games: int) -> MatchResult:
+    """Fold per-game records into a :class:`MatchResult`."""
+    outcomes = [r["outcome"] for r in records]
+
+    def mean(key):
+        return float(np.mean([r[key] for r in records])) if records else 0.0
+
+    return MatchResult(
+        wins=outcomes.count("win"), losses=outcomes.count("loss"),
+        draws=outcomes.count("draw"), games=num_games,
+        mean_turns=mean("turns"), mean_vp=mean("vp"), mean_opp_vp=mean("opp_vp"),
+        mean_settlements=mean("settlements"), mean_cities=mean("cities"),
+        mean_roads=mean("roads"),
+    )
+
+
+def _match_worker(payload):
+    """Play a slice of a match in a fresh process. Must be importable top-level."""
+    import torch
+
+    challenger_spec, opponent_spec, assignments = payload
+    # One core per worker; the pool supplies the parallelism, and batch-1 search
+    # forwards lose to thread synchronisation anyway.
+    torch.set_num_threads(1)
+
+    challenger = build_agent_from_spec(challenger_spec)
+    opponent = build_agent_from_spec(opponent_spec)
+    return [
+        _play_one_game(challenger, opponent, index, seed)
+        for index, seed in assignments
+    ]
+
+
+def play_match(challenger, opponent, num_games: int, seed=None,
+               progress=False, workers: int = 0) -> MatchResult:
+    """Play ``num_games`` alternating-seat games between two agents.
 
     Args:
-        challenger_factory: callable(Color) -> Player, the agent being measured.
-        opponent_factory: callable(Color) -> Player.
+        challenger: callable(Color) -> Player, or an :class:`AgentSpec`. The
+            agent being measured.
+        opponent: callable(Color) -> Player, or an :class:`AgentSpec`.
         num_games: how many games to play.
         seed: base RNG seed.
-        progress: print a line per game.
+        progress: print a line per finished game (serial) or chunk (parallel).
+        workers: processes to spread games over. 0/1 runs in-process. Requires
+            both agents to be :class:`AgentSpec` -- factory closures cannot be
+            pickled.
 
     Returns:
         A :class:`MatchResult` from the challenger's perspective.
     """
     rng = np.random.default_rng(seed)
-    wins = losses = draws = 0
-    turns, vps, opp_vps, settlements, cities, roads = [], [], [], [], [], []
+    seeds = [int(rng.integers(2**31 - 1)) for _ in range(num_games)]
 
+    if workers <= 1:
+        challenger_factory = _as_factory(challenger)
+        opponent_factory = _as_factory(opponent)
+        records = []
+        for index in range(num_games):
+            record = _play_one_game(
+                challenger_factory, opponent_factory, index, seeds[index]
+            )
+            records.append(record)
+            if progress:
+                print(f"  game {index + 1}/{num_games}: {record['outcome']}"
+                      f" in {record['turns']} turns", flush=True)
+        return _collect(records, num_games)
+
+    for agent in (challenger, opponent):
+        if not isinstance(agent, AgentSpec):
+            raise TypeError(
+                "workers > 1 requires AgentSpec for both agents; a factory "
+                "closure cannot cross a process boundary."
+            )
+
+    workers = min(workers, num_games, os.cpu_count() or workers)
+    chunks = [[] for _ in range(workers)]
     for index in range(num_games):
-        challenger_color = Color.BLUE if index % 2 == 0 else Color.RED
-        opponent_color = Color.RED if index % 2 == 0 else Color.BLUE
-        challenger = challenger_factory(challenger_color)
-        opponent = opponent_factory(opponent_color)
-        players = (
-            [challenger, opponent]
-            if challenger_color == Color.BLUE
-            else [opponent, challenger]
-        )
+        chunks[index % workers].append((index, seeds[index]))
 
-        game = make_1v1_game(players=players, seed=int(rng.integers(2**31 - 1)))
-        while game.winning_color() is None and game.state.num_turns < MAX_TURNS:
-            game.play_tick()
-
-        winner = game.winning_color()
-        if winner == challenger_color:
-            wins += 1
-        elif winner is None:
-            draws += 1
-        else:
-            losses += 1
-
-        mine = _player_stats(game.state, challenger_color)
-        theirs = _player_stats(game.state, opponent_color)
-        turns.append(game.state.num_turns)
-        vps.append(mine["vp"])
-        opp_vps.append(theirs["vp"])
-        settlements.append(mine["settlements"])
-        cities.append(mine["cities"])
-        roads.append(mine["roads"])
-
-        if progress:
-            print(f"  game {index + 1}/{num_games}: "
-                  f"{'win' if winner == challenger_color else 'loss' if winner else 'draw'}"
-                  f" in {game.state.num_turns} turns", flush=True)
-
-    return MatchResult(
-        wins=wins, losses=losses, draws=draws, games=num_games,
-        mean_turns=float(np.mean(turns)), mean_vp=float(np.mean(vps)),
-        mean_opp_vp=float(np.mean(opp_vps)),
-        mean_settlements=float(np.mean(settlements)),
-        mean_cities=float(np.mean(cities)), mean_roads=float(np.mean(roads)),
-    )
+    payloads = [
+        (challenger, opponent, assignments)
+        for assignments in chunks if assignments
+    ]
+    records = []
+    with ProcessPoolExecutor(max_workers=len(payloads)) as pool:
+        for batch in pool.map(_match_worker, payloads):
+            records.extend(batch)
+            if progress:
+                print(f"  {len(records)}/{num_games} games done", flush=True)
+    return _collect(records, num_games)
 
 
 # --------------------------------------------------------------------------
@@ -144,7 +231,49 @@ def net_factory(net, simulations: int, **mcts_kwargs):
     )
 
 
-def build_agent(spec: str, model_path=None, simulations: int = 100):
+@dataclass
+class AgentSpec:
+    """A picklable description of an agent, for matches that span processes.
+
+    ``net_blob`` carries an in-memory network (config + CPU state dict) so the
+    training loop can arena its live challenger without writing a checkpoint
+    first; ``model_path`` covers agents loaded from disk.
+    """
+
+    kind: str
+    model_path: str = None
+    simulations: int = 100
+    batch_size: int = 1
+    net_blob: dict = None
+
+    @classmethod
+    def from_net(cls, net, simulations: int, batch_size: int = 1) -> "AgentSpec":
+        return cls(
+            kind="az", simulations=simulations, batch_size=batch_size,
+            net_blob={
+                "config": net.config(),
+                "state_dict": {k: v.cpu() for k, v in net.state_dict().items()},
+            },
+        )
+
+
+def build_agent_from_spec(spec: AgentSpec):
+    """Rebuild an agent factory from its spec, inside whatever process needs it."""
+    if spec.net_blob is not None:
+        net = AlphaZeroNet(**spec.net_blob["config"])
+        net.load_state_dict(spec.net_blob["state_dict"])
+        net.eval()
+        return net_factory(net, spec.simulations, batch_size=spec.batch_size)
+    return build_agent(spec.kind, spec.model_path, spec.simulations)
+
+
+def _as_factory(agent):
+    """Accept either a factory or an :class:`AgentSpec`."""
+    return build_agent_from_spec(agent) if isinstance(agent, AgentSpec) else agent
+
+
+def build_agent(spec: str, model_path=None, simulations: int = 100,
+                batch_size: int = 1):
     """Build an agent factory from a short name.
 
     Specs:
@@ -159,6 +288,7 @@ def build_agent(spec: str, model_path=None, simulations: int = 100):
         spec: one of the names above.
         model_path: checkpoint path, required for the network-backed specs.
         simulations: playouts per decision for search-backed specs.
+        batch_size: leaves per evaluator call; see :class:`~src.agent.mcts.MCTS`.
 
     Returns:
         callable(Color) -> Player.
@@ -170,7 +300,8 @@ def build_agent(spec: str, model_path=None, simulations: int = 100):
     if spec == "mcts":
         evaluator = UniformEvaluator()
         return lambda color: MCTSPlayer(
-            color, evaluator, simulations=simulations, dirichlet_epsilon=0.0
+            color, evaluator, simulations=simulations, dirichlet_epsilon=0.0,
+            batch_size=batch_size,
         )
 
     if spec in ("ppo", "ppo-mcts"):
@@ -185,12 +316,15 @@ def build_agent(spec: str, model_path=None, simulations: int = 100):
             return lambda color: PolicyPlayer(color, model)
         evaluator = PPOEvaluator.from_path(model_path)
         return lambda color: MCTSPlayer(
-            color, evaluator, simulations=simulations, dirichlet_epsilon=0.0
+            color, evaluator, simulations=simulations, dirichlet_epsilon=0.0,
+            batch_size=batch_size,
         )
 
     if spec == "az":
         if model_path is None:
             raise ValueError("'az' requires --model")
-        return net_factory(AlphaZeroNet.load(model_path), simulations)
+        return net_factory(
+            AlphaZeroNet.load(model_path), simulations, batch_size=batch_size
+        )
 
     raise ValueError(f"Unknown agent spec: {spec}")
