@@ -42,7 +42,7 @@ class MatchResult:
 
     __slots__ = ("wins", "losses", "draws", "games", "mean_turns",
                  "mean_vp", "mean_opp_vp", "mean_settlements", "mean_cities",
-                 "mean_roads", "mean_knights")
+                 "mean_roads", "mean_knights", "mean_opp_knights")
 
     def __init__(self, **kwargs):
         for key in self.__slots__:
@@ -57,6 +57,16 @@ class MatchResult:
         """Win rate counting a draw as half a win."""
         return (self.wins + 0.5 * self.draws) / self.games if self.games else 0.0
 
+    @property
+    def knights_diff(self) -> float:
+        """Knights played minus the opponent's, averaged over the match.
+
+        Largest Army is a race, not a threshold met in isolation -- four knights
+        is dominant against an opponent playing one and irrelevant against one
+        playing five. The absolute count cannot tell those apart; this can.
+        """
+        return self.mean_knights - self.mean_opp_knights
+
     def summary(self) -> str:
         return (
             f"{self.wins}W-{self.losses}L-{int(self.draws)}D "
@@ -64,7 +74,7 @@ class MatchResult:
             f"avg turns {self.mean_turns:.0f}, VP {self.mean_vp:.1f} vs "
             f"{self.mean_opp_vp:.1f}, built {self.mean_settlements:.1f} settlements / "
             f"{self.mean_cities:.1f} cities / {self.mean_roads:.1f} roads, "
-            f"played {self.mean_knights:.1f} knights"
+            f"played {self.mean_knights:.1f} knights ({self.knights_diff:+.1f})"
         )
 
 
@@ -148,6 +158,7 @@ def _collect(records, num_games: int) -> MatchResult:
         mean_turns=mean("turns"), mean_vp=mean("vp"), mean_opp_vp=mean("opp_vp"),
         mean_settlements=mean("settlements"), mean_cities=mean("cities"),
         mean_roads=mean("roads"), mean_knights=mean("knights"),
+        mean_opp_knights=mean("opp_knights"),
     )
 
 

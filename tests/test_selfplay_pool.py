@@ -226,3 +226,23 @@ def test_knights_counts_played_cards_not_bought_ones():
 
     state.player_state[f"{key}_PLAYED_KNIGHT"] = 2
     assert _player_stats(state, color)["knights"] == 2
+
+
+def test_knights_diff_is_the_margin_over_the_opponent(tmp_path):
+    """Largest Army is a race: 4 knights means nothing if the opponent played 5."""
+    from src.agent.arena import MatchResult
+
+    ahead = MatchResult(games=10, mean_knights=4.0, mean_opp_knights=1.5)
+    behind = MatchResult(games=10, mean_knights=4.0, mean_opp_knights=5.0)
+
+    assert ahead.knights_diff == pytest.approx(2.5)
+    assert behind.knights_diff == pytest.approx(-1.0)
+    # Same absolute count, opposite standing -- which is the whole point.
+    assert ahead.mean_knights == behind.mean_knights
+
+
+def test_knights_diff_is_shown_with_a_sign(tmp_path):
+    from src.agent.arena import MatchResult
+
+    result = MatchResult(games=4, wins=2, mean_knights=3.0, mean_opp_knights=1.0)
+    assert "3.0 knights (+2.0)" in result.summary()

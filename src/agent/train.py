@@ -236,6 +236,8 @@ def evaluate(model_path, num_games: int, workers: int = 0, seed=None,
         "eval/cities": baseline.mean_cities,
         "eval/roads": baseline.mean_roads,
         "eval/knights_played": baseline.mean_knights,
+        "eval/opp_knights_played": baseline.mean_opp_knights,
+        "eval/knights_diff": baseline.knights_diff,
     }
     # The failure mode this whole re-test is about. Roads per victory point is
     # the sharpest single tell: feas02 improved 2.41 -> 1.54 as it learned.
@@ -510,6 +512,10 @@ def main():
             metrics["eval/elo"] = rating
             metrics["eval/score_vs_anchor"] = ladder_result.score
             metrics["eval/ladder_size"] = len(ladder)
+            # The knight race against a trained opponent, which is the one that
+            # actually contests Largest Army -- weighted-random barely plays any.
+            metrics["eval/knights_vs_anchor"] = ladder_result.mean_knights
+            metrics["eval/knights_diff_vs_anchor"] = ladder_result.knights_diff
             print(f" {ladder_result.score:.1%} -> Elo {rating:+.0f}"
                   f"{'  [new anchor]' if promoted else ''}")
 
