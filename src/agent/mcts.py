@@ -19,8 +19,16 @@ both the within-turn runs and the hand-offs uniformly.
 action. Those are played immediately without search and generate no training
 sample -- there is nothing to learn and nothing to choose.
 
+**Batched leaf evaluation.** A batch-1 forward pass is the dominant cost of the
+search, not the state copy. Setting ``batch_size > 1`` collects that many leaves
+before calling the evaluator once, using *virtual loss* to stop every descent in a
+batch converging on the same leaf: an in-flight edge is temporarily credited with
+a loss, which depresses its Q until the real value arrives. This changes search
+results for a given seed, so it is off by default -- ``batch_size=1`` reproduces
+the serial search exactly.
+
 The search operates on a real ``Game`` and copies it as it descends. That copy is
-the dominant cost; see ``src.eval.bench_mcts`` for the measured budget.
+the dominant cost per *simulation*; see ``src.eval.bench_mcts`` for the budget.
 """
 
 import math
@@ -75,6 +83,24 @@ class Node:
         self.total_visits = 0
 
 
+class _PendingLeaf:
+    """A leaf awaiting evaluation, plus where to hang it once the value lands."""
+
+    __slots__ = ("path", "game", "parent", "index", "key",
+                 "to_play", "actions", "obs", "mask")
+
+    def __init__(self, path, game, parent, index, key, to_play, actions, obs, mask):
+        self.path = path
+        self.game = game
+        self.parent = parent
+        self.index = index
+        self.key = key
+        self.to_play = to_play
+        self.actions = actions
+        self.obs = obs
+        self.mask = mask
+
+
 class SearchResult:
     """What one ``MCTS.search`` call produced at the root."""
 
@@ -118,6 +144,11 @@ class MCTS:
             parent's own value estimate, which stops the search from fanning out
             uniformly over Catan's very wide action lists.
         max_turns: simulations reaching this turn count score as a draw.
+        batch_size: leaves to collect before one ``evaluate_batch`` call. 1 keeps
+            the exact serial search; larger values amortize the forward pass at
+            the cost of descending against slightly staler statistics.
+        virtual_loss: visits temporarily charged to an in-flight edge, which is
+            what keeps a batch from collecting the same leaf repeatedly.
     """
 
     def __init__(
@@ -129,6 +160,8 @@ class MCTS:
         dirichlet_epsilon: float = 0.0,
         fpu_reduction: float = 0.25,
         max_turns: int = MAX_TURNS,
+        batch_size: int = 1,
+        virtual_loss: int = 1,
     ):
         self.evaluator = evaluator
         self.simulations = simulations
@@ -137,6 +170,8 @@ class MCTS:
         self.dirichlet_epsilon = dirichlet_epsilon
         self.fpu_reduction = fpu_reduction
         self.max_turns = max_turns
+        self.batch_size = max(1, int(batch_size))
+        self.virtual_loss = max(0, int(virtual_loss))
         self.num_actions = action_size()
 
     # ---- node construction ----------------------------------------------
@@ -149,18 +184,23 @@ class MCTS:
             return 0.0
         return None
 
-    def _make_node(self, game):
-        """Evaluate a position and wrap it in a Node."""
+    def _terminal_node(self, game):
+        """A finished-position Node, or None if the position is still live."""
         to_play = game.state.current_color()
         terminal_value = self._terminal_value(game, to_play)
-        if terminal_value is not None:
-            return Node(game, to_play, True, terminal_value)
+        if terminal_value is None:
+            return None
+        return Node(game, to_play, True, terminal_value)
 
+    def _leaf_request(self, game):
+        """The evaluator inputs for a live position."""
+        to_play = game.state.current_color()
         actions = list(game.state.playable_actions)
-        obs = encode_observation(game, to_play)
-        mask = legal_action_mask(actions)
-        priors_full, value = self.evaluator.evaluate(obs, mask)
+        return to_play, actions, encode_observation(game, to_play), \
+            legal_action_mask(actions)
 
+    def _expand(self, game, to_play, actions, priors_full, value):
+        """Wrap an evaluated position in a Node."""
         # Map the action-space priors onto the positional action list. Several
         # catanatron Actions can normalize to one slot, so renormalize afterwards.
         indices = action_indices(actions)
@@ -172,6 +212,15 @@ class MCTS:
             priors /= total
 
         return Node(game, to_play, False, float(value), actions, priors)
+
+    def _make_node(self, game):
+        """Evaluate a position and wrap it in a Node (single, unbatched)."""
+        node = self._terminal_node(game)
+        if node is not None:
+            return node
+        to_play, actions, obs, mask = self._leaf_request(game)
+        priors_full, value = self.evaluator.evaluate(obs, mask)
+        return self._expand(game, to_play, actions, priors_full, value)
 
     def _add_root_noise(self, node, rng):
         if self.dirichlet_epsilon <= 0 or len(node.actions) < 2:
@@ -209,8 +258,11 @@ class MCTS:
             raise ValueError("Cannot search from a finished position")
         self._add_root_noise(root, rng)
 
-        for _ in range(self.simulations):
-            self._simulate(root)
+        if self.batch_size > 1:
+            self._simulate_batched(root)
+        else:
+            for _ in range(self.simulations):
+                self._simulate(root)
 
         obs = encode_observation(game, root.to_play)
         mask = legal_action_mask(root.actions)
@@ -229,6 +281,19 @@ class MCTS:
         return SearchResult(
             root.actions, root.visits.copy(), policy, value, root.to_play, obs, mask
         )
+
+    def _backup(self, path, leaf_value, leaf_player, undo_virtual=False):
+        """Credit a real visit along ``path``, optionally clearing virtual loss.
+
+        Values are negated wherever the perspective differs from the leaf's, which
+        is what makes the non-alternating turn structure work.
+        """
+        vl = self.virtual_loss if undo_virtual else 0
+        for parent, index in path:
+            signed = leaf_value if parent.to_play == leaf_player else -leaf_value
+            parent.visits[index] += 1 - vl
+            parent.value_sum[index] += signed + vl
+            parent.total_visits += 1 - vl
 
     def _simulate(self, root):
         """One playout: descend to a leaf, evaluate it, back the value up."""
@@ -255,11 +320,94 @@ class MCTS:
                 break
             node = child
 
+        self._backup(path, leaf_value, leaf_player)
+
+    # ---- batched search --------------------------------------------------
+    def _charge_virtual_loss(self, path):
+        """Temporarily score every edge on ``path`` as a loss.
+
+        Applied once at the end of a descent rather than incrementally: a descent
+        visits each node at most once, so the two are equivalent here.
+        """
+        vl = self.virtual_loss
+        if not vl:
+            return
         for parent, index in path:
-            signed = leaf_value if parent.to_play == leaf_player else -leaf_value
-            parent.visits[index] += 1
-            parent.value_sum[index] += signed
-            parent.total_visits += 1
+            parent.visits[index] += vl
+            parent.value_sum[index] -= vl
+            parent.total_visits += vl
+
+    def _descend(self, root):
+        """Walk to a leaf, charging virtual loss on the way.
+
+        Returns ``(path, kind, payload)`` where kind is ``"terminal"`` (payload is
+        the node) or ``"leaf"`` (payload is the unexpanded child's game plus where
+        to attach it).
+        """
+        node = root
+        path = []
+
+        while True:
+            if node.is_terminal:
+                self._charge_virtual_loss(path)
+                return path, "terminal", node
+
+            index = self._select(node)
+            path.append((node, index))
+
+            child_game = node.game.copy()
+            executed = child_game.execute(node.actions[index], validate_action=False)
+            key = _outcome_key(executed)
+
+            child = node.children[index].get(key)
+            if child is None:
+                self._charge_virtual_loss(path)
+                return path, "leaf", (child_game, node, index, key)
+            node = child
+
+    def _simulate_batched(self, root):
+        """Run the simulation budget, evaluating leaves ``batch_size`` at a time.
+
+        Terminal leaves need no network call, so they are backed up during
+        collection and simply do not join the batch.
+        """
+        remaining = self.simulations
+        while remaining > 0:
+            pending = []
+            for _ in range(min(self.batch_size, remaining)):
+                path, kind, payload = self._descend(root)
+                if kind == "terminal":
+                    self._backup(path, payload.value_pred, payload.to_play, True)
+                    continue
+
+                child_game, parent, index, key = payload
+                terminal = self._terminal_node(child_game)
+                if terminal is not None:
+                    parent.children[index][key] = terminal
+                    self._backup(path, terminal.value_pred, terminal.to_play, True)
+                    continue
+
+                to_play, actions, obs, mask = self._leaf_request(child_game)
+                pending.append(_PendingLeaf(
+                    path, child_game, parent, index, key, to_play, actions, obs, mask
+                ))
+
+            remaining -= min(self.batch_size, remaining)
+            if not pending:
+                continue
+
+            priors_batch, values = self.evaluator.evaluate_batch(
+                np.stack([leaf.obs for leaf in pending]),
+                np.stack([leaf.mask for leaf in pending]),
+            )
+            for leaf, priors_full, value in zip(pending, priors_batch, values):
+                child = self._expand(
+                    leaf.game, leaf.to_play, leaf.actions, priors_full, value
+                )
+                # A duplicate collection overwrites the earlier node; both descents
+                # still back up, which is why virtual loss matters more than dedup.
+                leaf.parent.children[leaf.index][leaf.key] = child
+                self._backup(leaf.path, child.value_pred, child.to_play, True)
 
 
 class MCTSPlayer(Player):

@@ -51,6 +51,7 @@ class SelfPlayConfig:
     max_turns: int = MAX_TURNS
     value_nstep: int = 24
     value_mix: float = 0.5
+    batch_size: int = 1
 
     def mcts_kwargs(self) -> dict:
         return {
@@ -60,6 +61,7 @@ class SelfPlayConfig:
             "dirichlet_epsilon": self.dirichlet_epsilon,
             "fpu_reduction": self.fpu_reduction,
             "max_turns": self.max_turns,
+            "batch_size": self.batch_size,
         }
 
 

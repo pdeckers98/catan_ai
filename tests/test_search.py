@@ -42,6 +42,43 @@ def test_search_returns_a_normalized_policy_over_legal_actions():
     assert result.best_action() in game.state.playable_actions
 
 
+def test_batched_search_spends_exactly_the_simulation_budget():
+    """Virtual loss must net out: every charge is undone by its own backup.
+
+    If the undo were wrong the visit counts would drift, silently corrupting the
+    policy target the network is trained on.
+    """
+    for batch_size in (1, 4, 16, 64):
+        game = make_1v1_game(seed=2)
+        result = MCTS(
+            NetEvaluator(small_net()), simulations=48, batch_size=batch_size
+        ).search(game, rng=np.random.default_rng(0))
+
+        assert result.visits.sum() == 48, f"batch_size={batch_size}"
+        assert np.isclose(result.policy.sum(), 1.0)
+        assert np.allclose(result.policy[~result.mask], 0.0)
+        assert -1.0 <= result.value <= 1.0
+
+
+def test_batched_search_still_finds_a_spiked_prior():
+    """Batching must not destroy the search's ability to concentrate."""
+    class SpikedEvaluator(UniformEvaluator):
+        def evaluate_batch(self, obs_batch, mask_batch):
+            priors, values = super().evaluate_batch(obs_batch, mask_batch)
+            spike = np.argmax(mask_batch, axis=-1)
+            priors[np.arange(len(priors)), spike] += 5.0
+            priors /= priors.sum(axis=-1, keepdims=True)
+            return priors, values
+
+    game = make_1v1_game(seed=2)
+    result = MCTS(
+        SpikedEvaluator(), simulations=200, batch_size=16
+    ).search(game, rng=np.random.default_rng(0))
+
+    assert result.visits.argmax() == 0
+    assert result.visits[0] > result.visits.sum() / len(result.actions)
+
+
 def test_search_does_not_mutate_the_game_it_searches():
     game = make_1v1_game(seed=4)
     before_turns = game.state.num_turns
