@@ -25,8 +25,15 @@ Evaluation deliberately goes through ``src.agent.arena``, the same harness the
 AlphaZero track uses, so the numbers are directly comparable to it (the feas02
 checkpoint scored 70.8% vs weighted-random over 200 games).
 
+The re-test answered yes: sparse PPO reached ~92% vs weighted-random (400 games)
+in 3M steps, at which point both the training opponent and the yardstick had run
+out. ``--opponent pool`` is the follow-on -- frozen past checkpoints mixed with a
+slice of scripted games, rated by Elo against the run's own ladder rather than by
+a win rate that cannot exceed 100%.
+
 Usage:
     python -m src.agent.train --total-steps 2000000 --no-shaping --run-name ppo-sparse
+    python -m src.agent.train --opponent pool --resume checkpoints/<run>/best.zip
 """
 
 import argparse
@@ -48,6 +55,8 @@ from src.agent.arena import AgentSpec, play_match
 from src.agent.checkpoint_manager import (
     list_checkpoints, prune_checkpoints, save_checkpoint,
 )
+from src.agent.elo import Ladder, elo_delta
+from src.agent import pool as opponent_pool
 from src.env.catan_env import (
     MAX_TURNS, make_1v1_env, valid_action_mask, TurnLimitWrapper,
     RewardShapingWrapper,
@@ -128,12 +137,15 @@ class GameTurnCallback(BaseCallback):
             self._cities = [], [], [], [], [], []
 
 
-def make_vec_env(num_envs: int, enemy=None, shaping: bool = True):
+def make_vec_env(num_envs: int, enemy=None, shaping: bool = True, enemies=None):
     """Create a vectorized environment with num_envs parallel games.
 
     Args:
         num_envs: number of parallel environments.
         enemy: opponent Player instance. Defaults to WeightedRandomPlayer.
+        enemies: one opponent per env, overriding ``enemy``. Self-play uses this
+            to face a mixture within a single batch -- see
+            :func:`src.agent.pool.sample_enemies`.
         shaping: wrap in :class:`RewardShapingWrapper`. This is the re-test's
             independent variable, so it must be switchable -- the wrapper's
             milestone bonuses were tuned against the pre-08-11 rules and leaving
@@ -148,12 +160,16 @@ def make_vec_env(num_envs: int, enemy=None, shaping: bool = True):
         :class:`GameTurnCallback` logs turns only. Build telemetry still arrives
         from the fixed evaluation, which does not depend on the wrapper.
     """
-    if enemy is None:
-        enemy = WeightedRandomPlayer(Color.RED)
+    if enemies is None:
+        if enemy is None:
+            enemy = WeightedRandomPlayer(Color.RED)
+        enemies = [enemy] * num_envs
+    if len(enemies) != num_envs:
+        raise ValueError(f"need {num_envs} enemies, got {len(enemies)}")
 
-    def make_env():
+    def make_env(env_enemy):
         def _init():
-            env = make_1v1_env(enemy=enemy)
+            env = make_1v1_env(enemy=env_enemy)
             env = TurnLimitWrapper(
                 ActionMasker(env, valid_action_mask), max_turns=MAX_TURNS
             )
@@ -162,7 +178,7 @@ def make_vec_env(num_envs: int, enemy=None, shaping: bool = True):
             return env
         return _init
 
-    return SubprocVecEnv([make_env() for _ in range(num_envs)])
+    return SubprocVecEnv([make_env(e) for e in enemies])
 
 
 def sample_opponent(checkpoint_dir):
@@ -235,6 +251,47 @@ def evaluate(model_path, num_games: int, workers: int = 0, seed=None,
     return metrics, baseline
 
 
+def evaluate_ladder(model_path, ladder: Ladder, num_games: int, workers: int = 0,
+                    seed=None, promote_score: float = 0.70,
+                    promote_path=None, step: int = 0):
+    """Rate a checkpoint against the top of its own Elo ladder.
+
+    Only the top anchor is played, not every anchor. A full round robin would
+    give a better-conditioned rating, but it costs a match per anchor per
+    evaluation and the extra precision buys nothing here -- what the run needs
+    to answer is "is this stronger than the best thing we have made so far",
+    which is one match.
+
+    Args:
+        model_path: challenger checkpoint.
+        ladder: the run's ladder; must already be seeded.
+        num_games: games against the top anchor.
+        workers: processes for match play.
+        seed: base RNG seed.
+        promote_score: score at which the challenger joins the ladder. Above a
+            coin flip by a healthy margin, so noise cannot ratchet the reference.
+        promote_path: durable path to register if promoted (a pool entry --
+            ``agent_step_*`` files get pruned, and an anchor must outlive that).
+        step: training step, recorded with the anchor.
+
+    Returns:
+        ``(rating, result, promoted)``.
+    """
+    anchor = ladder.top()
+    result = play_match(
+        AgentSpec(kind="ppo", model_path=str(model_path)),
+        AgentSpec(kind="ppo", model_path=anchor.path),
+        num_games, seed=seed, workers=workers,
+    )
+    rating = anchor.elo + elo_delta(result.score, num_games)
+
+    promoted = False
+    if result.score >= promote_score and promote_path is not None:
+        ladder.add(promote_path, rating, step)
+        promoted = True
+    return rating, result, promoted
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train MaskablePPO agent with self-play.")
     parser.add_argument("--total-steps", type=int, default=500_000)
@@ -268,13 +325,29 @@ def main():
                         help="Milestone VP reward bonuses. Defaults off: the "
                              "sparse arm is the one that answers whether PPO can "
                              "solve this without a hand-tuned crutch.")
-    parser.add_argument("--opponent", choices=["weighted", "selfplay"],
+    parser.add_argument("--opponent", choices=["weighted", "pool", "selfplay"],
                         default="weighted",
                         help="'weighted' trains against a fixed bot throughout -- "
-                             "one moving part, interpretable curve. 'selfplay' "
-                             "swaps in sampled past checkpoints (the old "
-                             "behaviour), which is stronger but confounds the "
-                             "learning curve with a drifting opponent.")
+                             "one moving part, interpretable curve, but the agent "
+                             "only ever learns to beat that bot. 'pool' mixes "
+                             "frozen past checkpoints with a slice of scripted "
+                             "games (see --pool-weighted-frac). 'selfplay' is the "
+                             "old behaviour: one sampled checkpoint at a time.")
+    parser.add_argument("--pool-weighted-frac", type=float, default=0.1,
+                        help="Share of envs facing WeightedRandomPlayer under "
+                             "--opponent pool. Rounded up to at least one env, so "
+                             "the fixed reference never disappears entirely.")
+    parser.add_argument("--pool-max", type=int, default=25,
+                        help="Opponent pool size (~6 MB per entry).")
+    parser.add_argument("--pool-deterministic", action="store_true",
+                        help="Play pool opponents greedily. Off by default: a "
+                             "greedy opponent shows the learner one line per "
+                             "position, which is easy to overfit to.")
+    parser.add_argument("--elo-games", type=int, default=100,
+                        help="Games vs the top ladder anchor at each eval; 0 "
+                             "disables the ladder.")
+    parser.add_argument("--elo-promote", type=float, default=0.70,
+                        help="Score needed to become the new top anchor.")
     parser.add_argument("--eval-games", type=int, default=100)
     parser.add_argument("--eval-workers", type=int, default=0,
                         help="Processes for evaluation matches.")
@@ -304,6 +377,8 @@ def main():
             "ent_coef": args.ent_coef,
             "shaping": args.shaping,
             "opponent": args.opponent,
+            "pool_weighted_frac": args.pool_weighted_frac,
+            "pool_max": args.pool_max,
             "seed": seed,
         },
     )
@@ -314,17 +389,42 @@ def main():
     print(f"[Run] Checkpoints -> {checkpoint_dir}")
 
     num_envs = args.num_envs
-    env = make_vec_env(num_envs=num_envs, shaping=args.shaping)
+    ladder = Ladder.load(checkpoint_dir / "ladder.json")
+    rng = random.Random(seed)
 
+    steps_done = 0
+    resume_path = None
     if args.resume:
         resume_path = Path(args.resume)
-        model = MaskablePPO.load(str(resume_path), env=env, device="cpu")
         # Parse step count from filename, e.g. agent_step_01200000[.zip]
-        stem = resume_path.stem  # strips .zip if present
         try:
-            steps_done = int(stem.split("_")[-1])
+            steps_done = int(resume_path.stem.split("_")[-1])
         except ValueError:
             steps_done = 0
+
+        # Seed the pool *before* the first env is built, or the opening interval
+        # would train against weighted-random alone despite --opponent pool.
+        if args.opponent == "pool" and not opponent_pool.list_pool(checkpoint_dir):
+            origin = opponent_pool.add_to_pool(
+                resume_path, steps_done, checkpoint_dir, args.pool_max
+            )
+            ladder.seed(origin, steps_done)
+            print(f"[Pool] Seeded from {resume_path} -> {origin}")
+
+    if args.opponent == "pool":
+        enemies = opponent_pool.sample_enemies(
+            num_envs, checkpoint_dir, args.pool_weighted_frac, rng,
+            deterministic=args.pool_deterministic,
+        )
+        print(f"[Pool] Opponents: {opponent_pool.describe(enemies)}")
+        env = make_vec_env(
+            num_envs=num_envs, enemies=enemies, shaping=args.shaping
+        )
+    else:
+        env = make_vec_env(num_envs=num_envs, shaping=args.shaping)
+
+    if args.resume:
+        model = MaskablePPO.load(str(resume_path), env=env, device="cpu")
         print(f"[Resume] Loaded {resume_path}, continuing from step {steps_done}")
     else:
         model = MaskablePPO(
@@ -337,7 +437,6 @@ def main():
             verbose=1,
             device="cpu",
         )
-        steps_done = 0
 
     turn_callback = GameTurnCallback()
     wandb_callback = WandbCallback(verbose=0)
@@ -350,6 +449,11 @@ def main():
     best_path = checkpoint_dir / "best.zip"
     best_score = -1.0
     best_step = None
+    # Under --opponent pool the selection criterion is the ladder rating, not the
+    # win rate vs weighted-random: that bot is saturated at ~92%, so picking the
+    # best on it is mostly picking whichever eval drew a lucky hundred games.
+    best_metric = "elo" if args.opponent == "pool" and args.elo_games else "weighted"
+    rating = 0.0
 
     eval_step = 0
     while steps_done < args.total_steps:
@@ -378,28 +482,76 @@ def main():
             gauntlet_simulations=args.gauntlet_simulations,
         )
         score = metrics["eval/score_vs_weighted_random"]
-        if score > best_score:
-            best_score, best_step = score, steps_done
-            shutil.copyfile(Path(f"{latest}.zip"), best_path)
-            print(f"  new best ({score:.1%}) -> {best_path}")
-        metrics["eval/best_score"] = best_score
-        wandb.log({"step": steps_done, "checkpoint/step": steps_done, **metrics})
         print(f" {baseline.summary()}")
 
-        if args.opponent == "selfplay":
-            opponent = sample_opponent(checkpoint_dir)
-            print(f"[Self-play] Swapping to {opponent.__class__.__name__}")
-            env = make_vec_env(
-                num_envs=num_envs, enemy=opponent, shaping=args.shaping
+        # Grow the pool before rating, so a promoted checkpoint has a durable
+        # file to point at (``agent_step_*`` entries get pruned three intervals
+        # later, which would leave the ladder referencing a deleted anchor).
+        pool_entry = None
+        if args.opponent == "pool":
+            pool_entry = opponent_pool.add_to_pool(
+                latest, steps_done, checkpoint_dir, args.pool_max,
+                protected=ladder.paths(),
             )
-            model.set_env(env)
+            if not len(ladder):
+                ladder.seed(pool_entry, steps_done)
+
+        if args.opponent == "pool" and args.elo_games and len(ladder):
+            anchor = ladder.top()
+            print(f"[Elo] vs anchor step {anchor.step} ({anchor.elo:+.0f})...",
+                  end="", flush=True)
+            rating, ladder_result, promoted = evaluate_ladder(
+                latest, ladder, args.elo_games, workers=args.eval_workers,
+                seed=int(np.random.randint(2**31 - 1)),
+                promote_score=args.elo_promote, promote_path=pool_entry,
+                step=steps_done,
+            )
+            metrics["eval/elo"] = rating
+            metrics["eval/score_vs_anchor"] = ladder_result.score
+            metrics["eval/ladder_size"] = len(ladder)
+            print(f" {ladder_result.score:.1%} -> Elo {rating:+.0f}"
+                  f"{'  [new anchor]' if promoted else ''}")
+
+        selection = rating if best_metric == "elo" else score
+        if selection > best_score:
+            best_score, best_step = selection, steps_done
+            shutil.copyfile(Path(f"{latest}.zip"), best_path)
+            label = (f"Elo {selection:+.0f}" if best_metric == "elo"
+                     else f"{selection:.1%}")
+            print(f"  new best ({label}) -> {best_path}")
+        metrics["eval/best_score"] = best_score
+        wandb.log({"step": steps_done, "checkpoint/step": steps_done, **metrics})
+
+        if args.opponent in ("pool", "selfplay"):
+            if args.opponent == "pool":
+                enemies = opponent_pool.sample_enemies(
+                    num_envs, checkpoint_dir, args.pool_weighted_frac, rng,
+                    deterministic=args.pool_deterministic,
+                )
+                print(f"[Pool] Opponents: {opponent_pool.describe(enemies)}")
+                new_env = make_vec_env(
+                    num_envs=num_envs, enemies=enemies, shaping=args.shaping
+                )
+            else:
+                opponent = sample_opponent(checkpoint_dir)
+                print(f"[Self-play] Swapping to {opponent.__class__.__name__}")
+                new_env = make_vec_env(
+                    num_envs=num_envs, enemy=opponent, shaping=args.shaping
+                )
+            model.set_env(new_env)
+            # The old vector env owns ``num_envs`` live subprocesses. Rebinding
+            # the name without closing it leaks them all, every interval.
+            env.close()
+            env = new_env
 
     model.save(str(checkpoint_dir / "agent_final"))
+    env.close()
     wandb.finish()
     print(f"Training complete. Final model at {checkpoint_dir / 'agent_final'}")
     if best_step is not None:
-        print(f"Best checkpoint: step {best_step}, {best_score:.1%} vs "
-              f"weighted-random -> {best_path}")
+        label = (f"Elo {best_score:+.0f}" if best_metric == "elo"
+                 else f"{best_score:.1%} vs weighted-random")
+        print(f"Best checkpoint: step {best_step}, {label} -> {best_path}")
         print(f"Play it: python -m src.eval.play --agent ppo --model {best_path}")
 
 
