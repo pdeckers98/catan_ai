@@ -18,8 +18,8 @@ def test_action_space_expanded_to_one_discard_per_resource():
 
 
 def test_games_are_played_to_eight_points():
-    assert VPS_TO_WIN == 10
-    assert make_1v1_game().vps_to_win == 10
+    assert VPS_TO_WIN == 8
+    assert make_1v1_game().vps_to_win == 8
 
 
 def test_discard_limit_is_nine():

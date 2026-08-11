@@ -12,7 +12,8 @@ Key facts about the underlying env (catanatron-gym 4.0.0):
   DISCARD slot into one per resource; most actions are illegal each turn, so the
   valid-action mask is mandatory for any learning agent.
 - Default observation is the 614-dim ``"vector"`` representation.
-- Games are played to 8 VP with no Longest Road bonus (see ``src.env.rules``).
+- Games are played to ``VPS_TO_WIN`` VP with no Longest Road bonus (see
+  ``src.env.rules``).
 """
 
 import random
@@ -32,10 +33,14 @@ from src.env.rules import apply_rule_patches
 ENV_ID = "catanatron-v1"
 
 # Victory points needed to win. With Longest Road disabled, VPs come from
-# settlements, cities, VP dev cards and Largest Army. Was 8 (a short game keeps
-# the RL horizon manageable); raised to 10 for the standard-length game, which
-# lengthens episodes and pushes more weight onto the city/dev-card end game.
-VPS_TO_WIN = 10
+# settlements, cities, VP dev cards and Largest Army. Briefly 10 (the standard
+# target) for the ppo-10vp run; back to 8 because the shorter game keeps the RL
+# horizon manageable, and that turned out to matter more than it looked. At 10 VP
+# episodes ran ~250 agent steps, so with gamma=0.99 only ~8% of the terminal
+# win/loss signal survived back to the opening placement; at 8 VP it is ~150
+# steps. Anything changing this number must move ``--gamma`` in src/agent/train.py
+# with it -- see the note there.
+VPS_TO_WIN = 8
 
 # Safety net so a degenerate policy cannot stall a game forever.
 MAX_TURNS = 300

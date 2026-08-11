@@ -314,10 +314,23 @@ def main():
     parser.add_argument("--batch-size", type=int, default=256,
                         help="PPO minibatch size. Must divide n_steps * num_envs.")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
-                        help="Constant Adam step size. 3e-4 is the SB3 default. "
-                             "Raising it on a *resumed* policy trades stability "
-                             "for speed: the clip range bounds each policy "
-                             "update, but the value head has no such guard.")
+                        help="Constant Adam step size; 3e-4 is the SB3 default and "
+                             "suits training from a random init. Lower it to ~1e-4 "
+                             "when *resuming* an already-converged policy, where "
+                             "the job is refinement: the ppo-10vp run resumed at "
+                             "5e-4 and drifted to 45.5%% over 500 games against its "
+                             "own starting checkpoint, never once scoring above it.")
+    parser.add_argument("--gamma", type=float, default=0.995,
+                        help="Discount factor. Must be read against episode "
+                             "length, which at VPS_TO_WIN=8 is ~150 agent steps "
+                             "(~250 at 10 VP). The SB3 default of 0.99 is a "
+                             "100-step horizon, which discounted the terminal "
+                             "win/loss -- the only reward this project gives -- "
+                             "to ~22%% by the opening placement, and ~8%% at 10 "
+                             "VP. 0.995 doubles the horizon to 200 steps so the "
+                             "opening is trained on roughly half the win signal "
+                             "rather than a tenth. Raise it if VPS_TO_WIN or "
+                             "MAX_TURNS grows.")
     parser.add_argument("--ent-coef", type=float, default=0.01,
                         help="Entropy bonus coefficient. Was 0.05, raised at the "
                              "time to fight 'collapsing to road-heavy policies' "
@@ -387,6 +400,7 @@ def main():
             "n_steps": args.n_steps,
             "batch_size": args.batch_size,
             "learning_rate": args.learning_rate,
+            "gamma": args.gamma,
             "ent_coef": args.ent_coef,
             "vps_to_win": VPS_TO_WIN,
             "shaping": args.shaping,
@@ -439,19 +453,29 @@ def main():
 
     if args.resume:
         model = MaskablePPO.load(str(resume_path), env=env, device="cpu")
-        # ``load`` restores the *saved* schedule, so --learning-rate would be
-        # silently ignored on every resumed run. Rebind both: SB3 reads
-        # ``lr_schedule`` each update, but ``learning_rate`` is what gets
-        # serialised into the next checkpoint.
+        # ``load`` restores the *saved* hyperparameters, so --learning-rate and
+        # --gamma would be silently ignored on every resumed run. Rebind the lr
+        # in both places: SB3 reads ``lr_schedule`` each update, but
+        # ``learning_rate`` is what gets serialised into the next checkpoint.
         model.learning_rate = args.learning_rate
         model.lr_schedule = constant_lr(args.learning_rate)
+        # Changing gamma invalidates the loaded critic -- every value it learned
+        # is on the old discount -- so the first evaluations after a gamma change
+        # can dip while the value head re-fits. That is the price of the change,
+        # not a sign the run is broken.
+        changed_gamma = model.gamma != args.gamma
+        model.gamma = args.gamma
+        if model.rollout_buffer is not None:
+            model.rollout_buffer.gamma = args.gamma
         print(f"[Resume] Loaded {resume_path}, continuing from step {steps_done} "
-              f"at lr {args.learning_rate:g}")
+              f"at lr {args.learning_rate:g}, gamma {args.gamma:g}"
+              f"{' (changed -- critic will re-fit)' if changed_gamma else ''}")
     else:
         model = MaskablePPO(
             "MlpPolicy",
             env,
             learning_rate=args.learning_rate,
+            gamma=args.gamma,
             n_steps=args.n_steps,
             batch_size=args.batch_size,
             ent_coef=args.ent_coef,

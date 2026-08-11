@@ -57,9 +57,16 @@ Treat Stage 0 as directional.
 
 Both set in `src/env/` and applied to every code path:
 
-- **10 VP to win** (`VPS_TO_WIN` in `src/env/catan_env.py`). This was 8 for the PPO runs through
-  `ppo-pool`, which resolved in ~100-125 turns; the standard target lengthens episodes and shifts
-  weight onto the city and dev-card end game. `MAX_TURNS = 300` still caps runaway games.
+- **8 VP to win** (`VPS_TO_WIN` in `src/env/catan_env.py`), resolving in ~100-125 turns, or ~150
+  agent steps. `MAX_TURNS = 300` caps runaway games. The `ppo-10vp` run tried the standard target
+  of 10; games grew to ~176 turns / ~250 steps and the policy never beat its own starting
+  checkpoint over five evaluations, so the target went back to 8. The likely reason is the
+  discount, not the target itself — see the credit-assignment note below.
+- **`gamma = 0.995`**, not the SB3 default of 0.99 (`--gamma` in `src/agent/train.py`). The only
+  reward here is terminal (+1 win / -1 loss), and 0.99 is a 100-step horizon against ~150-step
+  episodes: the opening settlement placement — the most decisive decision in Catan — saw about 22%
+  of the win signal, and only ~8% at 10 VP. 0.995 gives a 200-step horizon and roughly half the
+  signal. Any change to `VPS_TO_WIN` or `MAX_TURNS` must move this with it.
 - **Longest Road awards no victory points** (`_patch_no_longest_road`). At 8 VP a 2-point swing is
   nearly a third of the win condition, and it pays out for exactly the road-spam behaviour we are
   training away from. `LONGEST_ROAD_LENGTH` is still tracked and still appears in the observation
