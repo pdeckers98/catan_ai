@@ -4,7 +4,7 @@ We keep these as monkeypatches (not edits to the installed package) so the chang
 lives in version control and is reapplied automatically in every process -- including
 the fresh interpreters that ``SubprocVecEnv`` spawns for parallel training.
 
-Six things happen here:
+Eight things happen here:
 
 1. **Discard threshold raised to 9.** Stock Catanatron makes you discard on a 7
    when you hold *more than 7* cards (``discard_limit=7``). The gym env builds
@@ -39,7 +39,18 @@ Six things happen here:
    tracked (it stays in the observation vector); only the VP award and the
    ``HAS_ROAD`` flag are suppressed.
 
-6. **``_discard_remaining`` survives ``State.copy()``.** Patch 2 stores the
+6. **Largest Army awards no victory points.** Same reasoning as patch 5, and for
+   now only a parking measure: with 7 VP to win, a +2 swing decides too much.
+   ``PLAYED_KNIGHT`` is still counted, so the feature stays in the observation.
+
+7. **A development card cannot be played on the turn it was bought.** Stock
+   ``buy_dev_card`` records only that a card entered the hand, never when, so a
+   knight could be bought and played immediately. We count purchases per turn and
+   subtract them from the hand when judging playability. The related "one dev card
+   per turn" rule needs no patch -- upstream already enforces it through
+   ``HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN``.
+
+8. **``_discard_remaining`` survives ``State.copy()``.** Patch 2 stores the
    per-player discard quota on a custom state attribute, but upstream
    ``State.copy`` enumerates the fields it copies explicitly and therefore drops
    it. That is harmless when copies are only taken by accumulators, but MCTS
@@ -77,6 +88,8 @@ def apply_rule_patches(discard_limit: int = DISCARD_LIMIT) -> None:
     _patch_state_copy()
     _patch_robber_placement()
     _patch_no_longest_road()
+    _patch_no_largest_army()
+    _patch_dev_card_summoning_sickness()
     _patch_gym_action_space()
     setattr(_game_mod, _PATCH_FLAG, True)
 
@@ -280,6 +293,95 @@ def _patch_no_longest_road() -> None:
 
     _state_mod.mantain_longest_road = patched_mantain
     _state_functions_mod.mantain_longest_road = patched_mantain
+
+
+# --------------------------------------------------------------------------
+# Largest Army grants no victory points
+# --------------------------------------------------------------------------
+def _patch_no_largest_army() -> None:
+    """Suppress the +2 VP for Largest Army, mirroring the Longest Road patch.
+
+    Knight counts are untouched: ``play_dev_card`` increments ``PLAYED_KNIGHT``
+    itself, so the feature stays in the observation and the robber still works.
+    Only the award is removed -- with 7 VP to win, a single +2 swing is nearly a
+    third of the win condition.
+
+    Unlike ``mantain_longest_road`` this one needs a single rebinding: only
+    ``state_functions.play_dev_card`` calls it, and it resolves the name from its
+    own module globals at call time. ``get_largest_army`` consequently always
+    reports ``(None, None)``, which is harmless -- its sole consumer is the
+    function being replaced here.
+    """
+
+    def patched_mantain(state, color, previous_army_color, previous_army_size):
+        return None
+
+    _state_functions_mod.mantain_largets_army = patched_mantain  # upstream typo
+
+
+# --------------------------------------------------------------------------
+# A development card cannot be played on the turn it was bought
+# --------------------------------------------------------------------------
+def _patch_dev_card_summoning_sickness() -> None:
+    """Forbid playing a development card bought in the same turn.
+
+    Stock ``buy_dev_card`` just increments ``{card}_IN_HAND``, with no record of
+    *when* a card arrived, so a player could buy a knight and play it
+    immediately. We track a per-turn counter and subtract it from the hand when
+    deciding playability.
+
+    Note the one-card-per-turn rule is *already* enforced upstream, via
+    ``HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN`` (set in ``play_dev_card``, cleared in
+    ``player_clean_turn``, checked in ``player_can_play_dev``). We leave it be.
+
+    Storage is a runtime-only key in ``player_state``:
+
+    - ``State.copy()`` does ``player_state.copy()``, so it survives MCTS for free
+      -- no repeat of the ``_discard_remaining`` problem.
+    - It is deliberately *not* added to ``PLAYER_INITIAL_STATE``. The gym feature
+      ordering is derived from a fresh game's sample keys, so growing that
+      template would change the 614-dim observation and invalidate every trained
+      checkpoint. ``create_vector`` iterates the cached ordering and filters on
+      it, so a key that only ever appears at runtime is ignored.
+
+    Victory Point cards are unaffected: they are never "played" (buying one adds
+    its VP immediately), and ``player_can_play_dev`` is only consulted for the
+    four playable types.
+    """
+    _bought = "_BOUGHT_THIS_TURN"
+    orig_buy = _state_functions_mod.buy_dev_card
+    orig_can_play = _state_functions_mod.player_can_play_dev
+    orig_clean = _state_functions_mod.player_clean_turn
+
+    def patched_buy(state, color, dev_card):
+        orig_buy(state, color, dev_card)
+        key = player_key(state, color)
+        field = f"{key}_{dev_card}{_bought}"
+        state.player_state[field] = state.player_state.get(field, 0) + 1
+
+    def patched_can_play(state, color, dev_card):
+        if not orig_can_play(state, color, dev_card):
+            return False
+        key = player_key(state, color)
+        in_hand = state.player_state[f"{key}_{dev_card}_IN_HAND"]
+        fresh = state.player_state.get(f"{key}_{dev_card}{_bought}", 0)
+        return in_hand - fresh >= 1
+
+    def patched_clean(state, color):
+        orig_clean(state, color)
+        key = player_key(state, color)
+        for field in [k for k in state.player_state
+                      if k.startswith(key) and k.endswith(_bought)]:
+            state.player_state[field] = 0
+
+    # All three are imported *by name* elsewhere at import time, so rebinding
+    # them in state_functions alone would be a silent no-op: state.py calls its
+    # own ``buy_dev_card`` (line 428) and ``player_clean_turn`` (line 314), and
+    # both state.py and models/actions.py hold their own ``player_can_play_dev``.
+    for module in (_state_functions_mod, _state_mod, _actions_mod):
+        module.buy_dev_card = patched_buy
+        module.player_clean_turn = patched_clean
+        module.player_can_play_dev = patched_can_play
 
 
 # --------------------------------------------------------------------------
