@@ -4,7 +4,7 @@ We keep these as monkeypatches (not edits to the installed package) so the chang
 lives in version control and is reapplied automatically in every process -- including
 the fresh interpreters that ``SubprocVecEnv`` spawns for parallel training.
 
-Four things happen here:
+Six things happen here:
 
 1. **Discard threshold raised to 9.** Stock Catanatron makes you discard on a 7
    when you hold *more than 7* cards (``discard_limit=7``). The gym env builds
@@ -31,6 +31,20 @@ Four things happen here:
      beyond the initial 2 settlements, self-robbing is a legal strategic choice.
    If all tiles are excluded by both rules (degenerate edge case), the filter is
    lifted so the engine always has at least one legal action.
+
+5. **Longest Road awards no victory points.** Stock Catanatron grants +2 VP to the
+   holder of the longest road. In a short 7-VP 1v1 game that single swing is close
+   to a third of the win condition and it rewards exactly the degenerate road-spam
+   behaviour we are trying to train away from. ``LONGEST_ROAD_LENGTH`` is still
+   tracked (it stays in the observation vector); only the VP award and the
+   ``HAS_ROAD`` flag are suppressed.
+
+6. **``_discard_remaining`` survives ``State.copy()``.** Patch 2 stores the
+   per-player discard quota on a custom state attribute, but upstream
+   ``State.copy`` enumerates the fields it copies explicitly and therefore drops
+   it. That is harmless when copies are only taken by accumulators, but MCTS
+   copies mid-game constantly -- a search descending through a 7 would re-derive
+   the quota from an already-partly-discarded hand and discard too many cards.
 """
 
 import gymnasium.spaces as _spaces
@@ -38,6 +52,7 @@ import gymnasium.spaces as _spaces
 import catanatron.game as _game_mod
 import catanatron.state as _state_mod
 import catanatron.models.actions as _actions_mod
+import catanatron.state_functions as _state_functions_mod
 import catanatron_gym.envs.catanatron_env as _gym_env
 from catanatron.models.enums import Action, ActionType, ActionPrompt, RESOURCES
 from catanatron.models.decks import freqdeck_add
@@ -59,7 +74,9 @@ def apply_rule_patches(discard_limit: int = DISCARD_LIMIT) -> None:
         return
     _patch_discard_limit(discard_limit)
     _patch_sequential_discard()
+    _patch_state_copy()
     _patch_robber_placement()
+    _patch_no_longest_road()
     _patch_gym_action_space()
     setattr(_game_mod, _PATCH_FLAG, True)
 
@@ -168,6 +185,26 @@ def _advance_after_discarder(state, color):
         state.is_moving_knight = True
 
 
+def _patch_state_copy() -> None:
+    """Carry the custom ``_discard_remaining`` quota across ``State.copy()``.
+
+    Upstream ``State.copy`` copies a hardcoded list of fields, so our attribute is
+    silently dropped. MCTS copies states mid-discard all the time, so without this
+    a search that descends through a 7 recomputes the quota from a half-discarded
+    hand and over-discards.
+    """
+    orig_copy = _state_mod.State.copy
+
+    def patched_copy(self):
+        state_copy = orig_copy(self)
+        remaining = getattr(self, "_discard_remaining", None)
+        if remaining:
+            state_copy._discard_remaining = dict(remaining)
+        return state_copy
+
+    _state_mod.State.copy = patched_copy
+
+
 def _largest_stack(state, color):
     """Resource the player holds most of (fallback when no card is specified)."""
     key = player_key(state, color)
@@ -223,6 +260,26 @@ def _patch_robber_placement() -> None:
         return filtered if filtered else actions
 
     _actions_mod.robber_possibilities = patched_robber
+
+
+# --------------------------------------------------------------------------
+# Longest Road grants no victory points
+# --------------------------------------------------------------------------
+def _patch_no_longest_road() -> None:
+    """Track longest-road length but never award the +2 VP (or set HAS_ROAD).
+
+    ``catanatron.state`` imported ``mantain_longest_road`` by name at import time,
+    so the binding we must replace is the one in the *state* module's globals; we
+    also replace it at its definition site for anything that imports it later.
+    """
+
+    def patched_mantain(state, previous_road_color, road_color, road_lengths):
+        for color, length in road_lengths.items():
+            key = player_key(state, color)
+            state.player_state[f"{key}_LONGEST_ROAD_LENGTH"] = length
+
+    _state_mod.mantain_longest_road = patched_mantain
+    _state_functions_mod.mantain_longest_road = patched_mantain
 
 
 # --------------------------------------------------------------------------

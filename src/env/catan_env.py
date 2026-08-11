@@ -8,9 +8,11 @@ expects.
 Key facts about the underlying env (catanatron-gym 4.0.0):
 - Env id ``catanatron-v1``; the controlled agent is P0 (Color.BLUE).
 - It is inherently 1v1: one entry in ``config["enemies"]`` => a 2-player game.
-- Action space ``Discrete(290)``; most actions are illegal each turn, so the
+- Action space ``Discrete(294)`` *after* ``src.env.rules`` expands the single
+  DISCARD slot into one per resource; most actions are illegal each turn, so the
   valid-action mask is mandatory for any learning agent.
 - Default observation is the 614-dim ``"vector"`` representation.
+- Games are played to 7 VP with no Longest Road bonus (see ``src.env.rules``).
 """
 
 import gymnasium as gym
@@ -18,22 +20,60 @@ from gymnasium import Wrapper
 import numpy as np
 
 import catanatron_gym  # noqa: F401  -- registers the "catanatron-v1" env id
-from catanatron import Color
+from catanatron import Color, Game
+from catanatron.models.map import build_map
+from catanatron.models.player import RandomPlayer
 from catanatron.players.weighted_random import WeightedRandomPlayer
 
 from src.env.rules import apply_rule_patches
 
 ENV_ID = "catanatron-v1"
 
+# Victory points needed to win. Short games keep the RL horizon (and the MCTS
+# search depth) manageable; with Longest Road disabled, 7 VP is reached through
+# settlements, cities, VP dev cards and Largest Army.
+VPS_TO_WIN = 7
+
+# Safety net so a degenerate policy cannot stall a game forever.
+MAX_TURNS = 300
+
 # Install custom 1v1 rules (discard only on >9 cards) at import time. This module is
 # imported by every env constructor, so the patch lands in SubprocVecEnv workers too.
 apply_rule_patches()
 
 
+def make_1v1_game(players=None, seed=None, map_type="BASE", vps_to_win=VPS_TO_WIN):
+    """Construct a raw Catanatron ``Game`` for tree search / self-play.
+
+    The gym env is the wrong substrate for MCTS: it auto-advances the opponent and
+    hides the ``Game`` behind a step interface. Search and AlphaZero self-play drive
+    the engine directly, so they build games here instead.
+
+    Args:
+        players: list of catanatron Players. Defaults to two placeholder
+            RandomPlayers (BLUE first, then RED) -- callers that drive the engine
+            themselves never invoke ``decide``.
+        seed: RNG seed, or None for a random one.
+        map_type: "BASE" (full board) or "MINI" (faster iteration).
+        vps_to_win: victory points to win.
+
+    Returns:
+        An initialized ``Game``.
+    """
+    if players is None:
+        players = [RandomPlayer(Color.BLUE), RandomPlayer(Color.RED)]
+    return Game(
+        players=players,
+        seed=seed,
+        vps_to_win=vps_to_win,
+        catan_map=build_map(map_type),
+    )
+
+
 def make_1v1_env(
     enemy=None,
     map_type="BASE",
-    vps_to_win=15,
+    vps_to_win=VPS_TO_WIN,
     representation="vector",
     reward_function=None,
 ):
@@ -43,7 +83,7 @@ def make_1v1_env(
         enemy: opponent Player instance (must not be Color.BLUE). Defaults to a
             WeightedRandomPlayer on RED -- a slightly stronger-than-random bot.
         map_type: "BASE" (full board) or "MINI" (faster iteration).
-        vps_to_win: victory points to win; 15 for extended gameplay.
+        vps_to_win: victory points to win.
         representation: "vector" (flat Box) or "mixed" (board tensor + numeric).
         reward_function: optional callable(game, p0_color) -> float. Defaults to
             the env's built-in win/loss/draw reward.
@@ -94,17 +134,21 @@ class TurnLimitWrapper(Wrapper):
         return self.env.reset(**kwargs)
 
 
-# Milestone VP thresholds and their one-time bonus rewards.
-_VP_MILESTONES = {6: 0.1, 8: 0.25, 12: 0.5}
+# Milestone VP thresholds and their one-time bonus rewards, scaled to a 7-VP game.
+_VP_MILESTONES = {3: 0.1, 5: 0.25, 6: 0.5}
 
 
 class RewardShapingWrapper(Wrapper):
     """Milestone-based reward shaping on top of the sparse win/loss signal.
 
+    Only the PPO training path (``src.agent.train``) uses this. The AlphaZero path
+    (``src.agent.train_az``) trains on the sparse win/loss outcome alone, because
+    MCTS supplies the dense signal that shaping was standing in for.
+
     One-time bonuses fire the first time the agent crosses each VP threshold:
-      6 VP -> +0.10
-      8 VP -> +0.25
-     12 VP -> +0.50
+      3 VP -> +0.10
+      5 VP -> +0.25
+      6 VP -> +0.50
     The base env still provides +1 on win and -1 on loss.
 
     Two additional one-time building bonuses:
