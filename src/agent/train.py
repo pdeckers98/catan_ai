@@ -1,16 +1,37 @@
-"""Phase 2 training (legacy track): MaskablePPO with self-play and W&B logging.
+"""Phase 2 training: MaskablePPO with self-play and W&B logging.
 
-Superseded by ``src.agent.train_az``, which replaces the policy-gradient update
-with AlphaZero-style search + supervised distillation. This module is kept so the
-old checkpoints stay loadable and reproducible, and so ``src.eval.stage0`` has a
-PPO baseline to diagnose.
+Long treated as the superseded track -- ``src.agent.train_az`` replaces the
+policy-gradient update with AlphaZero-style search + supervised distillation --
+but the evidence for abandoning it does not survive inspection. Every PPO run
+happened on 2026-06-26; the rules that disable the Longest Road VP bonus landed
+on 2026-08-11, in the same sitting as AlphaZero. So the failure that condemned
+PPO ("the agent only builds roads") was observed when Longest Road was worth +2
+VP out of 10, i.e. when road-spam genuinely *was* the highest-EV line and the
+policy was right to find it. The rule change and the algorithm change are
+completely confounded, and PPO has never run under the current rules.
+
+This module is set up to settle that, cheaply: PPO spends one network forward
+per decision against AlphaZero's ~200, so if it works at all it is worth roughly
+two orders of magnitude of compute.
+
+The re-test is two arms, differing only in ``--shaping``:
+
+- ``--no-shaping`` -- sparse win/loss only. The arm that answers whether PPO can
+  actually solve this. Run this one first.
+- ``--shaping`` -- milestone VP bonuses. A crutch tuned against the old rules;
+  useful only as a fallback if the sparse arm flatlines.
+
+Evaluation deliberately goes through ``src.agent.arena``, the same harness the
+AlphaZero track uses, so the numbers are directly comparable to it (the feas02
+checkpoint scored 70.8% vs weighted-random over 200 games).
 
 Usage:
-    python -m src.agent.train --total-steps 500000 --eval-interval 50000 --w-b-project "catan-ai"
+    python -m src.agent.train --total-steps 2000000 --no-shaping --run-name ppo-sparse
 """
 
 import argparse
 import random
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +44,7 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from catanatron import Color
 from catanatron.players.weighted_random import WeightedRandomPlayer
+from src.agent.arena import AgentSpec, play_match
 from src.agent.checkpoint_manager import (
     list_checkpoints, prune_checkpoints, save_checkpoint,
 )
@@ -106,15 +128,25 @@ class GameTurnCallback(BaseCallback):
             self._cities = [], [], [], [], [], []
 
 
-def make_vec_env(num_envs: int, enemy=None):
+def make_vec_env(num_envs: int, enemy=None, shaping: bool = True):
     """Create a vectorized environment with num_envs parallel games.
 
     Args:
         num_envs: number of parallel environments.
         enemy: opponent Player instance. Defaults to WeightedRandomPlayer.
+        shaping: wrap in :class:`RewardShapingWrapper`. This is the re-test's
+            independent variable, so it must be switchable -- the wrapper's
+            milestone bonuses were tuned against the pre-08-11 rules and leaving
+            them permanently on would carry that confound into the answer.
 
     Returns:
         SubprocVecEnv with num_envs workers.
+
+    Note:
+        Without shaping the per-episode ``info`` fields the wrapper injects
+        (``final_vp``, ``settlements_built``, ...) are absent, so
+        :class:`GameTurnCallback` logs turns only. Build telemetry still arrives
+        from the fixed evaluation, which does not depend on the wrapper.
     """
     if enemy is None:
         enemy = WeightedRandomPlayer(Color.RED)
@@ -125,7 +157,8 @@ def make_vec_env(num_envs: int, enemy=None):
             env = TurnLimitWrapper(
                 ActionMasker(env, valid_action_mask), max_turns=MAX_TURNS
             )
-            env = RewardShapingWrapper(env)
+            if shaping:
+                env = RewardShapingWrapper(env)
             return env
         return _init
 
@@ -149,31 +182,57 @@ def sample_opponent(checkpoint_dir):
     return PolicyPlayer(Color.RED, model)
 
 
-def evaluate(model, opponent, num_games: int = 50) -> float:
-    """Play num_games against opponent, return win rate.
+def evaluate(model_path, num_games: int, workers: int = 0, seed=None,
+             gauntlet_games: int = 0, gauntlet_simulations: int = 400) -> dict:
+    """Score a checkpoint against fixed yardsticks, via the shared arena.
+
+    The previous version of this played against ``sample_opponent()`` -- a
+    *randomly drawn past checkpoint*. That measures the agent against a moving
+    target, so the resulting curve could not be compared across time, across
+    runs, or against the AlphaZero track. These opponents never change, which is
+    the whole point.
 
     Args:
-        model: trained MaskablePPO.
-        opponent: catanatron Player instance.
-        num_games: how many games to play.
+        model_path: path to a saved MaskablePPO zip. Passed by path rather than
+            by object so the match can be fanned across processes.
+        num_games: games against WeightedRandomPlayer.
+        workers: processes for match play. 0/1 runs in-process.
+        seed: base RNG seed.
+        gauntlet_games: games against bare PUCT search; 0 skips it. Unlike the
+            scripted bots this yardstick does not saturate.
+        gauntlet_simulations: playouts for that opponent.
 
     Returns:
-        Win rate [0, 1].
+        Metrics dict ready for ``wandb.log``.
     """
-    wins = 0
-    for _ in range(num_games):
-        env = ActionMasker(make_1v1_env(enemy=opponent), valid_action_mask)
-        obs, info = env.reset()
-        done = False
-        while not done:
-            mask = valid_action_mask(env)
-            action, _ = model.predict(obs, action_masks=mask, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-        if reward > 0:
-            wins += 1
-        env.close()
-    return wins / num_games
+    challenger = AgentSpec(kind="ppo", model_path=str(model_path))
+    baseline = play_match(
+        challenger, AgentSpec(kind="weighted"), num_games,
+        seed=seed, workers=workers,
+    )
+    metrics = {
+        "eval/score_vs_weighted_random": baseline.score,
+        "eval/win_rate": baseline.win_rate,
+        "eval/turns": baseline.mean_turns,
+        "eval/vp": baseline.mean_vp,
+        "eval/opp_vp": baseline.mean_opp_vp,
+        "eval/settlements": baseline.mean_settlements,
+        "eval/cities": baseline.mean_cities,
+        "eval/roads": baseline.mean_roads,
+    }
+    # The failure mode this whole re-test is about. Roads per victory point is
+    # the sharpest single tell: feas02 improved 2.41 -> 1.54 as it learned.
+    if baseline.mean_vp > 0:
+        metrics["eval/roads_per_vp"] = baseline.mean_roads / baseline.mean_vp
+
+    if gauntlet_games:
+        gauntlet = play_match(
+            challenger,
+            AgentSpec(kind="mcts", simulations=gauntlet_simulations),
+            gauntlet_games, seed=seed, workers=workers,
+        )
+        metrics["eval/score_vs_mcts"] = gauntlet.score
+    return metrics, baseline
 
 
 def main():
@@ -190,11 +249,38 @@ def main():
                         help="PPO rollout length per env before each update.")
     parser.add_argument("--batch-size", type=int, default=256,
                         help="PPO minibatch size. Must divide n_steps * num_envs.")
-    parser.add_argument("--ent-coef", type=float, default=0.05,
-                        help="Entropy bonus coefficient (raised from 0.01 to discourage "
-                             "collapsing to road-heavy policies).")
-    parser.add_argument("--net-arch", type=int, nargs="+", default=[32, 32, 32],
-                        help="Hidden layer sizes, e.g. --net-arch 256 256.")
+    parser.add_argument("--ent-coef", type=float, default=0.01,
+                        help="Entropy bonus coefficient. Was 0.05, raised at the "
+                             "time to fight 'collapsing to road-heavy policies' "
+                             "-- a symptom of the Longest Road VP bonus that no "
+                             "longer exists. Back to the SB3 default so the "
+                             "re-test is not pre-compensating for a dead cause.")
+    parser.add_argument("--net-arch", type=int, nargs="+", default=[256, 256],
+                        help="Hidden layer sizes. Was [32, 32, 32], which is very "
+                             "small for a 614-dim observation and 294 actions and "
+                             "is a plausible independent cause of the original "
+                             "failure; the AlphaZero net that does learn here is "
+                             "256 wide.")
+    parser.add_argument("--num-envs", type=int, default=8,
+                        help="Parallel envs for rollout collection.")
+    parser.add_argument("--shaping", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Milestone VP reward bonuses. Defaults off: the "
+                             "sparse arm is the one that answers whether PPO can "
+                             "solve this without a hand-tuned crutch.")
+    parser.add_argument("--opponent", choices=["weighted", "selfplay"],
+                        default="weighted",
+                        help="'weighted' trains against a fixed bot throughout -- "
+                             "one moving part, interpretable curve. 'selfplay' "
+                             "swaps in sampled past checkpoints (the old "
+                             "behaviour), which is stronger but confounds the "
+                             "learning curve with a drifting opponent.")
+    parser.add_argument("--eval-games", type=int, default=100)
+    parser.add_argument("--eval-workers", type=int, default=0,
+                        help="Processes for evaluation matches.")
+    parser.add_argument("--gauntlet-games", type=int, default=0,
+                        help="Games vs bare PUCT at each eval; 0 disables.")
+    parser.add_argument("--gauntlet-simulations", type=int, default=400)
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to a checkpoint zip to resume from. "
                              "Step count is parsed from the filename (agent_step_XXXXXXXX).")
@@ -212,10 +298,12 @@ def main():
             "model": "MaskablePPO",
             "policy": "MlpPolicy",
             "net_arch": args.net_arch,
-            "num_envs": 8,
+            "num_envs": args.num_envs,
             "n_steps": args.n_steps,
             "batch_size": args.batch_size,
             "ent_coef": args.ent_coef,
+            "shaping": args.shaping,
+            "opponent": args.opponent,
             "seed": seed,
         },
     )
@@ -225,8 +313,8 @@ def main():
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     print(f"[Run] Checkpoints -> {checkpoint_dir}")
 
-    num_envs = 8
-    env = make_vec_env(num_envs=num_envs)
+    num_envs = args.num_envs
+    env = make_vec_env(num_envs=num_envs, shaping=args.shaping)
 
     if args.resume:
         resume_path = Path(args.resume)
@@ -255,6 +343,14 @@ def main():
     wandb_callback = WandbCallback(verbose=0)
     callbacks = CallbackList([turn_callback, wandb_callback])
 
+    # ``prune_checkpoints`` keeps the most *recent* three, which is what self-play
+    # sampling wants and is not at all what a human wants to play against. Track
+    # the best-scoring one separately; the name is outside the ``agent_step_*``
+    # glob, so pruning leaves it alone.
+    best_path = checkpoint_dir / "best.zip"
+    best_score = -1.0
+    best_step = None
+
     eval_step = 0
     while steps_done < args.total_steps:
         interval = min(args.eval_interval, args.total_steps - steps_done)
@@ -268,31 +364,43 @@ def main():
         steps_done += interval
         eval_step += 1
 
-        opponent = sample_opponent(checkpoint_dir)
-        print(f"[Eval] Testing against {opponent.__class__.__name__}...", end="", flush=True)
-        win_rate = evaluate(model, opponent, num_games=25)
+        # Evaluation loads from disk so it can run across processes, so the
+        # checkpoint has to exist before the match, not after it.
+        print(f"[Checkpoint] Saving model at step {steps_done}")
+        latest = save_checkpoint(model, steps_done, checkpoint_dir)
+        prune_checkpoints(checkpoint_dir, keep_n=3)
 
-        wandb.log({
-            "step": steps_done,
-            "eval/win_rate": win_rate,
-            "eval/opponent": opponent.__class__.__name__,
-        })
-        print(f" OK win_rate={win_rate:.2%}")
+        print("[Eval] vs weighted-random...", end="", flush=True)
+        metrics, baseline = evaluate(
+            latest, args.eval_games, workers=args.eval_workers,
+            seed=int(np.random.randint(2**31 - 1)),
+            gauntlet_games=args.gauntlet_games,
+            gauntlet_simulations=args.gauntlet_simulations,
+        )
+        score = metrics["eval/score_vs_weighted_random"]
+        if score > best_score:
+            best_score, best_step = score, steps_done
+            shutil.copyfile(Path(f"{latest}.zip"), best_path)
+            print(f"  new best ({score:.1%}) -> {best_path}")
+        metrics["eval/best_score"] = best_score
+        wandb.log({"step": steps_done, "checkpoint/step": steps_done, **metrics})
+        print(f" {baseline.summary()}")
 
-        if eval_step % 2 == 0:
-            print(f"[Checkpoint] Saving model at step {steps_done}")
-            save_checkpoint(model, steps_done, checkpoint_dir)
-            prune_checkpoints(checkpoint_dir, keep_n=3)
-            wandb.log({"checkpoint/step": steps_done})
-
-        opponent = sample_opponent(checkpoint_dir)
-        print(f"[Self-play] Swapping to {opponent.__class__.__name__}")
-        env = make_vec_env(num_envs=num_envs, enemy=opponent)
-        model.set_env(env)
+        if args.opponent == "selfplay":
+            opponent = sample_opponent(checkpoint_dir)
+            print(f"[Self-play] Swapping to {opponent.__class__.__name__}")
+            env = make_vec_env(
+                num_envs=num_envs, enemy=opponent, shaping=args.shaping
+            )
+            model.set_env(env)
 
     model.save(str(checkpoint_dir / "agent_final"))
     wandb.finish()
-    print(f"Training complete. Model saved to {checkpoint_dir / 'agent_final'}")
+    print(f"Training complete. Final model at {checkpoint_dir / 'agent_final'}")
+    if best_step is not None:
+        print(f"Best checkpoint: step {best_step}, {best_score:.1%} vs "
+              f"weighted-random -> {best_path}")
+        print(f"Play it: python -m src.eval.play --agent ppo --model {best_path}")
 
 
 if __name__ == "__main__":

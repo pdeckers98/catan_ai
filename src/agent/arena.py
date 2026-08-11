@@ -264,7 +264,9 @@ def build_agent_from_spec(spec: AgentSpec):
         net.load_state_dict(spec.net_blob["state_dict"])
         net.eval()
         return net_factory(net, spec.simulations, batch_size=spec.batch_size)
-    return build_agent(spec.kind, spec.model_path, spec.simulations)
+    return build_agent(
+        spec.kind, spec.model_path, spec.simulations, spec.batch_size
+    )
 
 
 def _as_factory(agent):
