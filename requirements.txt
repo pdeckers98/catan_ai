@@ -13,6 +13,7 @@ sb3-contrib==2.9.0   # MaskablePPO + ActionMasker (action masking is mandatory)
 
 # Tooling & logging
 flake8
+pytest
 wandb
 
 # Phase 3 (colonist.io bridge) — uncomment when reaching Phase 3
