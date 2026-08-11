@@ -31,10 +31,11 @@ from src.env.rules import apply_rule_patches
 
 ENV_ID = "catanatron-v1"
 
-# Victory points needed to win. Short games keep the RL horizon (and the MCTS
-# search depth) manageable; with Longest Road disabled, 8 VP is reached through
-# settlements, cities, VP dev cards and Largest Army.
-VPS_TO_WIN = 8
+# Victory points needed to win. With Longest Road disabled, VPs come from
+# settlements, cities, VP dev cards and Largest Army. Was 8 (a short game keeps
+# the RL horizon manageable); raised to 10 for the standard-length game, which
+# lengthens episodes and pushes more weight onto the city/dev-card end game.
+VPS_TO_WIN = 10
 
 # Safety net so a degenerate policy cannot stall a game forever.
 MAX_TURNS = 300
@@ -147,10 +148,16 @@ class TurnLimitWrapper(Wrapper):
         return self.env.reset(**kwargs)
 
 
-# Milestone VP thresholds and their one-time bonus rewards, scaled to an 8-VP
-# game. The top milestone tracks "one VP short of winning", so it moves with
-# VPS_TO_WIN; leaving it at 6 would have paid the largest bonus two VP early.
-_VP_MILESTONES = {3: 0.1, 5: 0.25, 7: 0.5}
+# Milestone VP thresholds and their one-time bonus rewards. The top milestone
+# tracks "one VP short of winning" and the other two sit at roughly 40% and 60%
+# of the way there, so all three move with VPS_TO_WIN -- hardcoding them would
+# have paid the largest bonus three VP early once the target moved to 10.
+# At 8 VP this reproduces the original {3, 5, 7}.
+_VP_MILESTONES = {
+    round(0.4 * VPS_TO_WIN): 0.1,
+    round(0.6 * VPS_TO_WIN): 0.25,
+    VPS_TO_WIN - 1: 0.5,
+}
 
 
 class RewardShapingWrapper(Wrapper):
@@ -160,10 +167,8 @@ class RewardShapingWrapper(Wrapper):
     (``src.agent.train_az``) trains on the sparse win/loss outcome alone, because
     MCTS supplies the dense signal that shaping was standing in for.
 
-    One-time bonuses fire the first time the agent crosses each VP threshold:
-      3 VP -> +0.10
-      5 VP -> +0.25
-      6 VP -> +0.50
+    One-time bonuses fire the first time the agent crosses each VP threshold in
+    ``_VP_MILESTONES``, which scales with VPS_TO_WIN: +0.10, +0.25, +0.50.
     The base env still provides +1 on win and -1 on loss.
 
     Two additional one-time building bonuses:

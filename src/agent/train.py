@@ -47,6 +47,7 @@ from wandb.integration.sb3 import WandbCallback
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
+from stable_baselines3.common.utils import get_schedule_fn
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from catanatron import Color
@@ -58,7 +59,7 @@ from src.agent.checkpoint_manager import (
 from src.agent.elo import Ladder, elo_delta
 from src.agent import pool as opponent_pool
 from src.env.catan_env import (
-    MAX_TURNS, make_1v1_env, valid_action_mask, TurnLimitWrapper,
+    MAX_TURNS, VPS_TO_WIN, make_1v1_env, valid_action_mask, TurnLimitWrapper,
     RewardShapingWrapper,
 )
 
@@ -309,6 +310,11 @@ def main():
                         help="PPO rollout length per env before each update.")
     parser.add_argument("--batch-size", type=int, default=256,
                         help="PPO minibatch size. Must divide n_steps * num_envs.")
+    parser.add_argument("--learning-rate", type=float, default=3e-4,
+                        help="Constant Adam step size. 3e-4 is the SB3 default. "
+                             "Raising it on a *resumed* policy trades stability "
+                             "for speed: the clip range bounds each policy "
+                             "update, but the value head has no such guard.")
     parser.add_argument("--ent-coef", type=float, default=0.01,
                         help="Entropy bonus coefficient. Was 0.05, raised at the "
                              "time to fight 'collapsing to road-heavy policies' "
@@ -377,7 +383,9 @@ def main():
             "num_envs": args.num_envs,
             "n_steps": args.n_steps,
             "batch_size": args.batch_size,
+            "learning_rate": args.learning_rate,
             "ent_coef": args.ent_coef,
+            "vps_to_win": VPS_TO_WIN,
             "shaping": args.shaping,
             "opponent": args.opponent,
             "pool_weighted_frac": args.pool_weighted_frac,
@@ -428,11 +436,19 @@ def main():
 
     if args.resume:
         model = MaskablePPO.load(str(resume_path), env=env, device="cpu")
-        print(f"[Resume] Loaded {resume_path}, continuing from step {steps_done}")
+        # ``load`` restores the *saved* schedule, so --learning-rate would be
+        # silently ignored on every resumed run. Rebind both: SB3 reads
+        # ``lr_schedule`` each update, but ``learning_rate`` is what gets
+        # serialised into the next checkpoint.
+        model.learning_rate = args.learning_rate
+        model.lr_schedule = get_schedule_fn(args.learning_rate)
+        print(f"[Resume] Loaded {resume_path}, continuing from step {steps_done} "
+              f"at lr {args.learning_rate:g}")
     else:
         model = MaskablePPO(
             "MlpPolicy",
             env,
+            learning_rate=args.learning_rate,
             n_steps=args.n_steps,
             batch_size=args.batch_size,
             ent_coef=args.ent_coef,
