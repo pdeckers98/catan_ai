@@ -15,16 +15,25 @@ the agent and, later, the web integration.
 - **Language**: Python 3.10+ (developed on the `catan` conda env, Python 3.14)
 - **Game engine**: [Catanatron](https://github.com/bcollazo/catanatron) (GPL-3.0) — fast pure-Python
   Catan simulator with a Gymnasium env, action masking, and strong baseline bots
-- **RL framework**: PyTorch via `stable-baselines3` + `sb3-contrib` (`MaskablePPO`); optional
-  raw-PyTorch PPO later
-- **Game mode**: 1v1 (`enemies=[one bot]`, `map_type="BASE"`, `vps_to_win=15`)
-- **Custom rules**: `src/env/rules.py` monkeypatches Catanatron at import time — discard on a
-  7 only triggers above **9** cards (`discard_limit=9`, vs. stock 7), and fixes an upstream
-  re-check bug that hardcoded `> 7`. Applied automatically via `src/env/catan_env.py`.
-- **Reward shaping**: training wraps the env in `RewardShapingWrapper` for a dense **exponential
-  VP** reward (late VPs worth exponentially more) on top of the sparse win/loss signal.
-- **Action masking**: mandatory — most actions are illegal each turn; always respect
-  `info["valid_actions"]` / `env.unwrapped.get_valid_actions()`
+- **Learning algorithm**: **AlphaZero** — one PyTorch net (policy + value heads) trained by
+  self-play, where PUCT tree search supplies the improved policy target. `src/agent/train_az.py`.
+  The older `MaskablePPO` (`stable-baselines3` + `sb3-contrib`) loop is kept as a legacy
+  baseline in `src/agent/train.py`.
+- **Game mode**: 1v1 (`enemies=[one bot]`, `map_type="BASE"`, `vps_to_win=7`)
+- **Custom rules**: `src/env/rules.py` monkeypatches Catanatron at import time. Applied
+  automatically via `src/env/catan_env.py`. Six patches:
+  1. discard on a 7 only above **9** cards (`discard_limit=9`, vs. stock 7)
+  2. per-resource, one-card-at-a-time discard the policy actually chooses
+     (expands the action space 290 → **294**)
+  3. correct multi-discarder sequencing (fixes an upstream `> 7` hardcode)
+  4. Colonist.io 1v1 robber placement restrictions
+  5. **Longest Road awards no VP** (length still tracked, `HAS_ROAD` never set)
+  6. `_discard_remaining` survives `State.copy()` — required for MCTS
+- **Reward shaping**: only on the legacy PPO track (`RewardShapingWrapper`, milestone VP
+  bonuses). AlphaZero trains on the sparse win/loss outcome; search provides the dense signal.
+- **Action masking**: mandatory — most of the 294 actions are illegal each turn; always respect
+  `info["valid_actions"]` / `env.unwrapped.get_valid_actions()`, or
+  `src/agent/encoding.py:legal_action_mask` off a raw `Game`.
 - **Training hardware**: high-core CPU cloud instance (RL here is CPU-bound — parallel game
   rollouts dominate; the policy is a small MLP)
 - **Inference hardware**: local GTX 1660 Super
@@ -34,10 +43,25 @@ the agent and, later, the web integration.
 
 ```
 src/
-├── env/       # Gym env construction, opponent config, reward shaping
-├── agent/     # PyTorch policy/value net + training (deep RL)
-├── eval/      # Benchmark harness vs Catanatron's built-in bots
-└── bridge/    # (Phase 3) colonist.io WebSocket reader + Playwright clicker
+├── env/
+│   ├── rules.py         # custom-rule monkeypatches (applied at import)
+│   └── catan_env.py     # gym env + raw-Game factory, shared constants
+├── agent/
+│   ├── encoding.py      # obs vector + action mask off a live Game
+│   ├── net.py           # AlphaZeroNet (residual MLP, policy + value heads)
+│   ├── evaluator.py     # leaf evaluators: net, PPO adapter, uniform control
+│   ├── mcts.py          # PUCT search with chance nodes; MCTSPlayer
+│   ├── selfplay.py      # self-play game generation + value targets
+│   ├── train_az.py      # AlphaZero training loop  <-- the main track
+│   ├── arena.py         # head-to-head match play + agent-by-name registry
+│   ├── train.py         # legacy MaskablePPO loop
+│   └── opponent.py      # PolicyPlayer (frozen PPO checkpoint as a Player)
+├── eval/
+│   ├── benchmark.py     # any agent vs any agent
+│   ├── stage0.py        # "is the old PPO net salvageable?" diagnostic
+│   ├── bench_mcts.py    # search compute-budget profiler
+│   └── play.py          # human vs AI (matplotlib)
+└── bridge/              # (Phase 3) colonist.io WebSocket reader + Playwright clicker
 docs/          # Per-phase guides (see below)
 checkpoints/   # Saved models (git-ignored)
 tests/         # Unit & integration tests
@@ -49,12 +73,18 @@ tests/         # Unit & integration tests
 
 **Smoke test (Phase 1)**: `python -m src.env.smoke_test`
 
-**Train (Phase 2)**: `python -m src.agent.train`
+**Train (Phase 2)**: `python -m src.agent.train_az --iterations 200 --games-per-iter 64 --workers 16`
 
-**Benchmark (Phase 2)**: `python -m src.eval.benchmark --games 500`
+**Benchmark**: `python -m src.eval.benchmark --agent az --model checkpoints/<run>/best.pt
+--opponent value --games 200`
 
-**Play vs the AI**: `python -m src.eval.play` (matplotlib window; you are RED, the trained
-agent is BLUE; type a move number, click "Next turn" to let the AI play)
+**Search budget**: `python -m src.eval.bench_mcts --simulations 100`
+
+**Play vs the AI**: `python -m src.eval.play --agent az --model checkpoints/<run>/best.pt`
+(matplotlib window; you are RED, the trained agent is BLUE; type a move number, click
+"Next turn" to let the AI play)
+
+**Test**: `python -m pytest tests/ -q`
 
 **Lint**: `flake8 src/ tests/`
 
@@ -68,7 +98,8 @@ presenting any code change, verify it passes flake8.
 See `docs/` for per-phase guides:
 
 - **`PHASE1_SETUP.md`** — Catanatron install, 1v1 env wiring, smoke test
-- **`PHASE2_AI.md`** — deep RL agent (MaskablePPO → custom PyTorch), self-play, cloud training, eval
+- **`PHASE2_AI.md`** — the AlphaZero agent (MCTS + self-play), the PPO track it replaced,
+  cloud training, eval
 - **`PHASE3_WEB.md`** — colonist.io bridge (WebSocket read + Playwright clicks)
 
 ## Caveats

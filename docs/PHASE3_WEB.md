@@ -35,7 +35,7 @@ Tampermonkey userscript ──► local Python server ──► state translator
    to produce the `(614,)` observation. Prior art:
    [robottler](https://github.com/meesg/robottler),
    [this writeup](https://medium.com/@alberttheblacksheep/abusing-my-computer-science-knowledge-to-cheat-at-catan-a0f72fa30309).
-2. **Action sender** — map the agent's chosen Catanatron action (one of the 290) to a colonist.io
+2. **Action sender** — map the agent's chosen Catanatron action (one of the 294) to a colonist.io
    UI click sequence via Playwright.
 3. **The hard part — coordinate translation.** colonist.io's tile/node/edge IDs and pixel
    coordinates must be mapped to Catanatron's node/edge/tile indexing (and back). Scope this as its

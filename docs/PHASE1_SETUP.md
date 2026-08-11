@@ -35,13 +35,16 @@
 - **Env id:** `catanatron-v1` — created via `gym.make("catanatron-v1", config={...})`.
 - **Inherently 1v1:** the agent is **P0 = `Color.BLUE`**; `config["enemies"]` is a list of opponent
   players. One enemy ⇒ 2-player game. Enemies must not be BLUE.
-- **Action space:** `Discrete(290)`. Most actions are illegal each turn.
+- **Action space:** `Discrete(290)` as shipped. Most actions are illegal each turn. `src/env/rules.py`
+  expands the single `(DISCARD, None)` slot into one per resource, so everything downstream sees
+  **`Discrete(294)`**.
 - **Observation:** default `"vector"` representation → flat `Box` of shape **(614,)**
   (alternative `"mixed"` gives a board tensor + numeric dict).
 - **Valid actions / masking:** `env.unwrapped.get_valid_actions()` returns the legal action ints;
   also exposed as `info["valid_actions"]` after `reset()`/`step()`.
 - **`config` keys** (with defaults): `enemies` (`[RandomPlayer(RED)]`), `map_type` (`"BASE"`),
-  `vps_to_win` (`15`), `representation` (`"vector"`), `reward_function` (built-in win/loss/draw),
+  `vps_to_win` (`10` upstream; this project passes **`7`**), `representation` (`"vector"`),
+  `reward_function` (built-in win/loss/draw),
   `invalid_action_reward` (`-1`).
 - **Reward:** built-in `simple_reward` → `+1` win / `-1` loss / `0` draw (or truncation at turn 1000).
 - **Turn limit:** games truncate (draw) if neither player reaches VP goal by turn 1000.
@@ -61,8 +64,12 @@ installing from Catanatron source/experimental or implementing one ourselves.
 ## What was built
 
 - `src/env/catan_env.py`
-  - `make_1v1_env(enemy=None, map_type="BASE", vps_to_win=15, representation="vector",
+  - `make_1v1_env(enemy=None, map_type="BASE", vps_to_win=VPS_TO_WIN, representation="vector",
     reward_function=None)` — constructs the 1v1 env (default enemy: `WeightedRandomPlayer(RED)`).
+  - `make_1v1_game(players=None, seed=None, ...)` — a **raw `Game`** for MCTS and AlphaZero
+    self-play, which drive the engine directly rather than through the gym `step` interface.
+  - `VPS_TO_WIN` (`7`) and `MAX_TURNS` (`300`) — the shared constants; import them rather than
+    hardcoding.
   - `valid_action_mask(env)` — boolean mask of shape `(action_space.n,)` for SB3-Contrib's
     `ActionMasker`.
 - `src/env/smoke_test.py` — plays N full games choosing uniformly among `info["valid_actions"]`.
