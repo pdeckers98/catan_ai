@@ -1,7 +1,8 @@
 """Play a 1v1 game against the trained agent in a matplotlib window.
 
-You are RED; the trained agent (``checkpoints/agent_final.zip``) is BLUE -- the
-side it trained on (P0). Both hands are shown god-mode (resources AND dev cards).
+You are RED; the trained agent is BLUE -- the side it trained on (P0). Both hands
+are shown god-mode (resources AND dev cards). Games are to 7 VP with no Longest
+Road bonus, matching training.
 
 Flow:
 - The board labels node ids, so a textual move like ``BUILD_ROAD edge (12, 13)``
@@ -11,7 +12,8 @@ Flow:
 - When you END your turn, click **Next turn** to let the AI play; review the
   result, then it's your turn again.
 
-Run: ``python -m src.eval.play``  (optional ``--model PATH`` / ``--seed N``)
+Run: ``python -m src.eval.play --agent az --model checkpoints/<run>/best.pt``
+(also ``--agent ppo`` for a legacy MaskablePPO zip; optional ``--seed N``)
 """
 
 import argparse
@@ -19,15 +21,14 @@ import random
 
 import matplotlib.pyplot as plt
 from matplotlib.widgets import TextBox, Button
-from sb3_contrib import MaskablePPO
 
-import src.env.catan_env  # noqa: F401  -- applies custom rules (discard_limit=9)
-from catanatron import Game, Color
+from catanatron import Color
 from catanatron.models.player import RandomPlayer
 from catanatron.models.enums import (
     ActionType, ActionPrompt, RESOURCES, DEVELOPMENT_CARDS,
 )
-from src.agent.opponent import PolicyPlayer
+from src.agent.arena import build_agent
+from src.env.catan_env import make_1v1_game
 from src.env.render import render_board
 
 HUMAN = Color.RED
@@ -101,13 +102,14 @@ def _hand_text(state, color, label):
 class HumanVsAI:
     """Drives a manual game loop: human (RED) vs frozen policy (BLUE)."""
 
-    def __init__(self, model_path, seed=None):
-        model = MaskablePPO.load(model_path, device="cpu", custom_objects={"n_steps": 1})
-        self.ai = PolicyPlayer(AI, model)
+    def __init__(self, agent_spec, model_path, seed=None, simulations=100):
+        self.ai = build_agent(agent_spec, model_path, simulations)(AI)
+        # Placeholder players: this loop drives the engine itself and never calls
+        # their decide(). Seating is randomized so the human isn't always second.
         players = [RandomPlayer(AI), RandomPlayer(HUMAN)]
         if random.random() < 0.5:
             players = [RandomPlayer(HUMAN), RandomPlayer(AI)]
-        self.game = Game(players=players, seed=seed, vps_to_win=15)
+        self.game = make_1v1_game(players=players, seed=seed)
         self.mode = HUMAN_TURN
         self.message = ""
         self._build_ui()
@@ -252,12 +254,16 @@ class HumanVsAI:
 
 def main():
     parser = argparse.ArgumentParser(description="Play 1v1 Catan vs the trained AI.")
-    parser.add_argument("--model", default="checkpoints/agent_final.zip",
-                        help="Path to the trained MaskablePPO checkpoint.")
+    parser.add_argument("--agent", default="az",
+                        help="Agent spec: az, ppo, ppo-mcts, mcts, value, weighted.")
+    parser.add_argument("--model", default=None,
+                        help="Checkpoint path (.pt for az, .zip for ppo).")
+    parser.add_argument("--simulations", type=int, default=100,
+                        help="MCTS playouts per move for search-backed agents.")
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
-    HumanVsAI(args.model, seed=args.seed)
+    HumanVsAI(args.agent, args.model, seed=args.seed, simulations=args.simulations)
     plt.show()
 
 
