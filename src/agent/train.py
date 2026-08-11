@@ -47,7 +47,10 @@ from wandb.integration.sb3 import WandbCallback
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
-from stable_baselines3.common.utils import get_schedule_fn
+try:  # SB3 >= 2.7 renamed the constant-schedule helper.
+    from stable_baselines3.common.utils import FloatSchedule as constant_lr
+except ImportError:  # pragma: no cover - older SB3
+    from stable_baselines3.common.utils import get_schedule_fn as constant_lr
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from catanatron import Color
@@ -441,7 +444,7 @@ def main():
         # ``lr_schedule`` each update, but ``learning_rate`` is what gets
         # serialised into the next checkpoint.
         model.learning_rate = args.learning_rate
-        model.lr_schedule = get_schedule_fn(args.learning_rate)
+        model.lr_schedule = constant_lr(args.learning_rate)
         print(f"[Resume] Loaded {resume_path}, continuing from step {steps_done} "
               f"at lr {args.learning_rate:g}")
     else:
