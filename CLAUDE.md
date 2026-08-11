@@ -19,7 +19,7 @@ the agent and, later, the web integration.
   self-play, where PUCT tree search supplies the improved policy target. `src/agent/train_az.py`.
   The older `MaskablePPO` (`stable-baselines3` + `sb3-contrib`) loop is kept as a legacy
   baseline in `src/agent/train.py`.
-- **Game mode**: 1v1 (`enemies=[one bot]`, `map_type="BASE"`, `vps_to_win=8`)
+- **Game mode**: 1v1 (`enemies=[one bot]`, `map_type="BASE"`, `vps_to_win=10`)
 - **Custom rules**: `src/env/rules.py` monkeypatches Catanatron at import time. Applied
   automatically via `src/env/catan_env.py`. Seven patches:
   1. discard on a 7 only above **9** cards (`discard_limit=9`, vs. stock 7)

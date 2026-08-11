@@ -57,9 +57,9 @@ Treat Stage 0 as directional.
 
 Both set in `src/env/` and applied to every code path:
 
-- **8 VP to win** (`VPS_TO_WIN` in `src/env/catan_env.py`). Games resolve in ~80-150 turns instead
-  of stretching past a turn cap, which shortens the credit-assignment horizon and lets search see
-  terminal states from realistic positions.
+- **10 VP to win** (`VPS_TO_WIN` in `src/env/catan_env.py`). This was 8 for the PPO runs through
+  `ppo-pool`, which resolved in ~100-125 turns; the standard target lengthens episodes and shifts
+  weight onto the city and dev-card end game. `MAX_TURNS = 300` still caps runaway games.
 - **Longest Road awards no victory points** (`_patch_no_longest_road`). At 8 VP a 2-point swing is
   nearly a third of the win condition, and it pays out for exactly the road-spam behaviour we are
   training away from. `LONGEST_ROAD_LENGTH` is still tracked and still appears in the observation
