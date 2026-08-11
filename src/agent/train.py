@@ -1,4 +1,9 @@
-"""Phase 2 training: MaskablePPO with self-play and W&B logging.
+"""Phase 2 training (legacy track): MaskablePPO with self-play and W&B logging.
+
+Superseded by ``src.agent.train_az``, which replaces the policy-gradient update
+with AlphaZero-style search + supervised distillation. This module is kept so the
+old checkpoints stay loadable and reproducible, and so ``src.eval.stage0`` has a
+PPO baseline to diagnose.
 
 Usage:
     python -m src.agent.train --total-steps 500000 --eval-interval 50000 --w-b-project "catan-ai"
@@ -22,7 +27,8 @@ from src.agent.checkpoint_manager import (
     list_checkpoints, prune_checkpoints, save_checkpoint,
 )
 from src.env.catan_env import (
-    make_1v1_env, valid_action_mask, TurnLimitWrapper, RewardShapingWrapper,
+    MAX_TURNS, make_1v1_env, valid_action_mask, TurnLimitWrapper,
+    RewardShapingWrapper,
 )
 
 
@@ -116,7 +122,9 @@ def make_vec_env(num_envs: int, enemy=None):
     def make_env():
         def _init():
             env = make_1v1_env(enemy=enemy)
-            env = TurnLimitWrapper(ActionMasker(env, valid_action_mask), max_turns=300)
+            env = TurnLimitWrapper(
+                ActionMasker(env, valid_action_mask), max_turns=MAX_TURNS
+            )
             env = RewardShapingWrapper(env)
             return env
         return _init
