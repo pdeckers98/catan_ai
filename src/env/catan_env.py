@@ -15,6 +15,8 @@ Key facts about the underlying env (catanatron-gym 4.0.0):
 - Games are played to 7 VP with no Longest Road bonus (see ``src.env.rules``).
 """
 
+import random
+
 import gymnasium as gym
 from gymnasium import Wrapper
 import numpy as np
@@ -53,7 +55,8 @@ def make_1v1_game(players=None, seed=None, map_type="BASE", vps_to_win=VPS_TO_WI
         players: list of catanatron Players. Defaults to two placeholder
             RandomPlayers (BLUE first, then RED) -- callers that drive the engine
             themselves never invoke ``decide``.
-        seed: RNG seed, or None for a random one.
+        seed: RNG seed, or None for a random one. Controls the board layout as
+            well as the dice -- see below.
         map_type: "BASE" (full board) or "MINI" (faster iteration).
         vps_to_win: victory points to win.
 
@@ -62,11 +65,21 @@ def make_1v1_game(players=None, seed=None, map_type="BASE", vps_to_win=VPS_TO_WI
     """
     if players is None:
         players = [RandomPlayer(Color.BLUE), RandomPlayer(Color.RED)]
+
+    # ``Game.__init__`` reseeds the *global* random module, but ``build_map``
+    # shuffles the board off that same module -- and as a plain argument it would
+    # run first, leaving the layout at the mercy of whatever consumed the RNG
+    # beforehand. Seeding here first is what makes a seed reproduce a board;
+    # without it two games with the same seed get different maps.
+    if seed is not None:
+        random.seed(seed)
+    catan_map = build_map(map_type)
+
     return Game(
         players=players,
         seed=seed,
         vps_to_win=vps_to_win,
-        catan_map=build_map(map_type),
+        catan_map=catan_map,
     )
 
 
