@@ -130,8 +130,23 @@ turns it off.
 
 *It measured neutral* — 49.0% head-to-head against a free-dice scorer, and the informative-pair rate
 barely moved (73.1% → 73.9%). At 8000 pairs, dice variance was not the binding constraint. Left on
-by default because it is free and makes the pair an actually controlled comparison, which should
-matter more once labels stop coming from weighted-random rollouts.
+by default because it is free and makes the pair an actually controlled comparison.
+
+**Rollout strength decides what the label means.** `--rollout ppo --rollout-model <ckpt>` plays the
+remaining ~120 turns with the trained agent instead of weighted-random, so the label answers "which
+opening suits how *we* play" rather than "which opening beats a bot". Both seats get the same
+checkpoint; initial roads stay on weighted-random because a `PlacementWrapper`-trained checkpoint
+has an untrained head there. Costs 1.85 pairs/s against weighted-random's 12 — ~72 min for 8000.
+
+It clearly produces better *data* — 81.2% of pairs decided vs 73.9%, and the held-out diagnostic
+improves to 3.7/54 at rho +0.92 (shipped scorer: 4.15, +0.883). It did **not** produce a stronger
+agent: 52.5% over 400 head-to-head games (51.0% / 54.0% on two seeds), 95% CI [47.6, 57.4].
+
+**Read the three attempts together.** CRN, the ranking loss, and agent-strength rollouts all left
+play strength where it was, despite two of them measurably improving label quality. The label
+pipeline is not what limits this scorer. The likelier constraint is structural: corners are picked
+**greedily and scored independently**, so the first settlement is chosen blind to what the second
+will be, and no amount of label quality fixes that. See the Ideas section.
 
 **A ranking loss was tried and lost.** `--loss rank` fits `sigmoid(s(X) − s(Y))` to `(delta+1)/2`,
 scoring a bundle as the sum of its corners — a pair *is* a comparison, so Bradley-Terry looks like
