@@ -78,7 +78,7 @@ class PlacementWrapper(Wrapper):
         ]
         if not settlements:
             roads = [a for a in actions if a.action_type == ActionType.BUILD_ROAD]
-            if roads and self.chooser.bundle_model is not None:
+            if roads and self.chooser.plans_roads:
                 edge = self.chooser.choose_road(
                     game, color, [a.value for a in roads]
                 )

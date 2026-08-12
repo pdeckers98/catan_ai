@@ -40,6 +40,7 @@ import numpy as np
 from catanatron.models.board import STATIC_GRAPH
 
 from src.placement.features import (
+    corner_feature_size,
     encode_candidates,
     legal_road_edges,
     node_features,
@@ -69,6 +70,14 @@ class OpeningChooser:
         self.bundle_model = bundle_model
         self.first_k = first_k
         self.partner_k = partner_k
+        # A bundle model trained before roads joined the opening takes bare
+        # settlement vectors. Read which it is off the checkpoint rather than
+        # asking the caller, so an older scorer keeps working and simply leaves
+        # the roads to the inner agent as it always did.
+        self.plans_roads = (
+            bundle_model is not None
+            and bundle_model.corner_dim == corner_feature_size()
+        )
         self.reset()
 
     def reset(self):
@@ -102,7 +111,7 @@ class OpeningChooser:
         if not edges:
             raise ValueError("no candidate edges")
         edges = [tuple(sorted(e)) for e in edges]
-        if self.bundle_model is None or self._plan is None:
+        if not self.plans_roads or self._plan is None:
             return self._pending_road if self._pending_road in edges else edges[0]
         if self._pending_road in edges:
             return self._pending_road
@@ -115,7 +124,13 @@ class OpeningChooser:
         return [nodes[i] for i in order]
 
     def _corners(self, game, color, node, features, assume_owned=()):
-        """Every (edge, corner vector) for one settlement node."""
+        """Every (edge, corner vector) for one settlement node.
+
+        With a settlement-only bundle model there is one "corner" and no road to
+        choose, so the edge is None and the search collapses to the corner pair.
+        """
+        if not self.plans_roads:
+            return [(None, features)]
         return [
             (tuple(edge), np.concatenate([
                 features,

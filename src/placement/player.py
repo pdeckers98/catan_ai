@@ -54,7 +54,7 @@ class PlacementPlayer(Player):
             # Only when the chooser is actually planning openings. Without a
             # bundle model it has no opinion about roads, and the inner agent
             # keeps them -- which is what every earlier measurement did.
-            if roads and self.chooser.bundle_model is not None:
+            if roads and self.chooser.plans_roads:
                 edge = self.chooser.choose_road(
                     game, self.color, [a.value for a in roads]
                 )
