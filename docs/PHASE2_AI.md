@@ -383,6 +383,189 @@ kept hand only exists on the other side of a dice roll. Planned fix, inference-t
 Cheap control worth running first: a handcrafted veto (e.g. cap dev buys at 5/game) on top of
 the raw policy. If a dumb constraint moves the win rate, it bounds what the search can recover.
 
+### Stage 0 validated the premise (2026-08-12)
+
+`python -m src.eval.stage0 --model checkpoints/ppo-8vp-scratch/best.zip --opponent weighted
+--games 40 --simulations 50` (seed 12345):
+
+| config | score | losses | draws | avg turns |
+| --- | --- | --- | --- | --- |
+| `ppo` (raw greedy) | 80.0% | 7 | 2 | 128 |
+| `mcts` (uniform priors, no net) | 22.5% | 22 | 18 | 242 |
+| `ppo-mcts` (PUCT + PPO net) | **95.0%** | 2 | 0 | 115 |
+
+Verdict (from `stage0.py`'s own logic): the PPO net adds real signal on top of search — start
+the AlphaZero trunk from it, don't train from scratch. Waste telemetry barely moved (dev bought
+8.5→8.4, cities 1.1→1.4), so search's gain here reads more like catching tactical mistakes
+(robber, trades, discards) than fixing the dev-card monoculture directly — the two problems may
+be more separable than assumed.
+
+### Placement diagnosis (2026-08-12): the policy learned tile count, not dice numbers
+
+Measured across 5 boards (seeds 7/11/23/42/99) by scoring every legal first-settlement node with
+a pip-count × resource-diversity heuristic (`catanatron.models.map.number_probability`) and
+comparing against both the PPO policy's prior and its critic.
+
+**The policy** — which is what actually makes the placement:
+
+| seed | chosen node | adj. tiles | numbers | pip rank (all) | rank among 3-tile nodes |
+| --- | --- | --- | --- | --- | --- |
+| 7 | 1 | 3 | 4, 5, 9 | 7/54 | 7/21 |
+| 11 | 19 | 3 | 3, 10, 5 | 10/54 | 10/18 |
+| 23 | 19 | 3 | 4, 12, 5 | 17/54 | 17/22 |
+| 42 | 16 | 3 | 8, 9, 11 | 11/54 | 11/21 |
+| 99 | 1 | 3 | 10, 4, 11 | 13/54 | 13/18 |
+
+It picks a three-tile node every time — so it did learn "settle where three tiles meet" — but
+lands in the **bottom half of the three-tile options on all five boards**, with almost no 6s or
+8s. Spearman rho(heuristic, policy prior) ≈ **0** on every board (-0.09..+0.01). The diagnosis is
+specific: **the policy learned adjacent-tile count but is blind to dice numbers.** Better than
+random (rank ~11/54 vs 27/54 expected), nowhere near good.
+
+**The critic** is not usable as a placement oracle either, though not for the reason a single
+board suggested. Scoring the post-settlement state gave rho = -0.833 on seed 7 (which looked
+like a clean inversion) but **+0.730 on seed 42**, with -0.65..-0.75 elsewhere. That is
+board-dependent instability — close to uninformative on placement rather than reliably
+backwards — over a narrow value spread (~0.21-0.38).
+
+Ruled out as artifacts: no port confound (adjacent tiles and ports inspected directly), and
+initial placement is **not** bypassed during training — it runs through the same policy/env step
+loop as every other decision (`src/env/catan_env.py`).
+
+**Do not use `checkpoints/feas01` or `feas02` for calibration checks like this** — they never
+converged (policy loss still falling when `feas02` ended), so a null result there is
+uninformative, not evidence.
+
+Consequence: the brute-force 1-ply critic-scoring plan for placement is blocked. The fix had to
+supply placement knowledge from outside the current value head — see the placement specialist
+below, which does exactly that and recovers most of the gap.
+
+## The placement specialist (`src/placement/`, built 2026-08-12)
+
+Placement is structurally unlike the rest of the game: **no dice at decision time**, ~2 decisions
+per game, fully observable, and hugely decisive. It also gets ~2 of ~300 gradient samples per
+episode, which is the real reason it is undertrained — a discount tweak does not fix data
+starvation. So it gets its own module, trained on its own data.
+
+**The design constraint: no hardcoded placement knowledge.** An earlier draft of this plan had a
+hand-written scorer playing the opening and hand-engineered "diversity bonus" features in the
+model. Both were cut. The agent has to learn placement the same way it learns everything else, or
+the project is building a rules engine with a neural net attached. What survives is a line between
+*facts* and *judgements*:
+
+- **Facts go in the features.** "This corner touches a tile numbered 8, whose roll probability is
+  5/36" is a property of two dice, not an opinion about Catan.
+- **Judgements are learned.** Whether 6s beat 5s, whether variety beats concentration, whether
+  ore+wheat beats brick+wood — none of it is written down anywhere. The model infers all of it
+  from which openings won.
+
+### How it works
+
+**`features.py` — 45 mechanical numbers per candidate node.** Per-resource production rate, tile
+counts, a dice-number histogram, desert count, port one-hot, whether this is the first or second
+settlement, what each player already holds, and how much buildable production sits 2 and 3 edges
+away. No weighting between blocks. Not the 614-dim game vector: in that encoding a corner's
+numbers are scattered across the board representation, so "an 8 next to a 6" looks different on
+every map — which is exactly why the main policy never generalized it. Here it is the same handful
+of dimensions on every board.
+
+**`dataset.py` — outcome labels from duplicate-board pairs.** Openings are picked **uniformly at
+random** (not sampled from any scorer — that would fill the dataset with the scorer's preferences
+and leave no counter-examples), the rest of the game is played out by weighted-random bots, and
+the label is what happened. Every sample is a placement decision instead of 2 in 300, and the
+target is the undiscounted result, so discounting never enters.
+
+The variance reduction is the duplicate-board pairing. Each board is played **twice with the four
+opening nodes swapped between the seats**, and the label is the difference: if the same seat wins
+both games the board explained the result and both openings get 0; if swapping the openings swaps
+the winner, the openings explained it and the labels go to ±1. In practice ~73% of pairs come back
+informative. The snake draft makes the swap always legal — seats pick n1, n2, n3, n4 in the order
+P0, P1, P1, P0, so reassigning ownership means replaying in the order n2, n1, n4, n3, and every
+node keeps its non-adjacency to the other three.
+
+*Honest caveat: this duplicates the **board**, not the dice.* Catanatron rolls off the global RNG,
+and once the seats hold different corners their actions diverge and so do the rolls. Board layout
+is the larger and more systematic nuisance term and it is fully controlled; dice are only
+correlated early. Variance reduction, not elimination.
+
+**`model.py` — a 64-wide, 2-hidden-layer MLP** mapping one node's features to a scalar in [-1, 1].
+Standardisation statistics are fitted on the training split and stored as buffers, so inference
+cannot silently disagree with training about what the inputs mean. Tiny on purpose: 45 inputs, one
+output, and labels that are almost all noise.
+
+**`heuristic.py` — the hand-written scorer, quarantined.** Pips × diversity. It is never consulted
+during data generation and never at play time; it exists only so `evaluate.py` can report where
+the model's chosen corner ranks. A model that merely matches it has rediscovered the beginner rule.
+
+**`player.py` — `PlacementPlayer`** intercepts initial-phase `BUILD_SETTLEMENT` and forwards
+everything else, initial roads included, to the inner agent. That narrow seam is what makes the
+measurement clean: the same agent with and without the scorer differs only in its opening. Wired
+through `arena.build_agent(..., placement_path=)` and `AgentSpec.placement_path`, so
+`src.eval.benchmark --placement-model` composes it with *any* agent spec.
+
+### Results (32k samples from 8000 board pairs, seed 1)
+
+| metric | PPO alone | PPO + placement scorer |
+| --- | --- | --- |
+| chosen corner's rank by the yardstick | ~11 / 54 | **4.2 / 54** |
+| rho(yardstick, model scores) | ~0.00 | **+0.88** |
+| vs `weighted`, 200 games, seed 42 | 89.2% | **97.0%** (194W-6L) |
+| head-to-head vs the identical agent without it | — | **85.5%** (171W-29L) |
+
+The head-to-head is the number that matters: two copies of the same PPO checkpoint differing
+**only** in who picks the opening, and the one with the scorer wins 85.5%. Placement really was
+worth that much, and the scorer learned dice numbers from outcomes alone — nobody told it that 8
+beats 3.
+
+Training overfits fast (validation loss bottoms out around epoch 7 and climbs steadily after), so
+early stopping is load-bearing rather than tidy: the epoch-200 network ranks corners visibly worse
+than the epoch-7 one.
+
+### Reproducing
+
+```
+python -m src.placement.dataset --pairs 8000 --workers 8 --seed 1
+python -m src.placement.train --data data/placement/samples.npz
+python -m src.eval.benchmark --agent ppo --model checkpoints/ppo-8vp-scratch/best.zip \
+    --placement-model checkpoints/placement/scorer.pt \
+    --opponent ppo --opponent-model checkpoints/ppo-8vp-scratch/best.zip \
+    --games 200 --workers 8 --seed 42
+```
+
+Data generation is cheap — ~7 pairs/second/core, so 8000 pairs is about a minute on 8 workers.
+
+### Next steps
+
+- **Expert Iteration.** `dataset.py --model <scorer> --epsilon 0.3` explores around the current
+  scorer instead of uniformly, concentrating samples near decisions that are actually close. Round
+  2 has not been run.
+- **Stronger rollouts.** Labels currently come from weighted-random play. Rolling out with the PPO
+  agent makes them "good openings *for how we actually play*", at a large compute cost.
+- **Fold into AlphaZero.** The scorer composes with any agent, so it can supply the prior at
+  placement nodes in `train_az.py` while the main net learns the rest.
+
+### Planned unified approach: warm-start + Expert Iteration on `AlphaZeroNet`
+
+`AlphaZeroNet` and the PPO net share the same 614-dim observation encoding and 294-action space
+(`src/agent/encoding.py`), so "start the AlphaZero trunk from PPO" means distillation, not a
+weight copy:
+
+1. **Warm start** (new script): sample states from `ppo-8vp-scratch` self-play, get its action
+   distribution + tanh-squashed critic value on each, and fit a fresh `AlphaZeroNet`'s policy
+   head by cross-entropy (`net.py:masked_policy_loss`) and value head by MSE against those
+   targets. Produces an `AlphaZeroNet` checkpoint starting near PPO's ~89-95% level instead of
+   `feas02`'s 70.8%.
+2. **Expert Iteration is just `train_az.py`, unmodified** — the "depth-2 dice-expectimax" reduces
+   to `MCTS` + `NetEvaluator` once on `AlphaZeroNet`, which the loop already runs every
+   iteration; `--simulations` is the depth/cost knob (stage 0 shows even 50 helps a lot). Fine-tune
+   from the Step 1 checkpoint rather than random init.
+3. **Placement stays open** — the calibration finding above means brute-force scoring is blocked
+   until early-game value estimates are fixed. Candidate fixes to evaluate: a lighter discount or
+   separate value target for early turns, or extra self-play weight on placement diversity. Revisit
+   once Step 1/2 produce a net worth recalibrating.
+
+Nothing here is implemented yet — this is the design as of 2026-08-12, pending confirmation.
+
 ## Cloud training
 
 Self-play generates data on the fly, so there is little to pre-upload. Checkpoints are small

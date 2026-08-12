@@ -31,6 +31,12 @@ the agent and, later, the web integration.
   6. a dev card **cannot be played the turn it was bought** (one-per-turn is already
      enforced upstream)
   7. `_discard_remaining` survives `State.copy()` — required for MCTS
+- **Opening placement**: a separate self-trained specialist (`src/placement/`). Initial settlement
+  choice gets ~2 of ~300 gradient samples per episode, so the main policy learned "settle where
+  three tiles meet" but never learned that an 8 beats a 3. The specialist trains on random
+  openings labelled with actual game outcomes, using duplicate-board pairs for variance reduction.
+  **No hardcoded placement knowledge**: features are mechanical board facts only, and the
+  hand-written scorer in `heuristic.py` is an evaluation yardstick that never plays.
 - **Reward shaping**: only on the legacy PPO track (`RewardShapingWrapper`, milestone VP
   bonuses). AlphaZero trains on the sparse win/loss outcome; search provides the dense signal.
 - **Action masking**: mandatory — most of the 294 actions are illegal each turn; always respect
@@ -58,6 +64,14 @@ src/
 │   ├── arena.py         # head-to-head match play + agent-by-name registry
 │   ├── train.py         # legacy MaskablePPO loop
 │   └── opponent.py      # PolicyPlayer (frozen PPO checkpoint as a Player)
+├── placement/           # opening-settlement specialist (self-trained, no heuristics)
+│   ├── features.py      # 45 mechanical per-node board facts
+│   ├── dataset.py       # random openings + duplicate-board outcome labels
+│   ├── model.py         # PlacementNet (small MLP, scores one node)
+│   ├── train.py         # supervised fit on the outcome labels
+│   ├── heuristic.py     # hand-written scorer -- EVALUATION YARDSTICK ONLY
+│   ├── evaluate.py      # rank/rho diagnostics on held-out boards
+│   └── player.py        # wraps any agent; takes over only the opening
 ├── eval/
 │   ├── benchmark.py     # any agent vs any agent
 │   ├── stage0.py        # "is the old PPO net salvageable?" diagnostic
@@ -77,8 +91,12 @@ tests/         # Unit & integration tests
 
 **Train (Phase 2)**: `python -m src.agent.train_az --iterations 200 --games-per-iter 64 --workers 16`
 
+**Train the placement scorer**: `python -m src.placement.dataset --pairs 8000 --workers 8` then
+`python -m src.placement.train --data data/placement/samples.npz`
+
 **Benchmark**: `python -m src.eval.benchmark --agent az --model checkpoints/<run>/best.pt
---opponent value --games 200`
+--opponent value --games 200` (add `--placement-model checkpoints/placement/scorer.pt` to hand
+the opening to the placement specialist)
 
 **Search budget**: `python -m src.eval.bench_mcts --simulations 100`
 

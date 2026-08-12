@@ -46,16 +46,24 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1,
                         help="MCTS leaves per network call. >1 trades exact "
                              "search reproducibility for throughput.")
+    parser.add_argument("--placement-model", default=None,
+                        help="PlacementNet checkpoint for the challenger's "
+                             "opening. Run the same agent with and without it "
+                             "to measure the opening in isolation.")
+    parser.add_argument("--opponent-placement-model", default=None,
+                        help="Same, for the opponent.")
     args = parser.parse_args()
 
     challenger = AgentSpec(
         kind=args.agent, model_path=args.model,
         simulations=args.simulations, batch_size=args.batch_size,
+        placement_path=args.placement_model,
     )
     opponent = AgentSpec(
         kind=args.opponent, model_path=args.opponent_model,
         simulations=args.opponent_simulations or args.simulations,
         batch_size=args.batch_size,
+        placement_path=args.opponent_placement_model,
     )
 
     print(f"{args.agent} vs {args.opponent} over {args.games} games "

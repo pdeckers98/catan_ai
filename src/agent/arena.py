@@ -351,11 +351,14 @@ class AgentSpec:
     simulations: int = 100
     batch_size: int = 1
     net_blob: dict = None
+    placement_path: str = None
 
     @classmethod
-    def from_net(cls, net, simulations: int, batch_size: int = 1) -> "AgentSpec":
+    def from_net(cls, net, simulations: int, batch_size: int = 1,
+                 placement_path: str = None) -> "AgentSpec":
         return cls(
             kind="az", simulations=simulations, batch_size=batch_size,
+            placement_path=placement_path,
             net_blob={
                 "config": net.config(),
                 "state_dict": {k: v.cpu() for k, v in net.state_dict().items()},
@@ -369,10 +372,20 @@ def build_agent_from_spec(spec: AgentSpec):
         net = AlphaZeroNet(**spec.net_blob["config"])
         net.load_state_dict(spec.net_blob["state_dict"])
         net.eval()
-        return net_factory(net, spec.simulations, batch_size=spec.batch_size)
+        factory = net_factory(net, spec.simulations, batch_size=spec.batch_size)
+        return _with_placement(factory, spec.placement_path)
     return build_agent(
-        spec.kind, spec.model_path, spec.simulations, spec.batch_size
+        spec.kind, spec.model_path, spec.simulations, spec.batch_size,
+        spec.placement_path,
     )
+
+
+def _with_placement(factory, placement_path):
+    """Optionally hand the opening to a learned placement scorer."""
+    if placement_path is None:
+        return factory
+    from src.placement.player import wrap_factory
+    return wrap_factory(factory, placement_path)
 
 
 def _as_factory(agent):
@@ -381,7 +394,7 @@ def _as_factory(agent):
 
 
 def build_agent(spec: str, model_path=None, simulations: int = 100,
-                batch_size: int = 1):
+                batch_size: int = 1, placement_path=None):
     """Build an agent factory from a short name.
 
     Specs:
@@ -397,10 +410,20 @@ def build_agent(spec: str, model_path=None, simulations: int = 100,
         model_path: checkpoint path, required for the network-backed specs.
         simulations: playouts per decision for search-backed specs.
         batch_size: leaves per evaluator call; see :class:`~src.agent.mcts.MCTS`.
+        placement_path: optional PlacementNet checkpoint. Any agent above can be
+            given one; it then takes over the opening settlements and nothing
+            else, so the same spec with and without it isolates the opening.
 
     Returns:
         callable(Color) -> Player.
     """
+    return _with_placement(
+        _build_core_agent(spec, model_path, simulations, batch_size),
+        placement_path,
+    )
+
+
+def _build_core_agent(spec: str, model_path, simulations: int, batch_size: int):
     if spec in BASELINE_BOTS:
         bot = BASELINE_BOTS[spec]
         return lambda color: bot(color)

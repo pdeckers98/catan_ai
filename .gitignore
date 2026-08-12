@@ -15,6 +15,7 @@ checkpoints/
 *.pt
 *.zip
 runs/
+data/
 tensorboard/
 logs/
 wandb/
