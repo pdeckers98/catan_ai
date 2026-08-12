@@ -106,6 +106,7 @@ beats brick+wood is a judgement and must be learned from outcomes.
 | `model.py` | 64-wide 2-layer MLP → scalar. Normalisation stats fitted on the train split, stored as buffers so inference cannot disagree with training. |
 | `heuristic.py` | Hand-written pips × diversity scorer. **Quarantined**: evaluation yardstick only, never in a decision path or in data generation. |
 | `player.py` | Intercepts initial-phase settlements only; everything else, initial roads included, goes to the inner agent. |
+| `env_wrapper.py` | The gym-side equivalent, for learners that step an env rather than acting as a `Player`. |
 
 **Duplicate-board pairing** is the variance reduction. Each board is played twice with the four
 opening nodes swapped between seats; the label is the difference. Same seat wins both → the board
@@ -126,6 +127,28 @@ python -m src.placement.train --data data/placement/samples.npz
 Early stopping is load-bearing, not tidiness.
 
 Attach to any agent with `--placement-model`, or `AgentSpec(placement_path=...)`.
+
+**For a gym-based learner**, `make_placement_env(model_path)` returns an env that plays the whole
+initial build phase **inside `reset()`** -- both seats -- so the learner's first observation is a
+mid-game position:
+
+```python
+from src.placement.env_wrapper import make_placement_env
+env = make_placement_env("checkpoints/placement/scorer.pt")
+```
+
+Doing it in `reset()` rather than intercepting mid-episode is what keeps the rollout buffer honest:
+an overridden action would otherwise sit in the buffer as if the learner had chosen it. It also
+makes placement 0 of ~300 samples rather than 2, removing the starvation problem by construction.
+The opponent gets the scorer too by default -- training against bad openings teaches the agent to
+exploit an edge it will not have.
+
+Two caveats. **Initial roads are random here**, where `PlacementPlayer` delegates them to the inner
+agent -- a small train/play mismatch on a 2-3 option decision. And **`env.reset(seed=n)` does not
+control the board layout**, and is not even repeatable across two resets: the gym env builds its
+map off the global `random` module at reset time. Same bug `make_1v1_game` was fixed for, still
+live on the gym path. Rank placements against `env.unwrapped.game.state.board.map`, never against
+a board built separately from the same seed.
 
 ---
 

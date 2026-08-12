@@ -1,5 +1,7 @@
 """Tests for the opening-placement specialist."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -164,3 +166,96 @@ def test_diagnose_reports_a_rank_within_range():
     assert result["boards"] == 4
     assert 1.0 <= result["mean_rank"] <= result["mean_candidates"]
     assert -1.0 <= result["mean_rho"] <= 1.0
+
+
+# --------------------------------------------------------------------------
+# Gym-side wrapper
+# --------------------------------------------------------------------------
+def _scorer_env(tmp_path, **kwargs):
+    """A placement env backed by a freshly-saved (untrained) scorer."""
+    path = PlacementNet().save(tmp_path / "scorer.pt")
+    from src.placement.env_wrapper import make_placement_env
+    return make_placement_env(str(path), seed=0, **kwargs)
+
+
+def test_wrapper_finishes_the_opening_during_reset(tmp_path):
+    """The learner's first observation must be past the initial build phase."""
+    env = _scorer_env(tmp_path)
+    obs, info = env.reset(seed=1)
+
+    game = env.unwrapped.game
+    assert not game.state.is_initial_build_phase
+    # Both seats placed two settlements each.
+    assert len(game.state.board.buildings) == 4
+    assert obs.shape == env.observation_space.shape
+    assert len(info["valid_actions"]) > 0
+
+
+def test_wrapper_records_only_its_own_two_picks(tmp_path):
+    env = _scorer_env(tmp_path)
+    env.reset(seed=2)
+
+    color = env.unwrapped.p0.color
+    owned = [
+        node for node, (owner, _) in env.unwrapped.game.state.board.buildings.items()
+        if owner == color
+    ]
+    assert len(env.opening_nodes) == 2
+    assert sorted(env.opening_nodes) == sorted(owned)
+
+
+def test_wrapper_clears_picks_between_episodes(tmp_path):
+    env = _scorer_env(tmp_path)
+    env.reset(seed=3)
+    env.reset(seed=4)
+    assert len(env.opening_nodes) == 2
+
+
+def test_wrapper_leaves_a_playable_episode(tmp_path):
+    """Post-reset the env must step normally -- no half-finished opening."""
+    env = _scorer_env(tmp_path)
+    env.reset(seed=5)
+
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        valid = env.unwrapped.get_valid_actions()
+        _, _, terminated, truncated, _ = env.step(int(rng.choice(valid)))
+        if terminated or truncated:
+            break
+
+
+def test_opponent_scorer_flag_controls_the_enemy(tmp_path):
+    from src.placement.player import PlacementPlayer as PP
+
+    shared = _scorer_env(tmp_path)
+    assert isinstance(shared.unwrapped.enemies[0], PP)
+
+    solo = _scorer_env(tmp_path, opponent_scorer=False)
+    assert not isinstance(solo.unwrapped.enemies[0], PP)
+
+
+def test_trained_scorer_opens_far_better_than_chance():
+    """End-to-end: the shipped checkpoint must pick genuinely good corners.
+
+    Ranked against the env's *own* board -- ``env.reset(seed=n)`` does not
+    control the layout, so a board built separately from the same seed is a
+    different board (see the wrapper docstring).
+    """
+    checkpoint = Path("checkpoints/placement/scorer.pt")
+    if not checkpoint.exists():
+        pytest.skip("no trained placement scorer available")
+
+    from src.placement.env_wrapper import make_placement_env
+
+    env = make_placement_env(str(checkpoint), seed=0)
+    ranks = []
+    for seed in range(8):
+        env.reset(seed=seed)
+        catan_map = env.unwrapped.game.state.board.map
+        # The first pick saw an empty board, so every land node was legal.
+        nodes = sorted(catan_map.land_nodes)
+        ranks.append(rank_of(catan_map, env.opening_nodes[0], nodes))
+
+    # Chance is ~27/54. Measured ~4.3 over 20 boards; 12 leaves ample headroom
+    # for board variance without passing a model that learned nothing.
+    assert np.mean(ranks) < 12.0
