@@ -149,6 +149,12 @@ makes placement 0 of ~300 samples rather than 2, removing the starvation problem
 The opponent gets the scorer too by default -- training against bad openings teaches the agent to
 exploit an edge it will not have.
 
+**A checkpoint trained this way depends on the scorer permanently.** Placement decisions never
+reach the rollout buffer, so the policy head gets no gradient on them and cannot place without
+help. Measured on the 2M run: 100.0% -> 88.2% vs weighted-random when the scorer is removed, and
+42.2% vs a bare `ppo-8vp-scratch` (against 53.0% when both have it) -- bare, it is beaten by the
+older agent whose placement was merely bad rather than absent. Ship the two together.
+
 Two caveats. **Initial roads are random here**, where `PlacementPlayer` delegates them to the inner
 agent -- a small train/play mismatch on a 2-3 option decision. And **`env.reset(seed=n)` does not
 control the board layout**, and is not even repeatable across two resets: the gym env builds its

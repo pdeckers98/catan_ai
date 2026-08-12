@@ -129,3 +129,12 @@ See `docs/` for per-phase guides:
 - **`PHASE3_WEB.md`** — colonist.io bridge (WebSocket read + Playwright clicks)
 
 ## Caveats
+
+**`checkpoints/ppo-pool-placement-lookahead/best.zip` is not a standalone agent — it must ship
+with `checkpoints/placement/scorer.pt`.** Any run trained through `PlacementWrapper` plays the
+opening inside `reset()`, so those decisions never enter the rollout buffer and the policy head
+receives **zero gradient on placement**. Deprived of the scorer it places with an untrained head.
+Measured over 200 games each: 100.0% -> 88.2% vs weighted-random, and head-to-head against
+`ppo-8vp-scratch` it goes from 53.0% (both scored) to 42.2% (neither) -- i.e. bare it is *worse*
+than the older agent that at least learned placement badly. This applies to the Phase 3
+colonist.io bridge too: the scorer has to be part of the deployed agent, not an eval-time extra.
