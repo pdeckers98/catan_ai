@@ -5,7 +5,7 @@ Examples:
     python -m src.eval.benchmark --agent az --model checkpoints/run/best.pt \\
         --opponent value --games 200
 
-    # Does search help the old PPO net at all? (see also src.eval.stage0)
+    # Does search help the old PPO net at all?
     python -m src.eval.benchmark --agent ppo-mcts --model checkpoints/old/agent_final.zip \\
         --opponent ppo --opponent-model checkpoints/old/agent_final.zip --games 100
 

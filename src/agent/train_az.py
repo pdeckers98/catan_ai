@@ -10,8 +10,8 @@ One iteration is:
 4. Every ``--eval-every`` iterations, play an arena match against the current best
    network and promote the challenger if it clears ``--promote-threshold``.
 
-There is no reward shaping here, deliberately. The dense signal the milestone
-bonuses in ``RewardShapingWrapper`` were standing in for now comes from search: a
+There is no reward shaping here, deliberately. The dense signal that milestone
+VP bonuses used to stand in for now comes from search: a
 position that leads to a settlement in eight plies gets a better backed-up value
 than one that does not, without anyone hand-tuning a bonus for it.
 

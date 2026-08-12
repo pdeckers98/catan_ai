@@ -1,8 +1,8 @@
 """Head-to-head match play and a registry for building any agent by name.
 
-Used by the AlphaZero promotion gate (``src.agent.train_az``) and by the
-evaluation entry points (``src.eval.benchmark``, ``src.eval.stage0``), so every
-comparison in the project runs the same alternating-seat protocol.
+Used by the AlphaZero promotion gate (``src.agent.train_az``) and by
+``src.eval.benchmark``, so every comparison in the project runs the same
+alternating-seat protocol.
 
 Seats alternate between games. In 1v1 Catan the first player picks first in the
 initial placement, which is a real edge; without alternation a benchmark mostly

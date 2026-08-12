@@ -70,8 +70,9 @@ installing from Catanatron source/experimental or implementing one ourselves.
     self-play, which drive the engine directly rather than through the gym `step` interface.
   - `VPS_TO_WIN` (`8`) and `MAX_TURNS` (`300`) — the shared constants; import them rather than
     hardcoding.
-  - `valid_action_mask(env)` — boolean mask of shape `(action_space.n,)` for SB3-Contrib's
-    `ActionMasker`.
+  - For a boolean action mask off a raw `Game`, use `src/agent/encoding.py:legal_action_mask`.
+    (`valid_action_mask(env)`, the SB3-Contrib `ActionMasker` helper, was removed with the PPO
+    training loop.)
 - `src/env/smoke_test.py` — plays N full games choosing uniformly among `info["valid_actions"]`.
 - `src/env/render.py` / `src/env/visual_test.py` — matplotlib board renderer (no visualizer ships
   with the pip package; the official web UI is a separate Docker-only Flask+React app). Draws

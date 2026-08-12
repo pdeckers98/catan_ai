@@ -17,8 +17,9 @@ the agent and, later, the web integration.
   Catan simulator with a Gymnasium env, action masking, and strong baseline bots
 - **Learning algorithm**: **AlphaZero** — one PyTorch net (policy + value heads) trained by
   self-play, where PUCT tree search supplies the improved policy target. `src/agent/train_az.py`.
-  The older `MaskablePPO` (`stable-baselines3` + `sb3-contrib`) loop is kept as a legacy
-  baseline in `src/agent/train.py`.
+  The `MaskablePPO` training loop was removed; its strongest checkpoint
+  (`checkpoints/ppo-8vp-scratch`) is retained as a benchmark opponent, loadable via the `ppo` and
+  `ppo-mcts` agent specs.
 - **Game mode**: 1v1 (`enemies=[one bot]`, `map_type="BASE"`, `vps_to_win=8`)
 - **Custom rules**: `src/env/rules.py` monkeypatches Catanatron at import time. Applied
   automatically via `src/env/catan_env.py`. Seven patches:
@@ -37,8 +38,8 @@ the agent and, later, the web integration.
   openings labelled with actual game outcomes, using duplicate-board pairs for variance reduction.
   **No hardcoded placement knowledge**: features are mechanical board facts only, and the
   hand-written scorer in `heuristic.py` is an evaluation yardstick that never plays.
-- **Reward shaping**: only on the legacy PPO track (`RewardShapingWrapper`, milestone VP
-  bonuses). AlphaZero trains on the sparse win/loss outcome; search provides the dense signal.
+- **Reward shaping**: none. AlphaZero trains on the sparse win/loss outcome; search provides the
+  dense signal that milestone bonuses used to stand in for.
 - **Action masking**: mandatory — most of the 294 actions are illegal each turn; always respect
   `info["valid_actions"]` / `env.unwrapped.get_valid_actions()`, or
   `src/agent/encoding.py:legal_action_mask` off a raw `Game`.
@@ -62,7 +63,6 @@ src/
 │   ├── selfplay.py      # self-play game generation + value targets
 │   ├── train_az.py      # AlphaZero training loop  <-- the main track
 │   ├── arena.py         # head-to-head match play + agent-by-name registry
-│   ├── train.py         # legacy MaskablePPO loop
 │   └── opponent.py      # PolicyPlayer (frozen PPO checkpoint as a Player)
 ├── placement/           # opening-settlement specialist (self-trained, no heuristics)
 │   ├── features.py      # 45 mechanical per-node board facts
@@ -74,7 +74,6 @@ src/
 │   └── player.py        # wraps any agent; takes over only the opening
 ├── eval/
 │   ├── benchmark.py     # any agent vs any agent
-│   ├── stage0.py        # "is the old PPO net salvageable?" diagnostic
 │   ├── bench_mcts.py    # search compute-budget profiler
 │   └── play.py          # human vs AI (matplotlib)
 └── bridge/              # (Phase 3) colonist.io WebSocket reader + Playwright clicker

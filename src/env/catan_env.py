@@ -1,9 +1,13 @@
 """1v1 Catanatron Gymnasium environment helpers.
 
-Thin wrappers around catanatron-gym's ``catanatron-v1`` env so the rest of the
-project has a single place that knows the env id, the 1v1 config, and how to
-turn ``get_valid_actions()`` into the boolean mask SB3-Contrib's ActionMasker
-expects.
+One place that knows the env id and the 1v1 config. Two entry points, for two
+different substrates:
+
+- :func:`make_1v1_game` -- a raw ``Game``. This is what search, self-play and
+  the placement pipeline use; they drive the engine directly.
+- :func:`make_1v1_env` -- the Gymnasium env, now used only by the Phase 1 smoke
+  and visual tests. The gym step interface auto-advances the opponent and hides
+  the ``Game``, which is why nothing in the training path goes through it.
 
 Key facts about the underlying env (catanatron-gym 4.0.0):
 - Env id ``catanatron-v1``; the controlled agent is P0 (Color.BLUE).
@@ -19,8 +23,6 @@ Key facts about the underlying env (catanatron-gym 4.0.0):
 import random
 
 import gymnasium as gym
-from gymnasium import Wrapper
-import numpy as np
 
 import catanatron_gym  # noqa: F401  -- registers the "catanatron-v1" env id
 from catanatron import Color, Game
@@ -38,8 +40,8 @@ ENV_ID = "catanatron-v1"
 # horizon manageable, and that turned out to matter more than it looked. At 10 VP
 # episodes ran ~250 agent steps, so with gamma=0.99 only ~8% of the terminal
 # win/loss signal survived back to the opening placement; at 8 VP it is ~150
-# steps. Anything changing this number must move ``--gamma`` in src/agent/train.py
-# with it -- see the note there.
+# steps. The AlphaZero track has no discount to keep in step with this, but the
+# episode length still sets how far search has to look.
 VPS_TO_WIN = 8
 
 # Safety net so a degenerate policy cannot stall a game forever.
@@ -123,164 +125,3 @@ def make_1v1_env(
         config["reward_function"] = reward_function
 
     return gym.make(ENV_ID, config=config)
-
-
-class TurnLimitWrapper(Wrapper):
-    """Enforce a maximum turn limit; truncates when exceeded.
-
-    Args:
-        env: the base environment.
-        max_turns: maximum turns; game truncates (draw) if exceeded.
-    """
-
-    def __init__(self, env, max_turns):
-        super().__init__(env)
-        self.max_turns = max_turns
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        num_turns = self.env.unwrapped.game.state.num_turns
-        # Truncate if turn limit exceeded
-        if num_turns >= self.max_turns:
-            truncated = True
-        # Expose the game length when an episode ends, so a callback can track how
-        # many turns games take (should fall as the agent gets more efficient).
-        if terminated or truncated:
-            info["game_turns"] = num_turns
-        return obs, reward, terminated, truncated, info
-
-    def reset(self, **kwargs):
-        return self.env.reset(**kwargs)
-
-
-# Milestone VP thresholds and their one-time bonus rewards. The top milestone
-# tracks "one VP short of winning" and the other two sit at roughly 40% and 60%
-# of the way there, so all three move with VPS_TO_WIN -- hardcoding them would
-# have paid the largest bonus three VP early once the target moved to 10.
-# At 8 VP this reproduces the original {3, 5, 7}.
-_VP_MILESTONES = {
-    round(0.4 * VPS_TO_WIN): 0.1,
-    round(0.6 * VPS_TO_WIN): 0.25,
-    VPS_TO_WIN - 1: 0.5,
-}
-
-
-class RewardShapingWrapper(Wrapper):
-    """Milestone-based reward shaping on top of the sparse win/loss signal.
-
-    Only the PPO training path (``src.agent.train``) uses this. The AlphaZero path
-    (``src.agent.train_az``) trains on the sparse win/loss outcome alone, because
-    MCTS supplies the dense signal that shaping was standing in for.
-
-    One-time bonuses fire the first time the agent crosses each VP threshold in
-    ``_VP_MILESTONES``, which scales with VPS_TO_WIN: +0.10, +0.25, +0.50.
-    The base env still provides +1 on win and -1 on loss.
-
-    Two additional one-time building bonuses:
-      3rd settlement placed -> +0.05
-      1st city built        -> +0.05
-
-    On episode end, records final VPs and build counts in ``info`` for W&B.
-
-    Place this OUTSIDE TurnLimitWrapper so it observes turn-limit truncations too.
-    """
-
-    def __init__(self, env, agent_color=Color.BLUE):
-        super().__init__(env)
-        self.agent_color = agent_color
-        self._milestones_reached: set = set()
-        self._settlements_built = 0
-        self._prev_settlements_avail = 5
-        self._3rd_settlement_bonus_given = False
-        self._4th_settlement_bonus_given = False
-        self._1st_city_bonus_given = False
-        self._2nd_city_bonus_given = False
-
-    def _actual_vp(self, color):
-        state = self.env.unwrapped.game.state
-        key = f"P{state.color_to_index[color]}"
-        return state.player_state[f"{key}_ACTUAL_VICTORY_POINTS"]
-
-    def _settlements_available(self, color):
-        state = self.env.unwrapped.game.state
-        key = f"P{state.color_to_index[color]}"
-        return state.player_state[f"{key}_SETTLEMENTS_AVAILABLE"]
-
-    def _roads_built(self, color):
-        state = self.env.unwrapped.game.state
-        key = f"P{state.color_to_index[color]}"
-        return 15 - state.player_state[f"{key}_ROADS_AVAILABLE"]
-
-    def _cities_built(self, color):
-        state = self.env.unwrapped.game.state
-        key = f"P{state.color_to_index[color]}"
-        return 4 - state.player_state[f"{key}_CITIES_AVAILABLE"]
-
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        self._milestones_reached = set()
-        self._settlements_built = 0
-        self._prev_settlements_avail = self._settlements_available(self.agent_color)
-        self._3rd_settlement_bonus_given = False
-        self._4th_settlement_bonus_given = False
-        self._1st_city_bonus_given = False
-        self._2nd_city_bonus_given = False
-        return obs, info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        vp = self._actual_vp(self.agent_color)
-
-        for threshold, bonus in _VP_MILESTONES.items():
-            if vp >= threshold and threshold not in self._milestones_reached:
-                reward += bonus
-                self._milestones_reached.add(threshold)
-
-        avail = self._settlements_available(self.agent_color)
-        if avail < self._prev_settlements_avail:
-            self._settlements_built += self._prev_settlements_avail - avail
-        self._prev_settlements_avail = avail
-
-        if self._settlements_built >= 3 and not self._3rd_settlement_bonus_given:
-            reward += 0.05
-            self._3rd_settlement_bonus_given = True
-
-        if self._settlements_built >= 4 and not self._4th_settlement_bonus_given:
-            reward += 0.05
-            self._4th_settlement_bonus_given = True
-
-        cities = self._cities_built(self.agent_color)
-        if cities >= 1 and not self._1st_city_bonus_given:
-            reward += 0.05
-            self._1st_city_bonus_given = True
-
-        if cities >= 2 and not self._2nd_city_bonus_given:
-            reward += 0.05
-            self._2nd_city_bonus_given = True
-
-        if terminated or truncated:
-            opponent = next(
-                c for c in self.env.unwrapped.game.state.colors
-                if c != self.agent_color
-            )
-            info["final_vp"] = vp
-            info["opp_vp"] = self._actual_vp(opponent)
-            info["settlements_built"] = self._settlements_built
-            info["roads_built"] = self._roads_built(self.agent_color)
-            info["cities_built"] = self._cities_built(self.agent_color)
-        return obs, reward, terminated, truncated, info
-
-
-def valid_action_mask(env):
-    """Boolean mask over the full action space for SB3-Contrib's ActionMasker.
-
-    Args:
-        env: a (possibly wrapped) Catanatron env.
-
-    Returns:
-        np.ndarray[bool] of shape (action_space.n,), True where legal.
-    """
-    n = env.action_space.n
-    mask = np.zeros(n, dtype=bool)
-    mask[env.unwrapped.get_valid_actions()] = True
-    return mask
