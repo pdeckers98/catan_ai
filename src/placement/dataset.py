@@ -31,11 +31,22 @@ cities. Both seats get the same checkpoint, so the comparison stays symmetric,
 and the agent's inability to place is irrelevant here because the opening is
 forced by the generator either way.
 
-**On-disk format.** ``pairs`` is (P, 4, F): each row is one duplicate-board pair,
-holding the first seat's two corners followed by the second seat's two, all
-featurised at the moment they were picked in game A. ``deltas`` is (P,), positive
-when the first seat's bundle was the better one. ``features``/``labels`` are the
-flattened per-node view of exactly the same data, kept for the regression loss.
+**Roads are part of the opening.** Each settlement comes with a free road, and
+under these rules Longest Road is worth no VP, so that road buys exactly one
+thing: access to the corner you settle next. Roads are therefore explored
+uniformly at random like the settlements, recorded, and **replayed with their
+settlement on the swap** -- leaving them to the rollout bot would put an
+uncontrolled variable inside a comparison built to control everything but the
+opening.
+
+**On-disk format.** ``pairs`` is (P, 4, 45): each row is one duplicate-board
+pair, holding the first seat's two settlements followed by the second seat's
+two, featurised at the moment they were picked in game A. ``deltas`` is (P,),
+positive when the first seat's opening was the better one. ``bundles`` is
+(P, 2, 2, 57) -- the same two openings as *whole openings*: per seat, two
+corners of settlement (45) + road (12), both encoded at that seat's first pick,
+with the second carrying ``assume_owned=(first,)``. ``features``/``labels`` are
+the flattened per-settlement view, kept for the per-corner scorer.
 """
 
 import argparse
@@ -55,9 +66,13 @@ from catanatron.players.weighted_random import WeightedRandomPlayer
 from src.env.catan_env import MAX_TURNS, make_1v1_game
 from src.env.dice import fixed_dice
 from src.placement.features import (
+    corner_feature_size,
     encode_candidates,
     feature_size,
+    legal_road_edges,
     node_features,
+    open_nodes,
+    road_features,
 )
 
 # Corners per pair: the first seat's two, then the second seat's two.
@@ -109,7 +124,7 @@ class ExplorerPlayer(Player):
     """
 
     def __init__(self, color, rollout, rng, model=None, epsilon=1.0, forced=None,
-                 opening_rollout=None):
+                 opening_rollout=None, forced_roads=None):
         super().__init__(color)
         self.rollout = rollout
         # Initial roads. Kept off the main rollout because a PPO checkpoint
@@ -121,8 +136,22 @@ class ExplorerPlayer(Player):
         self.model = model
         self.epsilon = epsilon
         self.forced = list(forced) if forced else []
+        self.forced_roads = [tuple(e) for e in forced_roads] if forced_roads else []
         # (node_id, features-at-decision-time) for each opening settlement.
         self.picks = []
+        # The free road that came with each settlement, in the same order. Also
+        # explored uniformly at random: under these rules a road buys only
+        # expansion, and leaving it to the rollout bot would put an uncontrolled
+        # variable inside a comparison built to control everything but the
+        # opening.
+        self.roads = []
+        # Partner corners encoded at the *first* pick's board state, keyed by
+        # node. Captured there because that is the only moment a first-pick
+        # decision can be asked "what is the best second corner this opens up?"
+        # -- by the real second pick the answer is already spent.
+        self._partners = {}
+        self._partner_roads = {}   # (node, edge) -> road features
+        self._own_roads = {}       # edge -> road features, off the first pick
 
     def decide(self, game, playable_actions):
         settlements = [
@@ -130,6 +159,12 @@ class ExplorerPlayer(Player):
             if a.action_type == ActionType.BUILD_SETTLEMENT
         ]
         if game.state.is_initial_build_phase and not settlements:
+            roads = [
+                a for a in playable_actions
+                if a.action_type == ActionType.BUILD_ROAD
+            ]
+            if roads and len(self.roads) < len(self.picks):
+                return self._decide_road(roads)
             return self.opening_rollout.decide(game, playable_actions)
         if not settlements or not game.state.is_initial_build_phase:
             return self.rollout.decide(game, playable_actions)
@@ -147,8 +182,69 @@ class ExplorerPlayer(Player):
         else:
             chosen = self.rng.choice(nodes)
 
+        if not self.picks:
+            self._cache_openings(game, chosen)
         self.picks.append((chosen, node_features(game, self.color, chosen)))
         return next(a for a in settlements if a.value == chosen)
+
+    def _cache_openings(self, game, chosen):
+        """Encode every corner+road this first pick could still be paired with.
+
+        Done here and nowhere else: the first pick is the only moment at which
+        "what does this open up?" is still an open question, so it is the state
+        the opening model has to be trained on.
+        """
+        self._own_roads = {
+            tuple(edge): road_features(game, self.color, chosen, edge)
+            for edge in legal_road_edges(chosen)
+        }
+        for node in open_nodes(game):
+            self._partners[node] = node_features(
+                game, self.color, node, assume_owned=(chosen,)
+            )
+            for edge in legal_road_edges(node):
+                # No assume_owned here, deliberately: the chooser computes
+                # partner road reach once at the base board rather than per
+                # candidate first corner, and the two must agree. The corners
+                # are non-adjacent, so the expansion rings they block for each
+                # other rarely overlap.
+                self._partner_roads[(node, tuple(edge))] = road_features(
+                    game, self.color, node, edge
+                )
+
+    def _decide_road(self, roads):
+        if self.forced_roads:
+            wanted = self.forced_roads.pop(0)
+            action = next(
+                (a for a in roads if tuple(sorted(a.value)) == tuple(sorted(wanted))),
+                None,
+            )
+            if action is None:
+                raise ValueError(f"replay desync: road {wanted} is not legal")
+        else:
+            action = self.rng.choice(roads)
+        self.roads.append(tuple(sorted(action.value)))
+        return action
+
+    def bundle(self):
+        """(2, F): this seat's two corners, settlement and road, at the first pick.
+
+        The second corner carries ``assume_owned=(first,)``, so the vector says
+        what it is worth *given* the first -- which is the pairing a per-corner
+        scorer never sees. Returns None if the seat did not open fully.
+        """
+        if len(self.picks) != 2 or len(self.roads) != 2:
+            return None
+        (_, first_features), (second, _) = self.picks
+        first_road = self._own_roads.get(self.roads[0])
+        partner = self._partners.get(second)
+        partner_road = self._partner_roads.get((second, self.roads[1]))
+        if first_road is None or partner is None or partner_road is None:
+            return None
+        return np.stack([
+            np.concatenate([first_features, first_road]),
+            np.concatenate([partner, partner_road]),
+        ])
 
 
 def _outcome(game, color) -> float:
@@ -160,13 +256,15 @@ def _outcome(game, color) -> float:
 
 
 def _play(seed, rollout_kind, rng_seed, forced_by_color=None, model=None,
-          epsilon=1.0, dice_seed=None, rollout_model=None):
+          epsilon=1.0, dice_seed=None, rollout_model=None,
+          forced_roads_by_color=None):
     """Play one game with explorer openings; returns (game, {color: explorer}).
 
     ``dice_seed`` puts the rolls on their own stream so both games of a pair see
     the same sequence; ``None`` leaves them on the global RNG.
     """
     forced_by_color = forced_by_color or {}
+    forced_roads_by_color = forced_roads_by_color or {}
     explorers = {}
     players = []
     for offset, color in enumerate((Color.BLUE, Color.RED)):
@@ -179,6 +277,7 @@ def _play(seed, rollout_kind, rng_seed, forced_by_color=None, model=None,
             model=model,
             epsilon=epsilon,
             forced=forced_by_color.get(color),
+            forced_roads=forced_roads_by_color.get(color),
         )
         explorers[color] = explorer
         players.append(explorer)
@@ -201,8 +300,21 @@ def _draft_order(game):
     return picks[:4]
 
 
+def _draft_roads(game):
+    """The four opening roads as edge tuples, in the order played."""
+    roads = [
+        tuple(sorted(a.value)) for a in game.state.actions
+        if a.action_type == ActionType.BUILD_ROAD
+    ]
+    return roads[:4]
+
+
 def _empty_pair():
-    return np.zeros((0, PAIR_NODES, feature_size()), np.float32), np.zeros(0, np.float32)
+    return (
+        np.zeros((0, PAIR_NODES, feature_size()), np.float32),
+        np.zeros(0, np.float32),
+        np.zeros((0, 2, 2, corner_feature_size()), np.float32),
+    )
 
 
 def generate_pair(seed: int, rollout_kind: str = "weighted", model=None,
@@ -211,10 +323,12 @@ def generate_pair(seed: int, rollout_kind: str = "weighted", model=None,
     """Play a board twice with the openings swapped; return one labelled pair.
 
     Returns:
-        (pair, delta) -- float32 (1, 4, F) and (1,), or empty arrays if the pair
-        could not be completed. The four corners are the first seat's two
-        followed by the second seat's two, and ``delta`` is positive when the
-        first seat's bundle won the comparison.
+        (pair, delta, bundles). ``pair`` is float32 (1, 4, F) -- the first seat's
+        two corners followed by the second seat's two, each encoded when it was
+        picked. ``delta`` is (1,), positive when the first seat's bundle won.
+        ``bundles`` is (1, 2, 2, F) -- the same two openings re-encoded as
+        *bundles*, both corners at the seat's first-pick state. Empty arrays if
+        the pair could not be completed.
     """
     dice_seed = seed if common_dice else None
     game_a, explorers = _play(seed, rollout_kind, seed, model=model, epsilon=epsilon,
@@ -229,30 +343,47 @@ def generate_pair(seed: int, rollout_kind: str = "weighted", model=None,
     # order is n2, n1, n4, n3. Every node keeps its non-adjacency to the other
     # three, so the swapped assignment is always legal.
     nodes = [node for _, node in order]
-    swapped = [nodes[1], nodes[0], nodes[3], nodes[2]]
+    roads = _draft_roads(game_a)
+    if len(roads) < 4:
+        return _empty_pair()
+
+    swap = [1, 0, 3, 2]
+    swapped = [nodes[i] for i in swap]
+    # Each settlement keeps the road it was built with -- the road is part of
+    # the opening being swapped, not a separate decision. It stays legal: an
+    # initial road touches its own settlement, and two non-adjacent settlements
+    # can never contest the same edge.
+    swapped_roads = [roads[i] for i in swap]
     first_seat = order[0][0]
     second_seat = order[1][0]
     forced = {
         first_seat: [swapped[0], swapped[3]],
         second_seat: [swapped[1], swapped[2]],
     }
+    forced_roads = {
+        first_seat: [swapped_roads[0], swapped_roads[3]],
+        second_seat: [swapped_roads[1], swapped_roads[2]],
+    }
 
     game_b, _ = _play(seed, rollout_kind, seed, forced_by_color=forced,
-                      dice_seed=dice_seed, rollout_model=rollout_model)
+                      dice_seed=dice_seed, rollout_model=rollout_model,
+                      forced_roads_by_color=forced_roads)
 
     # Paired label: how much better the first seat did holding its own opening
     # than the second seat did holding that same opening on the same board.
     delta = (_outcome(game_a, first_seat) - _outcome(game_b, first_seat)) / 2.0
 
-    corners = []
+    corners, bundles = [], []
     for color in (first_seat, second_seat):
         corners.extend(vector for _, vector in explorers[color].picks)
-    if len(corners) != PAIR_NODES:
+        bundles.append(explorers[color].bundle())
+    if len(corners) != PAIR_NODES or any(b is None for b in bundles):
         return _empty_pair()
 
     return (
         np.stack(corners).astype(np.float32)[None, ...],
         np.array([delta], dtype=np.float32),
+        np.stack(bundles).astype(np.float32)[None, ...],
     )
 
 
@@ -284,11 +415,14 @@ def _worker(payload):
         generate_pair(s, rollout_kind, model, epsilon, common_dice, rollout_model)
         for s in seeds
     ]
-    pairs = [p for p, _ in chunks if len(p)]
-    deltas = [d for _, d in chunks if len(d)]
-    if not pairs:
+    return _stack(chunks)
+
+
+def _stack(chunks):
+    kept = [c for c in chunks if len(c[0])]
+    if not kept:
         return _empty_pair()
-    return np.concatenate(pairs), np.concatenate(deltas)
+    return tuple(np.concatenate([c[i] for c in kept]) for i in range(3))
 
 
 def generate(num_pairs: int, seed: int = 0, rollout_kind: str = "weighted",
@@ -298,7 +432,8 @@ def generate(num_pairs: int, seed: int = 0, rollout_kind: str = "weighted",
     """Generate ``num_pairs`` duplicate-board pairs (two games each).
 
     Returns:
-        (pairs, deltas) -- float32 (P, 4, F) and (P,), P up to ``num_pairs``.
+        (pairs, deltas, bundles) -- see :func:`generate_pair`, concatenated over
+        up to ``num_pairs`` pairs.
     """
     rng = np.random.default_rng(seed)
     seeds = [int(rng.integers(2**31 - 1)) for _ in range(num_pairs)]
@@ -319,14 +454,10 @@ def generate(num_pairs: int, seed: int = 0, rollout_kind: str = "weighted",
             for result in pool.map(_worker, payloads):
                 results.append(result)
                 if progress:
-                    done = sum(len(p) for p, _ in results)
+                    done = sum(len(p) for p, _, _ in results)
                     print(f"  {done} pairs collected", flush=True)
 
-    pairs = [p for p, _ in results if len(p)]
-    deltas = [d for _, d in results if len(d)]
-    if not pairs:
-        return _empty_pair()
-    return np.concatenate(pairs), np.concatenate(deltas)
+    return _stack(results)
 
 
 def main():
@@ -352,7 +483,7 @@ def main():
     parser.add_argument("--out", default="data/placement/samples.npz")
     args = parser.parse_args()
 
-    pairs, deltas = generate(
+    pairs, deltas, bundles = generate(
         args.pairs, seed=args.seed, rollout_kind=args.rollout,
         workers=args.workers, model_path=args.model, epsilon=args.epsilon,
         common_dice=not args.free_dice, rollout_model=args.rollout_model,
@@ -362,7 +493,7 @@ def main():
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out, pairs=pairs, deltas=deltas,
+    np.savez_compressed(out, pairs=pairs, deltas=deltas, bundles=bundles,
                         features=features, labels=labels)
 
     informative = int(np.count_nonzero(deltas))

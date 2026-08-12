@@ -177,6 +177,22 @@ def test_robber_suppresses_the_tile_it_sits_on():
 
     coordinate = next(c for c, t in board.map.land_tiles.items()
                       if t.id == producing.id)
+
+    # Park the robber off BLUE's tiles first. Measuring the baseline wherever it
+    # happened to start makes the test depend on the board layout: if it already
+    # sat on a tile BLUE touches, moving it *frees* that tile and production can
+    # rise instead of fall.
+    blue_tiles = {
+        tile.id
+        for node_id, (owner, _) in board.buildings.items() if owner == Color.BLUE
+        for tile in board.map.adjacent_tiles[node_id]
+    }
+    neutral = next((c for c, t in board.map.land_tiles.items()
+                    if t.id not in blue_tiles), None)
+    if neutral is None:
+        pytest.skip("every land tile touches a BLUE building")
+
+    board.robber_coordinate = neutral
     before = lookahead_features(game, Color.BLUE)[MEAN_GAIN].sum()
     board.robber_coordinate = coordinate
     after = lookahead_features(game, Color.BLUE)[MEAN_GAIN].sum()

@@ -70,9 +70,12 @@ class PlacementNet(nn.Module):
     @torch.no_grad()
     def score(self, features: np.ndarray) -> np.ndarray:
         """Score an (N, F) batch of candidates. Returns float32 (N,)."""
+        features = np.asarray(features)
         if len(features) == 0:
             return np.zeros(0, dtype=np.float32)
-        tensor = torch.as_tensor(np.atleast_2d(features), dtype=torch.float32)
+        if features.ndim == 1:
+            features = features[None, :]
+        tensor = torch.as_tensor(features, dtype=torch.float32)
         return self(tensor).cpu().numpy().astype(np.float32)
 
     # ---- persistence ----------------------------------------------------
@@ -93,3 +96,38 @@ class PlacementNet(nn.Module):
         net.to(device)
         net.eval()
         return net
+
+
+class BundleNet(PlacementNet):
+    """Scores an opening as a *pair* of corners rather than one at a time.
+
+    The per-corner scorer has a structural blind spot: it commits to the first
+    settlement before knowing what the second will be, so it cannot prefer a
+    slightly weaker corner that opens a much better pairing. Feeding it both
+    corners at once -- the second encoded with ``assume_owned=(first,)`` -- puts
+    the whole opening in front of the network and lets complementarity be part
+    of the decision instead of an afterthought.
+
+    Input is the two corners concatenated, in pick order, so the head keeps a
+    consistent meaning for "the one I take first". Everything else, including
+    the normalisation buffers and the persistence format, is inherited.
+    """
+
+    def __init__(self, feature_dim=None, width=64, corners=2):
+        self.corners = corners
+        per_corner = feature_dim if feature_dim is not None else feature_size()
+        super().__init__(feature_dim=per_corner * corners, width=width)
+        self.corner_dim = per_corner
+
+    def config(self) -> dict:
+        return {"feature_dim": self.corner_dim, "width": self.width,
+                "corners": self.corners}
+
+    def forward(self, features):
+        # Accept either (N, corners, F) or the already-flat (N, corners * F).
+        if features.dim() == 3:
+            features = features.reshape(len(features), -1)
+        return super().forward(features)
+
+    def fit_normalizer(self, features: np.ndarray) -> None:
+        super().fit_normalizer(np.asarray(features).reshape(len(features), -1))

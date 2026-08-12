@@ -37,7 +37,7 @@ import torch.nn as nn
 
 from src.placement.dataset import flatten_pairs
 from src.placement.evaluate import diagnose, format_diagnosis
-from src.placement.model import PlacementNet
+from src.placement.model import BundleNet, PlacementNet
 
 # Held-out board seeds for the diagnostic. Fixed so the number means the same
 # thing across runs, and far away from the default data-generation seeds.
@@ -58,6 +58,52 @@ def load_pairs(path):
             f"Regenerate it with src.placement.dataset."
         )
     return blob["pairs"].astype(np.float32), blob["deltas"].astype(np.float32)
+
+
+def load_bundles(path):
+    """Openings as corner *pairs*: (bundles, deltas), float32 (P, 2, 2, F), (P,).
+
+    Axis 1 is the seat (first, second); axis 2 is the corner in pick order.
+    """
+    blob = np.load(Path(path))
+    if "bundles" not in blob:
+        raise KeyError(
+            f"{path} has no 'bundles' array. Regenerate it with "
+            f"src.placement.dataset."
+        )
+    return blob["bundles"].astype(np.float32), blob["deltas"].astype(np.float32)
+
+
+def flatten_bundles(bundles, deltas):
+    """(2P, 2, F) openings and (2P,) labels -- one sample per seat per pair."""
+    if len(bundles) == 0:
+        return bundles.reshape(0, 2, 0), deltas
+    samples = bundles.reshape(-1, *bundles.shape[2:])
+    labels = np.stack([deltas, -deltas], axis=1).reshape(-1)
+    return samples.astype(np.float32), labels.astype(np.float32)
+
+
+def train_bundle(bundles, deltas, epochs=200, batch_size=256, lr=1e-3,
+                 val_fraction=0.15, width=64, seed=0, patience=25, progress=True):
+    """Fit a :class:`BundleNet` on whole openings. Returns (net, history).
+
+    Same regression against the same duplicate-board label as the per-corner
+    scorer -- the only change is that the network sees both corners at once, so
+    complementarity is available to it rather than having to be inferred one
+    corner at a time. Split is by pair, as above.
+    """
+    rng = np.random.default_rng(seed)
+    torch.manual_seed(seed)
+
+    order = rng.permutation(len(bundles))
+    cut = max(1, int(len(bundles) * (1.0 - val_fraction)))
+    train_x, train_y = flatten_bundles(bundles[order[:cut]], deltas[order[:cut]])
+    val_x, val_y = flatten_bundles(bundles[order[cut:]], deltas[order[cut:]])
+
+    net = BundleNet(feature_dim=bundles.shape[-1], width=width)
+    net.fit_normalizer(train_x)
+    return _fit(net, train_x, train_y, val_x, val_y, epochs, batch_size, lr,
+                patience, progress)
 
 
 def train(pairs, deltas, epochs=200, batch_size=256, lr=1e-3, val_fraction=0.15,
@@ -82,7 +128,13 @@ def train(pairs, deltas, epochs=200, batch_size=256, lr=1e-3, val_fraction=0.15,
     # Fitted on the training split only -- the validation set must not inform
     # the input scaling any more than it informs the weights.
     net.fit_normalizer(train_x)
+    return _fit(net, train_x, train_y, val_x, val_y, epochs, batch_size, lr,
+                patience, progress)
 
+
+def _fit(net, train_x, train_y, val_x, val_y, epochs, batch_size, lr, patience,
+         progress):
+    """Adam + MSE with early stopping on validation loss. Returns (net, history)."""
     train_x_t = torch.as_tensor(train_x)
     train_y_t = torch.as_tensor(train_y)
     val_x_t = torch.as_tensor(val_x)
@@ -137,6 +189,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--data", default="data/placement/samples.npz")
     parser.add_argument("--out", default="checkpoints/placement/scorer.pt")
+    parser.add_argument("--target", choices=("corner", "bundle"), default="corner",
+                        help="corner: score one settlement at a time (default). "
+                             "bundle: score both corners of an opening jointly.")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -147,19 +202,28 @@ def main():
                              "stopping; 0 disables early stopping")
     args = parser.parse_args()
 
-    pairs, deltas = load_pairs(args.data)
+    kwargs = dict(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
+                  width=args.width, seed=args.seed, patience=args.patience)
+
+    if args.target == "bundle":
+        bundles, deltas = load_bundles(args.data)
+        fit = lambda: train_bundle(bundles, deltas, **kwargs)  # noqa: E731
+        unit = f"{len(bundles)} pairs -> {2 * len(bundles)} openings"
+    else:
+        pairs, deltas = load_pairs(args.data)
+        fit = lambda: train(pairs, deltas, **kwargs)  # noqa: E731
+        unit = f"{len(pairs)} pairs -> {4 * len(pairs)} corners"
+
     decided = int(np.count_nonzero(deltas))
-    print(f"{len(pairs)} pairs ({4 * len(pairs)} corners), {pairs.shape[-1]} "
-          f"features, {decided} decided ({decided / max(1, len(deltas)):.1%})")
+    print(f"{unit}, {decided} decided ({decided / max(1, len(deltas)):.1%})")
 
-    net, _ = train(
-        pairs, deltas, epochs=args.epochs, batch_size=args.batch_size,
-        lr=args.lr, width=args.width, seed=args.seed, patience=args.patience,
-    )
-
+    net, _ = fit()
     path = net.save(args.out)
     print(f"saved -> {path}")
-    print(format_diagnosis(diagnose(net, DIAGNOSTIC_SEEDS)))
+    # The rank/rho diagnostic ranks single corners, so it has nothing to say
+    # about a bundle scorer. Games are the metric there.
+    if args.target == "corner":
+        print(format_diagnosis(diagnose(net, DIAGNOSTIC_SEEDS)))
 
 
 if __name__ == "__main__":

@@ -47,11 +47,9 @@ import catanatron_gym.envs.catanatron_env as cenv
 from catanatron.models.enums import ActionType
 
 from src.env.catan_env import make_1v1_env
-from src.placement.features import encode_candidates
-from src.placement.model import PlacementNet
+from src.placement.chooser import OpeningChooser
+from src.placement.model import BundleNet, PlacementNet
 from src.placement.player import PlacementPlayer
-
-import numpy as np
 
 
 class PlacementWrapper(Wrapper):
@@ -63,9 +61,10 @@ class PlacementWrapper(Wrapper):
         seed: seed for the initial-road choice.
     """
 
-    def __init__(self, env, model, seed=None):
+    def __init__(self, env, model, seed=None, bundle_model=None):
         super().__init__(env)
         self.model = model
+        self.chooser = OpeningChooser(model, bundle_model)
         self.rng = random.Random(seed)
         # Nodes the scorer picked this episode, in order. Useful telemetry: if
         # these stop varying across resets, exploration has collapsed.
@@ -78,17 +77,27 @@ class PlacementWrapper(Wrapper):
             a for a in actions if a.action_type == ActionType.BUILD_SETTLEMENT
         ]
         if not settlements:
+            roads = [a for a in actions if a.action_type == ActionType.BUILD_ROAD]
+            if roads and self.chooser.bundle_model is not None:
+                edge = self.chooser.choose_road(
+                    game, color, [a.value for a in roads]
+                )
+                return next(
+                    a for a in roads
+                    if tuple(sorted(a.value)) == tuple(sorted(edge))
+                )
             return self.rng.choice(list(actions))
 
         nodes = [a.value for a in settlements]
-        scores = self.model.score(encode_candidates(game, color, nodes))
-        chosen = settlements[int(np.argmax(scores))]
+        node = self.chooser.choose(game, color, nodes)
+        chosen = next(a for a in settlements if a.value == node)
         self.opening_nodes.append(chosen.value)
         return chosen
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self.opening_nodes = []
+        self.chooser.reset()
 
         game = self.env.unwrapped.game
         color = self.env.unwrapped.p0.color
@@ -112,11 +121,13 @@ class PlacementWrapper(Wrapper):
 
 
 def make_placement_env(model_path, enemy=None, seed=None, opponent_scorer=True,
-                       **env_kwargs):
+                       bundle_path=None, **env_kwargs):
     """A 1v1 env where both seats open with the placement scorer.
 
     Args:
         model_path: PlacementNet checkpoint.
+        bundle_path: optional BundleNet checkpoint; when given, openings are
+            chosen as a pair of corners rather than greedily one at a time.
         enemy: opponent Player. Defaults to the env's WeightedRandomPlayer(RED).
         seed: seed for initial-road choices.
         opponent_scorer: give the opponent the scorer as well. Leave this on
@@ -128,13 +139,14 @@ def make_placement_env(model_path, enemy=None, seed=None, opponent_scorer=True,
         players have completed the initial build phase.
     """
     model = PlacementNet.load(model_path)
+    bundle = BundleNet.load(bundle_path) if bundle_path else None
 
     if opponent_scorer:
         from catanatron import Color
         from catanatron.players.weighted_random import WeightedRandomPlayer
 
         inner = enemy if enemy is not None else WeightedRandomPlayer(Color.RED)
-        enemy = PlacementPlayer(inner.color, inner, model)
+        enemy = PlacementPlayer(inner.color, inner, model, bundle)
 
     env = make_1v1_env(enemy=enemy, **env_kwargs)
-    return PlacementWrapper(env, model, seed=seed)
+    return PlacementWrapper(env, model, seed=seed, bundle_model=bundle)

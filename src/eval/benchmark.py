@@ -52,18 +52,26 @@ def main():
                              "to measure the opening in isolation.")
     parser.add_argument("--opponent-placement-model", default=None,
                         help="Same, for the opponent.")
+    parser.add_argument("--bundle-model", default=None,
+                        help="BundleNet checkpoint for the challenger. Needs "
+                             "--placement-model, which shortlists the corners "
+                             "it searches; the opening is then chosen as a pair.")
+    parser.add_argument("--opponent-bundle-model", default=None,
+                        help="Same, for the opponent.")
     args = parser.parse_args()
 
     challenger = AgentSpec(
         kind=args.agent, model_path=args.model,
         simulations=args.simulations, batch_size=args.batch_size,
         placement_path=args.placement_model,
+        bundle_path=args.bundle_model,
     )
     opponent = AgentSpec(
         kind=args.opponent, model_path=args.opponent_model,
         simulations=args.opponent_simulations or args.simulations,
         batch_size=args.batch_size,
         placement_path=args.opponent_placement_model,
+        bundle_path=args.opponent_bundle_model,
     )
 
     print(f"{args.agent} vs {args.opponent} over {args.games} games "

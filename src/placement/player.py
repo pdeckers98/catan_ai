@@ -10,28 +10,31 @@ Initial *roads* are left to the inner agent on purpose. The scorer ranks corners
 and inventing a road policy here would smuggle in an extra untested change.
 """
 
-import numpy as np
-
 from catanatron.models.enums import ActionType
 from catanatron.models.player import Player
 
-from src.placement.features import encode_candidates
-from src.placement.model import PlacementNet
+from src.placement.chooser import OpeningChooser
+from src.placement.model import BundleNet, PlacementNet
 
 
 class PlacementPlayer(Player):
-    """``inner`` plays the game; ``model`` picks the opening settlements.
+    """``inner`` plays the game; the scorer picks the opening settlements.
 
     Args:
         color: seat.
         inner: the Player handling every non-opening decision.
         model: a :class:`~src.placement.model.PlacementNet`.
+        bundle_model: optional :class:`~src.placement.model.BundleNet`; when
+            given, the opening is chosen as a pair of corners rather than one
+            corner at a time.
     """
 
-    def __init__(self, color, inner, model):
+    def __init__(self, color, inner, model, bundle_model=None):
         super().__init__(color)
         self.inner = inner
         self.model = model
+        # Per-seat: the chooser remembers this player's first pick.
+        self.chooser = OpeningChooser(model, bundle_model)
 
     def decide(self, game, playable_actions):
         if game.state.is_initial_build_phase:
@@ -41,21 +44,37 @@ class PlacementPlayer(Player):
             ]
             if settlements:
                 nodes = [a.value for a in settlements]
-                scores = self.model.score(
-                    encode_candidates(game, self.color, nodes)
+                chosen = self.chooser.choose(game, self.color, nodes)
+                return next(a for a in settlements if a.value == chosen)
+
+            roads = [
+                a for a in playable_actions
+                if a.action_type == ActionType.BUILD_ROAD
+            ]
+            # Only when the chooser is actually planning openings. Without a
+            # bundle model it has no opinion about roads, and the inner agent
+            # keeps them -- which is what every earlier measurement did.
+            if roads and self.chooser.bundle_model is not None:
+                edge = self.chooser.choose_road(
+                    game, self.color, [a.value for a in roads]
                 )
-                return settlements[int(np.argmax(scores))]
+                return next(
+                    a for a in roads if tuple(sorted(a.value)) == tuple(sorted(edge))
+                )
         return self.inner.decide(game, playable_actions)
 
     def reset_state(self):
+        self.chooser.reset()
         self.inner.reset_state()
 
 
-def wrap_factory(inner_factory, model_path):
+def wrap_factory(inner_factory, model_path, bundle_path=None):
     """Wrap a ``callable(Color) -> Player`` so its openings come from the scorer.
 
-    Loads the checkpoint once and shares it across seats; the model is stateless
-    at inference, so there is nothing to keep separate.
+    Loads the checkpoints once and shares them across seats; the models are
+    stateless at inference. The per-seat search state lives in the chooser, so
+    each :class:`PlacementPlayer` builds its own.
     """
     model = PlacementNet.load(model_path)
-    return lambda color: PlacementPlayer(color, inner_factory(color), model)
+    bundle = BundleNet.load(bundle_path) if bundle_path else None
+    return lambda color: PlacementPlayer(color, inner_factory(color), model, bundle)

@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from catanatron import Color
+from catanatron.models.board import STATIC_GRAPH
 from catanatron.models.enums import ActionType
 
 from src.env.catan_env import make_1v1_game
@@ -94,16 +95,28 @@ def test_spearman_endpoints():
 
 
 def test_generate_pair_shape_and_delta_range():
-    pairs, deltas = generate_pair(7)
+    pairs, deltas, bundles = generate_pair(7)
     assert pairs.shape == (1, 4, feature_size())
     assert deltas.shape == (1,)
+    # Same two openings, re-encoded as bundles: [seat][corner][settlement+road].
+    from src.placement.features import corner_feature_size
+
+    assert bundles.shape == (1, 2, 2, corner_feature_size())
+    # A bundle corner opens with its settlement block, unchanged from the pair.
+    width = feature_size()
+    assert np.array_equal(bundles[0, 0, 0, :width], pairs[0, 0])
+    assert np.array_equal(bundles[0, 1, 0, :width], pairs[0, 2])
+    # Its second corner is encoded with the first assumed built, so it carries
+    # the second-settlement flag even though nothing is on the board yet.
+    first, last = FEATURE_SLICES["placement_index"]
+    assert bundles[0, 0, 1, first] == 1.0
     # One comparison per pair: how much better the first seat's two corners did
     # than the second seat's, on the same board with the same dice.
     assert abs(deltas[0]) in (0.0, 0.5, 1.0)
 
 
 def test_flatten_pairs_opposes_the_two_bundles():
-    pairs, deltas = generate_pair(7)
+    pairs, deltas, _ = generate_pair(7)
     features, labels = flatten_pairs(pairs, deltas)
     assert features.shape == (4, feature_size())
     assert labels[0] == labels[1]
@@ -148,6 +161,141 @@ def test_training_learns_a_planted_ordering():
     probe = np.zeros((9, dim), dtype=np.float32)
     probe[:, 0] = np.linspace(-2, 2, 9)
     assert np.all(np.diff(net.score(probe)) > 0)
+
+
+def test_assume_owned_encodes_a_hypothetical_first_settlement():
+    from src.placement.features import node_features
+
+    game = make_1v1_game(seed=5)
+    color = game.state.colors[0]
+    catan_map = game.state.board.map
+    first, second = sorted(catan_map.land_nodes)[:2]
+
+    bare = node_features(game, color, second)
+    with_first = node_features(game, color, second, assume_owned=(first,))
+
+    flag, _ = FEATURE_SLICES["placement_index"]
+    assert bare[flag] == 0.0 and with_first[flag] == 1.0
+
+    # The assumed corner's production shows up as production we already hold.
+    start, stop = FEATURE_SLICES["own_production"]
+    assert not bare[start:stop].any()
+    expected = np.array(
+        [catan_map.node_production[first].get(r, 0.0) for r in RESOURCES],
+        dtype=np.float32,
+    )
+    assert np.allclose(with_first[start:stop], expected)
+
+    # Blocks that describe the candidate itself must not move.
+    for block in ("production", "tile_counts", "number_hist", "ports"):
+        lo, hi = FEATURE_SLICES[block]
+        assert np.array_equal(bare[lo:hi], with_first[lo:hi])
+
+
+def test_road_features_distinguish_directions():
+    """A road's whole value here is where it lets you build next."""
+    from src.placement.features import (
+        ROAD_FEATURE_SLICES, legal_road_edges, road_far_end, road_features,
+    )
+
+    game = make_1v1_game(seed=3)
+    color = game.state.colors[0]
+    node = sorted(game.state.board.map.land_nodes)[0]
+    edges = legal_road_edges(node)
+    vectors = [road_features(game, color, node, e) for e in edges]
+
+    # The three roads off one corner must not encode identically -- if they did,
+    # the model could not prefer one and the choice would be a coin flip.
+    assert any(not np.array_equal(vectors[0], v) for v in vectors[1:])
+
+    lo, hi = ROAD_FEATURE_SLICES["reach_1"]
+    for edge, vector in zip(edges, vectors):
+        far = road_far_end(node, edge)
+        assert far != node
+        # Count of settleable corners one road on, and it excludes the corner
+        # we just settled and everything adjacent to it.
+        assert vector[lo] >= 0
+        assert vector[lo + 1] >= vector[lo + 2]  # best >= mean
+
+
+def test_road_far_end_rejects_a_foreign_edge():
+    from src.placement.features import road_far_end
+
+    assert road_far_end(3, (3, 4)) == 4
+    assert road_far_end(4, (3, 4)) == 3
+    with pytest.raises(ValueError):
+        road_far_end(9, (3, 4))
+
+
+def test_opening_swap_replays_the_same_roads():
+    """Roads travel with their settlement, or the pair is not a controlled test."""
+    from src.placement.dataset import _draft_order, _draft_roads, _play
+
+    game_a, explorers = _play(7, "weighted", 7, dice_seed=7)
+    order, roads = _draft_order(game_a), _draft_roads(game_a)
+    assert len(order) == 4 and len(roads) == 4
+
+    swap = [1, 0, 3, 2]
+    nodes = [n for _, n in order]
+    first_seat, second_seat = order[0][0], order[1][0]
+    forced = {first_seat: [nodes[swap[0]], nodes[swap[3]]],
+              second_seat: [nodes[swap[1]], nodes[swap[2]]]}
+    forced_roads = {first_seat: [roads[swap[0]], roads[swap[3]]],
+                    second_seat: [roads[swap[1]], roads[swap[2]]]}
+
+    game_b, _ = _play(7, "weighted", 7, forced_by_color=forced, dice_seed=7,
+                      forced_roads_by_color=forced_roads)
+    # Same four openings, same four roads, opposite seats.
+    assert sorted(_draft_roads(game_b)) == sorted(roads)
+    assert sorted(n for _, n in _draft_order(game_b)) == sorted(nodes)
+
+
+def test_bundle_chooser_plans_roads_with_settlements():
+    from src.placement.chooser import OpeningChooser
+    from src.placement.features import corner_feature_size, legal_road_edges
+    from src.placement.model import BundleNet
+
+    game = make_1v1_game(seed=11)
+    color = game.state.colors[0]
+    chooser = OpeningChooser(PlacementNet(),
+                             BundleNet(feature_dim=corner_feature_size()),
+                             first_k=4, partner_k=8)
+    nodes = sorted(game.state.board.map.land_nodes)
+
+    first = chooser.choose(game, color, nodes)
+    edge = chooser.choose_road(game, color, legal_road_edges(first))
+    assert first in edge and edge in [tuple(e) for e in legal_road_edges(first)]
+
+    second, second_road = chooser._plan["second"]
+    assert second != first
+    assert second not in STATIC_GRAPH.neighbors(first)
+    assert second in second_road
+
+    # Losing the planned road falls back inside the model, not to a coin flip.
+    others = [e for e in legal_road_edges(first) if tuple(e) != edge]
+    if others:
+        assert tuple(chooser.choose_road(game, color, others)) in [
+            tuple(e) for e in others
+        ]
+
+
+def test_bundle_net_round_trip_and_shape(tmp_path):
+    from src.placement.model import BundleNet
+
+    rng = np.random.default_rng(0)
+    dim = feature_size()
+    openings = rng.normal(size=(32, 2, dim)).astype(np.float32)
+
+    net = BundleNet()
+    net.fit_normalizer(openings)
+    before = net.score(openings)
+    assert before.shape == (32,)
+
+    # Flat (N, 2F) and stacked (N, 2, F) must mean the same thing.
+    assert np.allclose(before, net.score(openings.reshape(32, -1)))
+
+    after = BundleNet.load(net.save(tmp_path / "bundle.pt")).score(openings)
+    assert np.allclose(before, after)
 
 
 def test_model_round_trip_preserves_scores(tmp_path):
