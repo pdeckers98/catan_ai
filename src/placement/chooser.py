@@ -6,18 +6,28 @@ for a much better pairing -- and complementarity between your two openings is a
 real part of the decision. Three label-pipeline changes failed to move play
 strength, which is what pointed at the selection rule rather than the labels.
 
-Roads belong here too. Under these house rules Longest Road is worth no VP, so
-an opening road buys exactly one thing: access to the corner you settle next.
-Choosing corners carefully and then throwing a random road at each -- which is
-what the codebase did before -- spends half the opening on a coin flip.
+Pair-scoring works: **642W-558L = 53.5%** over 1200 games against greedy
+selection, same agent and same corner scorer on both sides.
 
-:class:`OpeningChooser` in bundle mode therefore searches whole openings. For
-each strong first corner and each road off it, it asks what the best second
-corner *and its road* would then be, encoding the partner with ``assume_owned``
-so the pairing is visible, and scores the four-part opening with a
-:class:`~src.placement.model.BundleNet`.
+**Folding roads into that search does not, and the measurement is emphatic.**
+An opening road is a real decision -- Longest Road is worth no VP here, so a
+road buys exactly one thing, access to the corner you settle next -- and leaving
+it random is plainly wrong. But a bundle model over (settlement, road) x 2
+scored **44.1%** against the settlement-only bundle over 1200 games, wiping out
+the entire pair-scoring gain. Diagnosis: on 32 of 40 boards the two models pick
+different first settlements, and the roads model sits *closer* to the plain
+corner scorer (mean rank 1.70 vs 3.02). The 24 road dimensions swamped the
+complementarity signal that was doing the work, and the settlement choice
+collapsed back toward greedy. Roads are still worth solving -- but with a
+separate model conditioned on the chosen pair, not by widening this search.
 
-Three approximations, stated rather than hidden:
+So :class:`OpeningChooser` searches settlement pairs. It reads the corner width
+off the bundle checkpoint and only plans roads if given a model trained on them
+(``plans_roads``); with the settlement-only model that is measured stronger, the
+road falls back to the inner agent.
+
+Approximations, stated rather than hidden (the last two apply only in the
+measured-worse road mode):
 
 - **The corner scorer proposes, the bundle scorer disposes.** Searching all
   openings exactly would be slow, so the per-corner model shortlists first

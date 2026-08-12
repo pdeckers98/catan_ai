@@ -144,9 +144,34 @@ agent: 52.5% over 400 head-to-head games (51.0% / 54.0% on two seeds), 95% CI [4
 
 **Read the three attempts together.** CRN, the ranking loss, and agent-strength rollouts all left
 play strength where it was, despite two of them measurably improving label quality. The label
-pipeline is not what limits this scorer. The likelier constraint is structural: corners are picked
-**greedily and scored independently**, so the first settlement is chosen blind to what the second
-will be, and no amount of label quality fixes that. See the Ideas section.
+pipeline is not what limits this scorer. The constraint was structural — and fixing it worked.
+
+### The selection rule, not the labels
+
+`BundleNet` (`model.py`) scores both opening corners at once, the second encoded with
+`assume_owned=(first,)` so complementarity is visible; `OpeningChooser` (`chooser.py`) searches
+corner *pairs* instead of taking corners greedily. Measured **642W-558L = 53.5%** over 1200 games,
+95% CI [50.7, 56.3], against the same agent with the same corner scorer and the same training data
+— only the selection rule differs.
+
+Six seeds were needed. The first two read 48.5% and 60.0%, a spread wide enough that the pooled CI
+still touched 50; the other four came in at 49.5 / 52.5 / 54.5 / 56.0.
+
+**Roads were tried in that search and lost badly.** An opening road is a real decision — Longest
+Road is worth no VP here, so a road buys only access to the corner you settle next, and both
+`env_wrapper` (random) and `PlacementPlayer` (untrained inner head) were choosing it by coin flip.
+But the two halves of the fix measure very differently over 1200 games each:
+
+| half | pooled | verdict |
+| --- | --- | --- |
+| data: replay a road with its settlement on the swap | 49.7% | neutral; kept, it is a correct control |
+| model: road features in the bundle + joint road search | **44.1%** | worse; erases the pair-scoring gain |
+
+Diagnosis: on 32 of 40 boards the two models pick different first settlements, and the roads model
+sits *closer* to the plain corner scorer (mean rank 1.70 vs 3.02). The 24 road dimensions swamped
+the complementarity signal, and the settlement choice collapsed back toward greedy. Roads are still
+unsolved and still worth solving — with a separate model conditioned on the chosen pair, not by
+widening this search.
 
 **A ranking loss was tried and lost.** `--loss rank` fits `sigmoid(s(X) − s(Y))` to `(delta+1)/2`,
 scoring a bundle as the sum of its corners — a pair *is* a comparison, so Bradley-Terry looks like
