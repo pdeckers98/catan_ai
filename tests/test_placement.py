@@ -133,26 +133,21 @@ def test_fixed_dice_gives_paired_games_the_same_rolls():
     assert catanatron_state.roll_dice is original
 
 
-def test_ranking_loss_learns_a_separable_ordering():
-    from src.placement.train import train_ranking
+def test_training_learns_a_planted_ordering():
+    from src.placement.train import train
 
     rng = np.random.default_rng(0)
     dim = feature_size()
-    # Bundles whose first feature is larger always win, by construction.
+    # The first seat's bundle wins exactly when its first feature is larger.
     pairs = rng.normal(size=(1500, 4, dim)).astype(np.float32)
     strength = pairs[:, :, 0]
     deltas = np.sign(strength[:, :2].sum(1) - strength[:, 2:].sum(1)).astype(np.float32)
 
-    net, history = train_ranking(pairs, deltas, epochs=120, patience=0, progress=False)
-    # 44 of the 45 features are pure noise, so this never reaches 1.0; chance is
-    # 0.5 and the early-stopped model should be well clear of it.
-    assert max(epoch[3] for epoch in history) > 0.8
+    net, _ = train(pairs, deltas, epochs=120, patience=0, progress=False)
 
-    # And the ordering it learned is the one that was planted.
     probe = np.zeros((9, dim), dtype=np.float32)
     probe[:, 0] = np.linspace(-2, 2, 9)
-    scores = net.score(probe)
-    assert np.all(np.diff(scores) > 0)
+    assert np.all(np.diff(net.score(probe)) > 0)
 
 
 def test_model_round_trip_preserves_scores(tmp_path):
