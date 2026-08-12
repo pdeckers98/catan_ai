@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from catanatron import Color
+from catanatron.models.enums import ActionType
 from catanatron.models.player import RandomPlayer
 from catanatron.players.search import VictoryPointPlayer
 from catanatron.players.weighted_random import WeightedRandomPlayer
@@ -42,7 +43,10 @@ class MatchResult:
 
     __slots__ = ("wins", "losses", "draws", "games", "mean_turns",
                  "mean_vp", "mean_opp_vp", "mean_settlements", "mean_cities",
-                 "mean_roads", "mean_knights", "mean_opp_knights")
+                 "mean_roads", "mean_knights", "mean_opp_knights",
+                 "mean_dev_bought", "mean_dev_unplayed", "mean_end_hand",
+                 "mean_final_hand", "mean_trailing_roads",
+                 "loss_final_hand", "loss_dev_unplayed", "loss_trailing_roads")
 
     def __init__(self, **kwargs):
         for key in self.__slots__:
@@ -68,14 +72,36 @@ class MatchResult:
         return self.mean_knights - self.mean_opp_knights
 
     def summary(self) -> str:
-        return (
+        lines = (
             f"{self.wins}W-{self.losses}L-{int(self.draws)}D "
             f"(score {self.score:.1%}) | "
             f"avg turns {self.mean_turns:.0f}, VP {self.mean_vp:.1f} vs "
             f"{self.mean_opp_vp:.1f}, built {self.mean_settlements:.1f} settlements / "
             f"{self.mean_cities:.1f} cities / {self.mean_roads:.1f} roads, "
-            f"played {self.mean_knights:.1f} knights ({self.knights_diff:+.1f})"
+            f"played {self.mean_knights:.1f} knights ({self.knights_diff:+.1f})\n"
+            f"waste: {self.mean_dev_bought:.1f} dev bought "
+            f"({self.mean_dev_unplayed:.1f} dead), "
+            f"{self.mean_trailing_roads:.1f} trailing roads, hand "
+            f"{self.mean_end_hand:.1f} at end-turn / "
+            f"{self.mean_final_hand:.1f} at game end"
         )
+        if self.losses:
+            lines += (
+                f" (losses: {self.loss_final_hand:.1f} held, "
+                f"{self.loss_dev_unplayed:.1f} dead dev, "
+                f"{self.loss_trailing_roads:.1f} trailing)"
+            )
+        return lines
+
+
+RESOURCES = ("WOOD", "BRICK", "SHEEP", "WHEAT", "ORE")
+# VICTORY_POINT is deliberately absent: a VP card in hand scored, it is not dead.
+DEAD_DEV_CARDS = ("KNIGHT", "MONOPOLY", "YEAR_OF_PLENTY", "ROAD_BUILDING")
+
+
+def _hand_size(state, color) -> int:
+    key = f"P{state.color_to_index[color]}"
+    return sum(state.player_state[f"{key}_{r}_IN_HAND"] for r in RESOURCES)
 
 
 def _player_stats(state, color) -> dict:
@@ -91,7 +117,45 @@ def _player_stats(state, color) -> dict:
         # found that route: three knights is the threshold, and a mean well under
         # 3 means it is buying development cards without cashing them in.
         "knights": state.player_state[f"{key}_PLAYED_KNIGHT"],
+        # Resources still in hand when the game ended: in a loss, cards that
+        # were hoarded past the point of usefulness (or never spendable).
+        "final_hand": _hand_size(state, color),
+        # Development cards bought but never cashed in -- pure waste.
+        "dev_unplayed": sum(
+            state.player_state[f"{key}_{card}_IN_HAND"] for card in DEAD_DEV_CARDS
+        ),
     }
+
+
+def _action_log_stats(actions, color) -> dict:
+    """Waste telemetry mined from a finished game's action log.
+
+    ``trailing_roads`` counts roads built after the player's last settlement or
+    city -- roads that never enabled anything. The first two settlements and two
+    roads are initial placement and excluded, so a player who never builds
+    another building has every later road counted as trailing.
+    """
+    dev_bought = 0
+    placement_settlements = placement_roads = 0
+    roads_since_building = 0
+    for action in actions:
+        if action.color != color:
+            continue
+        if action.action_type == ActionType.BUY_DEVELOPMENT_CARD:
+            dev_bought += 1
+        elif action.action_type == ActionType.BUILD_SETTLEMENT:
+            if placement_settlements < 2:
+                placement_settlements += 1
+            else:
+                roads_since_building = 0
+        elif action.action_type == ActionType.BUILD_CITY:
+            roads_since_building = 0
+        elif action.action_type == ActionType.BUILD_ROAD:
+            if placement_roads < 2:
+                placement_roads += 1
+            else:
+                roads_since_building += 1
+    return {"dev_bought": dev_bought, "trailing_roads": roads_since_building}
 
 
 def _play_one_game(challenger_factory, opponent_factory, index: int, seed: int) -> dict:
@@ -124,12 +188,22 @@ def _play_one_game(challenger_factory, opponent_factory, index: int, seed: int) 
     )
 
     game = make_1v1_game(players=players, seed=seed)
+    # Hand size at each of the challenger's END_TURNs has to be sampled live --
+    # the action log records the decision but not the hand it was made with.
+    end_hands = []
+    actions_seen = 0
     while game.winning_color() is None and game.state.num_turns < MAX_TURNS:
         game.play_tick()
+        for action in game.state.actions[actions_seen:]:
+            if (action.color == challenger_color
+                    and action.action_type == ActionType.END_TURN):
+                end_hands.append(_hand_size(game.state, challenger_color))
+        actions_seen = len(game.state.actions)
 
     winner = game.winning_color()
     mine = _player_stats(game.state, challenger_color)
     theirs = _player_stats(game.state, opponent_color)
+    log_stats = _action_log_stats(game.state.actions, challenger_color)
     return {
         "index": index,
         "outcome": ("win" if winner == challenger_color
@@ -142,15 +216,21 @@ def _play_one_game(challenger_factory, opponent_factory, index: int, seed: int) 
         "roads": mine["roads"],
         "knights": mine["knights"],
         "opp_knights": theirs["knights"],
+        "final_hand": mine["final_hand"],
+        "dev_unplayed": mine["dev_unplayed"],
+        "dev_bought": log_stats["dev_bought"],
+        "trailing_roads": log_stats["trailing_roads"],
+        "end_hand": float(np.mean(end_hands)) if end_hands else 0.0,
     }
 
 
 def _collect(records, num_games: int) -> MatchResult:
     """Fold per-game records into a :class:`MatchResult`."""
     outcomes = [r["outcome"] for r in records]
+    lost = [r for r in records if r["outcome"] == "loss"]
 
-    def mean(key):
-        return float(np.mean([r[key] for r in records])) if records else 0.0
+    def mean(key, over=records):
+        return float(np.mean([r[key] for r in over])) if over else 0.0
 
     return MatchResult(
         wins=outcomes.count("win"), losses=outcomes.count("loss"),
@@ -159,6 +239,12 @@ def _collect(records, num_games: int) -> MatchResult:
         mean_settlements=mean("settlements"), mean_cities=mean("cities"),
         mean_roads=mean("roads"), mean_knights=mean("knights"),
         mean_opp_knights=mean("opp_knights"),
+        mean_dev_bought=mean("dev_bought"), mean_dev_unplayed=mean("dev_unplayed"),
+        mean_end_hand=mean("end_hand"), mean_final_hand=mean("final_hand"),
+        mean_trailing_roads=mean("trailing_roads"),
+        loss_final_hand=mean("final_hand", lost),
+        loss_dev_unplayed=mean("dev_unplayed", lost),
+        loss_trailing_roads=mean("trailing_roads", lost),
     )
 
 
