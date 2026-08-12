@@ -108,7 +108,8 @@ beats brick+wood is a judgement and must be learned from outcomes.
 | module | role |
 | --- | --- |
 | `features.py` | 45 mechanical facts per node: production rate per resource, tile counts, dice-number histogram, desert count, port one-hot, first/second-settlement flag, both players' holdings, buildable production 2 and 3 edges out. No weighting between blocks. |
-| `dataset.py` | Openings explored **uniformly at random** (sampling from a scorer would bake in its preferences), played out, labelled with the actual outcome. |
+| `dataset.py` | Openings explored **uniformly at random** (sampling from a scorer would bake in its preferences), played out, labelled with the actual outcome. Emits duplicate-board *pairs*. |
+| `../env/dice.py` | `fixed_dice(seed)` — a dedicated roll stream, so both games of a pair see the same dice. |
 | `model.py` | 64-wide 2-layer MLP → scalar. Normalisation stats fitted on the train split, stored as buffers so inference cannot disagree with training. |
 | `heuristic.py` | Hand-written pips × diversity scorer. **Quarantined**: evaluation yardstick only, never in a decision path or in data generation. |
 | `player.py` | Intercepts initial-phase settlements only; everything else, initial roads included, goes to the inner agent. |
@@ -120,17 +121,39 @@ explained it, both openings labelled 0. Swapping flips the winner → the openin
 labels ±1. ~73% of pairs come back informative. The snake draft (P0, P1, P1, P0) makes the swap
 always legal: replay in the order n2, n1, n4, n3 and every node keeps its non-adjacency.
 
-*Caveat: this duplicates the **board**, not the dice.* Rolls come off the global RNG, so once the
-seats hold different corners their actions and their roll sequences diverge. Variance reduction,
-not elimination.
+**Common random numbers** duplicate the dice too. `src/env/dice.py:fixed_dice` swaps
+`catanatron.state.roll_dice` for a dedicated `random.Random`, so roll *k* is identical in both games
+of a pair no matter how the bots' actions diverge — without it a shared seed drifts apart as soon as
+the seats act differently, which is immediately. Turns alternate, so turn *k* is the same seat in
+both. Dev-card draws and robber steals still ride the global RNG and still diverge. `--free-dice`
+turns it off.
+
+*It measured neutral* — 49.0% head-to-head against a free-dice scorer, and the informative-pair rate
+barely moved (73.1% → 73.9%). At 8000 pairs, dice variance was not the binding constraint. Left on
+by default because it is free and makes the pair an actually controlled comparison, which should
+matter more once labels stop coming from weighted-random rollouts.
+
+**A ranking loss was tried and lost.** `--loss rank` fits `sigmoid(s(X) − s(Y))` to `(delta+1)/2`,
+scoring a bundle as the sum of its corners — a pair *is* a comparison, so Bradley-Terry looks like
+the natural shape, and play time only needs the ordering. Measured over 400 head-to-head games it
+scored **45.3%** against the same agent using the regression scorer. Likely cause: `s(X) = s(n1) +
+s(n4)` assumes corners are independent, but the first pick is featurised before the second exists.
+`--loss mse` remains the default. The rank path is kept, untested, for the case where labels come
+from strong rollouts.
+
+Its one diagnostic worth reading is **validation pair accuracy** — the share of decided val pairs
+whose winner the model calls. Note it is ~0.88 and that is *not* impressive: openings are uniformly
+random, so most comparisons are a good bundle against an obviously bad one.
 
 ```bash
-python -m src.placement.dataset --pairs 8000 --workers 8 --seed 1   # ~1 min on 8 workers
+python -m src.placement.dataset --pairs 8000 --workers 8 --seed 1   # ~11 min on 8 workers
 python -m src.placement.train --data data/placement/samples.npz
 ```
 
-**Training overfits fast** — validation loss bottoms out around epoch 7 of 200 and climbs steadily.
-Early stopping is load-bearing, not tidiness.
+On-disk: `pairs` (P, 4, F) — first seat's two corners then the second's, featurised at pick time in
+game A — plus `deltas` (P,), and the flattened `features`/`labels` view for `--loss mse`.
+
+**Training overfits fast** — early stopping is load-bearing, not tidiness.
 
 Attach to any agent with `--placement-model`, or `AgentSpec(placement_path=...)`.
 

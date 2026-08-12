@@ -9,7 +9,7 @@ from catanatron import Color
 from catanatron.models.enums import ActionType
 
 from src.env.catan_env import make_1v1_game
-from src.placement.dataset import generate_pair
+from src.placement.dataset import flatten_pairs, generate_pair
 from src.placement.evaluate import diagnose
 from src.placement.features import (
     FEATURE_SLICES,
@@ -93,15 +93,22 @@ def test_spearman_endpoints():
     assert spearman([1, 2, 3], [5, 5, 5]) == 0.0
 
 
-def test_generate_pair_labels_are_paired_and_opposed():
-    features, labels = generate_pair(7)
+def test_generate_pair_shape_and_delta_range():
+    pairs, deltas = generate_pair(7)
+    assert pairs.shape == (1, 4, feature_size())
+    assert deltas.shape == (1,)
+    # One comparison per pair: how much better the first seat's two corners did
+    # than the second seat's, on the same board with the same dice.
+    assert abs(deltas[0]) in (0.0, 0.5, 1.0)
+
+
+def test_flatten_pairs_opposes_the_two_bundles():
+    pairs, deltas = generate_pair(7)
+    features, labels = flatten_pairs(pairs, deltas)
     assert features.shape == (4, feature_size())
-    # Two samples per seat, and the seats' labels are exact opposites: the pair
-    # measures one opening against the other on the same board.
     assert labels[0] == labels[1]
     assert labels[2] == labels[3]
     assert labels[0] == pytest.approx(-labels[2])
-    assert set(np.abs(labels)) <= {0.0, 0.5, 1.0}
 
 
 def test_generate_pair_is_deterministic():
@@ -109,6 +116,43 @@ def test_generate_pair_is_deterministic():
     second = generate_pair(23)
     assert np.array_equal(first[0], second[0])
     assert np.array_equal(first[1], second[1])
+
+
+def test_fixed_dice_gives_paired_games_the_same_rolls():
+    from src.env.dice import fixed_dice
+    from catanatron import state as catanatron_state
+
+    original = catanatron_state.roll_dice
+    with fixed_dice(11):
+        first = [catanatron_state.roll_dice() for _ in range(20)]
+    with fixed_dice(11):
+        second = [catanatron_state.roll_dice() for _ in range(20)]
+    assert first == second
+    # And the patch is fully undone, including the module-global rebind that
+    # apply_action resolves through.
+    assert catanatron_state.roll_dice is original
+
+
+def test_ranking_loss_learns_a_separable_ordering():
+    from src.placement.train import train_ranking
+
+    rng = np.random.default_rng(0)
+    dim = feature_size()
+    # Bundles whose first feature is larger always win, by construction.
+    pairs = rng.normal(size=(1500, 4, dim)).astype(np.float32)
+    strength = pairs[:, :, 0]
+    deltas = np.sign(strength[:, :2].sum(1) - strength[:, 2:].sum(1)).astype(np.float32)
+
+    net, history = train_ranking(pairs, deltas, epochs=120, patience=0, progress=False)
+    # 44 of the 45 features are pure noise, so this never reaches 1.0; chance is
+    # 0.5 and the early-stopped model should be well clear of it.
+    assert max(epoch[3] for epoch in history) > 0.8
+
+    # And the ordering it learned is the one that was planted.
+    probe = np.zeros((9, dim), dtype=np.float32)
+    probe[:, 0] = np.linspace(-2, 2, 9)
+    scores = net.score(probe)
+    assert np.all(np.diff(scores) > 0)
 
 
 def test_model_round_trip_preserves_scores(tmp_path):

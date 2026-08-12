@@ -15,18 +15,26 @@ is the difference. If the same seat wins both, the board explained the result an
 both openings are labelled 0. If swapping the openings swaps the winner, the
 openings explained it and the labels go to +-1.
 
-The honest caveat: this duplicates the **board**, not the dice. Catanatron rolls
-off the global RNG, and once the two seats hold different corners they take
-different actions and the roll sequences diverge. Board layout is the larger and
-more systematic of the two nuisance terms and it is fully controlled; dice are
-only correlated early. It is variance reduction, not elimination.
+**Common random numbers.** The pair also duplicates the dice, via
+:func:`~src.env.dice.fixed_dice`: both games draw rolls from the same dedicated
+stream, so roll *k* is identical in each and only the openings differ. Without
+it the two games share a seed but drift apart the moment the seats act
+differently, which is immediately. Dev-card draws and robber steals still come
+off the global RNG and still diverge; dice are the dominant term.
 
 The rollout agent that plays the other ~120 turns is a knob. Weighted-random is
 the default because it is fast and symmetric, which keeps labels about the
 opening rather than about one side's mid-game skill.
+
+**On-disk format.** ``pairs`` is (P, 4, F): each row is one duplicate-board pair,
+holding the first seat's two corners followed by the second seat's two, all
+featurised at the moment they were picked in game A. ``deltas`` is (P,), positive
+when the first seat's bundle was the better one. ``features``/``labels`` are the
+flattened per-node view of exactly the same data, kept for the regression loss.
 """
 
 import argparse
+import contextlib
 import os
 import random
 from concurrent.futures import ProcessPoolExecutor
@@ -40,11 +48,15 @@ from catanatron.models.player import Player, RandomPlayer
 from catanatron.players.weighted_random import WeightedRandomPlayer
 
 from src.env.catan_env import MAX_TURNS, make_1v1_game
+from src.env.dice import fixed_dice
 from src.placement.features import (
     encode_candidates,
     feature_size,
     node_features,
 )
+
+# Corners per pair: the first seat's two, then the second seat's two.
+PAIR_NODES = 4
 
 ROLLOUT_BOTS = {
     "random": RandomPlayer,
@@ -120,8 +132,12 @@ def _outcome(game, color) -> float:
 
 
 def _play(seed, rollout_kind, rng_seed, forced_by_color=None, model=None,
-          epsilon=1.0):
-    """Play one game with explorer openings; returns (game, {color: explorer})."""
+          epsilon=1.0, dice_seed=None):
+    """Play one game with explorer openings; returns (game, {color: explorer}).
+
+    ``dice_seed`` puts the rolls on their own stream so both games of a pair see
+    the same sequence; ``None`` leaves them on the global RNG.
+    """
     forced_by_color = forced_by_color or {}
     bot = ROLLOUT_BOTS[rollout_kind]
     explorers = {}
@@ -140,8 +156,11 @@ def _play(seed, rollout_kind, rng_seed, forced_by_color=None, model=None,
         players.append(explorer)
 
     game = make_1v1_game(players=players, seed=seed)
-    while game.winning_color() is None and game.state.num_turns < MAX_TURNS:
-        game.play_tick()
+    with contextlib.ExitStack() as stack:
+        if dice_seed is not None:
+            stack.enter_context(fixed_dice(dice_seed))
+        while game.winning_color() is None and game.state.num_turns < MAX_TURNS:
+            game.play_tick()
     return game, explorers
 
 
@@ -154,19 +173,27 @@ def _draft_order(game):
     return picks[:4]
 
 
+def _empty_pair():
+    return np.zeros((0, PAIR_NODES, feature_size()), np.float32), np.zeros(0, np.float32)
+
+
 def generate_pair(seed: int, rollout_kind: str = "weighted", model=None,
-                  epsilon: float = 1.0):
-    """Play a board twice with the openings swapped; return labelled samples.
+                  epsilon: float = 1.0, common_dice: bool = True):
+    """Play a board twice with the openings swapped; return one labelled pair.
 
     Returns:
-        (features, labels) -- float32 (4, F) and (4,), or empty arrays if the
-        pair could not be completed.
+        (pair, delta) -- float32 (1, 4, F) and (1,), or empty arrays if the pair
+        could not be completed. The four corners are the first seat's two
+        followed by the second seat's two, and ``delta`` is positive when the
+        first seat's bundle won the comparison.
     """
-    game_a, explorers = _play(seed, rollout_kind, seed, model=model, epsilon=epsilon)
+    dice_seed = seed if common_dice else None
+    game_a, explorers = _play(seed, rollout_kind, seed, model=model, epsilon=epsilon,
+                              dice_seed=dice_seed)
 
     order = _draft_order(game_a)
     if len(order) < 4:
-        return np.zeros((0, feature_size()), np.float32), np.zeros(0, np.float32)
+        return _empty_pair()
 
     # Snake draft: seats pick n1, n2, n3, n4 in the order P0, P1, P1, P0. Swapping
     # ownership means P0 now takes {n2, n3} and P1 takes {n1, n4}, which in draft
@@ -181,61 +208,77 @@ def generate_pair(seed: int, rollout_kind: str = "weighted", model=None,
         second_seat: [swapped[1], swapped[2]],
     }
 
-    game_b, _ = _play(seed, rollout_kind, seed, forced_by_color=forced)
+    game_b, _ = _play(seed, rollout_kind, seed, forced_by_color=forced,
+                      dice_seed=dice_seed)
 
     # Paired label: how much better the first seat did holding its own opening
     # than the second seat did holding that same opening on the same board.
     delta = (_outcome(game_a, first_seat) - _outcome(game_b, first_seat)) / 2.0
 
-    features, labels = [], []
-    for color, explorer in explorers.items():
-        label = delta if color == first_seat else -delta
-        for _, vector in explorer.picks:
-            features.append(vector)
-            labels.append(label)
+    corners = []
+    for color in (first_seat, second_seat):
+        corners.extend(vector for _, vector in explorers[color].picks)
+    if len(corners) != PAIR_NODES:
+        return _empty_pair()
 
     return (
-        np.stack(features).astype(np.float32),
-        np.array(labels, dtype=np.float32),
+        np.stack(corners).astype(np.float32)[None, ...],
+        np.array([delta], dtype=np.float32),
     )
+
+
+def flatten_pairs(pairs: np.ndarray, deltas: np.ndarray):
+    """Per-node view of paired data, for the regression loss.
+
+    Every corner inherits its bundle's outcome: the first seat's two corners take
+    ``+delta`` and the second seat's two take ``-delta``.
+    """
+    if len(pairs) == 0:
+        return np.zeros((0, feature_size()), np.float32), np.zeros(0, np.float32)
+    features = pairs.reshape(-1, pairs.shape[-1])
+    signs = np.array([1.0, 1.0, -1.0, -1.0], dtype=np.float32)
+    labels = (deltas[:, None] * signs[None, :]).reshape(-1)
+    return features.astype(np.float32), labels.astype(np.float32)
 
 
 def _worker(payload):
     import torch
 
     torch.set_num_threads(1)
-    seeds, rollout_kind, model_path, epsilon = payload
+    seeds, rollout_kind, model_path, epsilon, common_dice = payload
     model = None
     if model_path is not None:
         from src.placement.model import PlacementNet
         model = PlacementNet.load(model_path)
 
-    chunks = [generate_pair(s, rollout_kind, model, epsilon) for s in seeds]
-    features = [f for f, _ in chunks if len(f)]
-    labels = [ln for _, ln in chunks if len(ln)]
-    if not features:
-        return np.zeros((0, feature_size()), np.float32), np.zeros(0, np.float32)
-    return np.concatenate(features), np.concatenate(labels)
+    chunks = [
+        generate_pair(s, rollout_kind, model, epsilon, common_dice) for s in seeds
+    ]
+    pairs = [p for p, _ in chunks if len(p)]
+    deltas = [d for _, d in chunks if len(d)]
+    if not pairs:
+        return _empty_pair()
+    return np.concatenate(pairs), np.concatenate(deltas)
 
 
 def generate(num_pairs: int, seed: int = 0, rollout_kind: str = "weighted",
              workers: int = 0, model_path=None, epsilon: float = 1.0,
-             progress: bool = False):
+             common_dice: bool = True, progress: bool = False):
     """Generate ``num_pairs`` duplicate-board pairs (two games each).
 
     Returns:
-        (features, labels) -- float32 (N, F) and (N,), N up to ``4 * num_pairs``.
+        (pairs, deltas) -- float32 (P, 4, F) and (P,), P up to ``num_pairs``.
     """
     rng = np.random.default_rng(seed)
     seeds = [int(rng.integers(2**31 - 1)) for _ in range(num_pairs)]
 
     if workers <= 1:
-        payloads = [(seeds, rollout_kind, model_path, epsilon)]
+        payloads = [(seeds, rollout_kind, model_path, epsilon, common_dice)]
     else:
         workers = min(workers, num_pairs, os.cpu_count() or workers)
         buckets = [seeds[i::workers] for i in range(workers)]
         payloads = [
-            (bucket, rollout_kind, model_path, epsilon)
+            (bucket, rollout_kind, model_path, epsilon, common_dice)
             for bucket in buckets if bucket
         ]
 
@@ -247,14 +290,14 @@ def generate(num_pairs: int, seed: int = 0, rollout_kind: str = "weighted",
             for result in pool.map(_worker, payloads):
                 results.append(result)
                 if progress:
-                    done = sum(len(f) for f, _ in results)
-                    print(f"  {done} samples collected", flush=True)
+                    done = sum(len(p) for p, _ in results)
+                    print(f"  {done} pairs collected", flush=True)
 
-    features = [f for f, _ in results if len(f)]
-    labels = [ln for _, ln in results if len(ln)]
-    if not features:
-        return np.zeros((0, feature_size()), np.float32), np.zeros(0, np.float32)
-    return np.concatenate(features), np.concatenate(labels)
+    pairs = [p for p, _ in results if len(p)]
+    deltas = [d for _, d in results if len(d)]
+    if not pairs:
+        return _empty_pair()
+    return np.concatenate(pairs), np.concatenate(deltas)
 
 
 def main():
@@ -270,22 +313,27 @@ def main():
                              "(later Expert Iteration rounds)")
     parser.add_argument("--epsilon", type=float, default=1.0,
                         help="uniform-random share of openings when --model is set")
+    parser.add_argument("--free-dice", action="store_true",
+                        help="leave the dice on the global RNG instead of giving "
+                             "each pair a shared roll sequence")
     parser.add_argument("--out", default="data/placement/samples.npz")
     args = parser.parse_args()
 
-    features, labels = generate(
+    pairs, deltas = generate(
         args.pairs, seed=args.seed, rollout_kind=args.rollout,
         workers=args.workers, model_path=args.model, epsilon=args.epsilon,
-        progress=True,
+        common_dice=not args.free_dice, progress=True,
     )
+    features, labels = flatten_pairs(pairs, deltas)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out, features=features, labels=labels)
+    np.savez_compressed(out, pairs=pairs, deltas=deltas,
+                        features=features, labels=labels)
 
-    informative = int(np.count_nonzero(labels))
-    print(f"{len(labels)} samples -> {out}")
-    print(f"  {informative} informative ({informative / max(1, len(labels)):.1%}); "
+    informative = int(np.count_nonzero(deltas))
+    print(f"{len(pairs)} pairs ({len(labels)} corners) -> {out}")
+    print(f"  {informative} informative ({informative / max(1, len(deltas)):.1%}); "
           f"the rest are boards where swapping the openings did not swap the winner")
 
 
