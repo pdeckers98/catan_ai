@@ -17,9 +17,9 @@ the agent and, later, the web integration.
   Catan simulator with a Gymnasium env, action masking, and strong baseline bots
 - **Learning algorithm**: **AlphaZero** — one PyTorch net (policy + value heads) trained by
   self-play, where PUCT tree search supplies the improved policy target. `src/agent/train_az.py`.
-  The `MaskablePPO` training loop was removed; its strongest checkpoint
-  (`checkpoints/ppo-8vp-scratch`) is retained as a benchmark opponent, loadable via the `ppo` and
-  `ppo-mcts` agent specs.
+  **`MaskablePPO` (`src/agent/train.py`) is the active track** -- one forward per decision vs
+  AlphaZero's ~200, and ~92% vs weighted-random at 3M steps vs AlphaZero's 70.8%. The old "PPO only
+  builds roads" verdict predates the Longest-Road rule change and is confounded by it.
 - **Game mode**: 1v1 (`enemies=[one bot]`, `map_type="BASE"`, `vps_to_win=8`)
 - **Custom rules**: `src/env/rules.py` monkeypatches Catanatron at import time. Applied
   automatically via `src/env/catan_env.py`. Seven patches:
@@ -54,7 +54,8 @@ the agent and, later, the web integration.
 src/
 ├── env/
 │   ├── rules.py         # custom-rule monkeypatches (applied at import)
-│   └── catan_env.py     # gym env + raw-Game factory, shared constants
+│   ├── catan_env.py     # gym env + raw-Game factory, shared constants
+│   └── lookahead.py     # two-roll dice features (P(afford), discard risk)
 ├── agent/
 │   ├── encoding.py      # obs vector + action mask off a live Game
 │   ├── net.py           # AlphaZeroNet (residual MLP, policy + value heads)
@@ -63,6 +64,8 @@ src/
 │   ├── selfplay.py      # self-play game generation + value targets
 │   ├── train_az.py      # AlphaZero training loop  <-- the main track
 │   ├── arena.py         # head-to-head match play + agent-by-name registry
+│   ├── train.py         # MaskablePPO loop  <-- the active track
+│   ├── pool.py / elo.py / checkpoint_manager.py   # self-play ladder for train.py
 │   └── opponent.py      # PolicyPlayer (frozen PPO checkpoint as a Player)
 ├── placement/           # opening-settlement specialist (self-trained, no heuristics)
 │   ├── features.py      # 45 mechanical per-node board facts
@@ -89,6 +92,10 @@ tests/         # Unit & integration tests
 **Smoke test (Phase 1)**: `python -m src.env.smoke_test`
 
 **Train (Phase 2)**: `python -m src.agent.train_az --iterations 200 --games-per-iter 64 --workers 16`
+
+**Train (PPO, sparse + placement + lookahead)**: `python -m src.agent.train --total-steps 3000000
+--no-shaping --placement-model checkpoints/placement/scorer.pt --lookahead --eval-games 200
+--eval-workers 8 --run-name <name>`
 
 **Train the placement scorer**: `python -m src.placement.dataset --pairs 8000 --workers 8` then
 `python -m src.placement.train --data data/placement/samples.npz`

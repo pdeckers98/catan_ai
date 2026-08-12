@@ -6,13 +6,19 @@ Two components, trained separately because they are different problems:
 
 | | trains on | entry point | best result |
 | --- | --- | --- | --- |
-| **Main agent** — AlphaZero (PUCT search + `AlphaZeroNet`) | self-play, sparse win/loss | `src.agent.train_az` | feasibility only; no strong checkpoint yet |
-| **Opening placement** — `src/placement/` | random openings labelled by game outcome | `src.placement.train` | +85.5% head-to-head over the same agent without it |
+| **PPO** (MaskablePPO) | sparse win/loss, gym env | `src.agent.train` | **~92%** vs `weighted` at 3M steps |
+| **AlphaZero** (PUCT + `AlphaZeroNet`) | self-play, sparse win/loss | `src.agent.train_az` | feasibility only (70.8%) |
+| **Opening placement** | random openings labelled by game outcome | `src.placement.train` | +85.5% head-to-head over the same agent without it |
 
-The strongest *playable* agent today is still the old PPO checkpoint
-`checkpoints/ppo-8vp-scratch/best.zip` (97.0% vs `weighted` with the placement scorer attached).
-Its training loop has been deleted; the checkpoint is retained as a benchmark opponent via the
-`ppo` and `ppo-mcts` agent specs.
+**PPO is currently the stronger *and* cheaper track** — one network forward per decision against
+AlphaZero's ~200 — and the case against it does not survive inspection. Every PPO run predates
+2026-08-11, the day the Longest-Road-awards-no-VP rule landed. The failure that condemned it
+("the agent only builds roads") was observed while Longest Road was worth +2 VP out of 10, i.e.
+when road-spam genuinely *was* the highest-EV line. The rule change and the algorithm change are
+completely confounded.
+
+The strongest playable agent is `checkpoints/ppo-8vp-scratch/best.zip`: 89.2% vs `weighted` alone,
+**97.0%** with the placement scorer attached.
 
 ---
 
@@ -277,11 +283,12 @@ reads as tactical rather than a cure for the monoculture.
 
 ---
 
-## Open thread: END_TURN is where sampled chance nodes fail
+## The two-roll lookahead (`src/env/lookahead.py`)
 
 The hypothesis behind the waste telemetry is that the policy undervalues `END_TURN` because a kept
-hand only pays off on the far side of a dice roll. **The targeted lookahead for this is not
-implemented**, and the general search does not cover it:
+hand only pays off on the far side of a dice roll.
+
+**In MCTS this remains unfixed**, and the general search does not cover it:
 
 - PUCT spreads ~100 simulations across the whole action list, so `END_TURN` collects perhaps 10-15
   visits — used to sample an 11-outcome distribution (121 for two rolls deep). That estimate is
@@ -290,17 +297,37 @@ implemented**, and the general search does not cover it:
   under-visited children, so a branch whose few sampled rolls came up bad gets a poor Q and then
   stops being visited. The search cannot tell an unreliable estimate from a genuinely low one.
 
-**Proposed fix** (enumerate instead of sample, on this branch only): for the `END_TURN` action,
-apply dice production for the opponent's roll and then your own across all outcomes, evaluate the
-resulting states with the critic in **one batched forward**, and replace `END_TURN`'s value with
-the probability-weighted average. Cost is ~15-20 ms per `END_TURN` decision, ~65 such decisions per
-game → **~1 s/game** against ~16 s for full search. Distinct outcomes are usually well under 11
-per roll, since sums with no matching tile collapse.
+**For PPO the fix took a different shape, because a value override does not apply.** PPO picks
+actions from policy logits and its critic scores *states*, not actions — there is no per-action
+value to replace. So the lookahead is delivered as **observation features** instead
+(`--lookahead`, 614 → 642):
 
-Two approximations to settle first: the opponent's turn is more than a roll (ignoring their builds
-and robber makes the estimate systematically optimistic), and a 7 produces no resources but does
-trigger discard and robber — dropping it makes the search blind to exactly the discard risk that
-should penalise a big hand.
+| block | count |
+| --- | --- |
+| E[gain] and Var[gain] per resource, next roll | 10 |
+| **P(afford road / settlement / city / dev) after 1 roll, and after 2** | 8 |
+| P(you must discard), E[cards lost], E[hand size] after 1 and 2 rolls | 4 |
+| Opponent E[gain] per resource, and P(they must discard) | 6 |
+
+**Probabilities, not expectations, are the payload.** "Expected 0.5 wheat" could be a near-certain
+half wheat or 3 wheat one time in six, and the END_TURN question is a threshold — *will waiting let
+me afford a settlement?* — which a mean cannot answer.
+
+**Public information only.** The observation exposes 14 `P1_*` features and none break out the
+opponent's hand: only `P1_NUM_RESOURCES_IN_HAND` (a count, public in a real game) and
+`P1_NUM_DEVS_IN_HAND`. So no `P(opponent affords X)` feature exists — that would need their hand
+composition, i.e. fabricated hidden state. What is used from their side is their *production*
+(derivable from their buildings on the board) and their exact card count, which says whether a 7
+would force them to discard. **Standing rule: anything derived for the observation must be
+computable from what a human player can see** — Phase 3 puts this agent on colonist.io with only
+the public view.
+
+Cost: **114 µs per call**. The first implementation looped the 121 roll pairs and cost ~1 ms, the
+same order as an entire PPO step; vectorising the grid to `(11, 11, 5)` gave 9×.
+
+Approximations, all deliberate: the opponent acts between the two rolls and none of it is modelled
+(so the projection is optimistic about their turn); a discard is assumed to remove cards
+proportionally, where the real choice is the policy's; and the robber is read where it stands.
 
 ## Other open threads
 

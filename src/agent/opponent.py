@@ -14,6 +14,8 @@ from catanatron_gym.features import create_sample_vector, get_feature_ordering
 # call time rather than frozen at import.
 import catanatron_gym.envs.catanatron_env as cenv
 
+from src.env.lookahead import LOOKAHEAD_SIZE, lookahead_features
+
 
 class PolicyPlayer(Player):
     """A catanatron Player that acts via a frozen SB3 MaskablePPO policy."""
@@ -64,6 +66,17 @@ class PolicyPlayer(Player):
             )
         return self.policy
 
+    def _wants_lookahead(self, policy) -> bool:
+        """Whether this checkpoint was trained with the two-roll dice features.
+
+        Inferred from the policy's own observation space rather than passed in.
+        A mismatch here is silent -- the policy would read a 642-dim vector into
+        614 slots, or crash on shape -- and it is exactly the kind of flag a
+        caller forgets, so it is not offered as one.
+        """
+        expected = int(policy.observation_space.shape[0])
+        return expected == len(self._features) + LOOKAHEAD_SIZE
+
     def decide(self, game, playable_actions):
         """Choose an action via the trained policy.
 
@@ -84,7 +97,11 @@ class PolicyPlayer(Player):
         for action in playable_actions:
             mask[cenv.to_action_space(action)] = True
 
-        action_int, _ = self._ensure_policy().predict(
+        policy = self._ensure_policy()
+        if self._wants_lookahead(policy):
+            obs = np.concatenate([obs, lookahead_features(game, self.color)])
+
+        action_int, _ = policy.predict(
             obs, action_masks=mask, deterministic=self.deterministic
         )
         return cenv.from_action_space(int(action_int), playable_actions)
