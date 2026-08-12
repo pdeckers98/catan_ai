@@ -314,6 +314,75 @@ Size matches properly. At 200 games the standard error is ±3.2%; at 12 games it
 first feasibility run the in-training 6-game evals reported 83.3% and 66.7% for a checkpoint whose
 true strength was 70.8% — both were pure noise.
 
+### Waste telemetry
+
+Every match summary carries a second line measuring resource waste, from the challenger's side:
+
+```
+waste: 9.3 dev bought (0.5 dead), 0.5 trailing roads, hand 4.4 at end-turn / 4.0 at game end
+       (losses: 5.0 held, 0.7 dead dev, 1.9 trailing)
+```
+
+- **dev bought / dead** — development cards purchased over the game, and how many sat unplayed at
+  the end (VP cards excluded — those scored).
+- **trailing roads** — roads built after the player's *last* settlement or city, i.e. roads that
+  never enabled anything. Initial-placement roads are excluded. Mined from the action log in
+  `_action_log_stats` (`src/agent/arena.py`).
+- **hand at end-turn / game end** — mean resource-card count when the challenger chose `END_TURN`
+  (sampled live during play; the action log alone cannot recover it), and what it was still
+  holding when the game ended.
+- **losses: …** — the same held/dead/trailing numbers averaged over lost games only. Divergence
+  from the overall means is the tell: it shows what the agent does when its plan stalls.
+
+## Telemetry pass on ppo-8vp-scratch (2026-08-12)
+
+Motivation: the PPO agent seemed to prefer *doing something* (dev cards, roads) over ending the
+turn and holding for the right build. 200 games, `ppo-8vp-scratch/best.zip` vs
+`WeightedRandomPlayer`, seed 42:
+
+```
+177W-20L-3D (score 89.2%) | avg turns 128, VP 7.7 vs 3.7, built 1.7 settlements / 1.1 cities /
+6.2 roads, played 5.0 knights (+3.4)
+waste: 9.3 dev bought (0.5 dead), 0.5 trailing roads, hand 4.4 at end-turn / 4.0 at game end
+(losses: 5.0 held, 0.7 dead dev, 1.9 trailing)
+```
+
+Findings:
+
+- **89.2% on this seed**, well below the 95.5% the run originally reported — the "should be
+  ≥98% vs weighted-random" concern is real.
+- **Dev-card monoculture, not dead spend.** 9.3 dev cards/game (~28 resources — three cities'
+  worth) but only 0.5 unplayed: the agent cashes them (5.0 knights, plus VP/utility cards). Yet
+  it ends with only ~2.8 buildings on the board (~0.8 net beyond placement). Its ~7.7 VP ≈ 3.9
+  from buildings + 2 Largest Army + ~1.8 VP cards. The policy has collapsed onto
+  place-two-settlements → one city → pump dev cards, and never learned to expand.
+- **Losses look like "doesn't know how to wait."** Lost games end holding 5.0 cards (vs 4.0
+  overall) with 1.9 trailing roads (vs 0.5): when the dev line stalls, the agent hoards and
+  burns resources on roads that lead nowhere.
+
+## Next experiment: depth-2 expectimax over dice (planned)
+
+The hypothesis the telemetry supports: the policy undervalues `END_TURN` because the payoff of a
+kept hand only exists on the other side of a dice roll. Planned fix, inference-time first:
+
+- For each candidate action (or at minimum, `END_TURN` vs the policy's top few alternatives):
+  play it, then let the current PPO policy autoplay **both** players greedily, branching **only
+  at dice rolls**, for the next 2 rolls. Truncate each chance node to the most probable
+  outcomes, renormalize, and back up the PPO critic's leaf values probability-weighted.
+- **Include the 7** despite its cost (robber + discard sub-branching) — excluding it makes the
+  search blind to robber risk.
+- Cost target: ~12 dice branches × a short policy rollout each ≈ a few hundred forward passes
+  per decision. Do **not** enumerate deeper: 4 rolls with comparable coverage is ~100× the cost
+  with compounding truncation bias and policy drift. If depth 2 helps but is not enough, switch
+  to sampled rollouts / small-budget PUCT (`src/agent/mcts.py`), not enumerated depth 4.
+- Ship it as a new agent spec in `src/agent/arena.py:build_agent` so
+  `python -m src.eval.benchmark` can run it head-to-head against raw `ppo` — that comparison,
+  plus the never-yet-run `ppo-8vp-scratch` vs `ppo-pool/agent_final` match, decides whether the
+  idea graduates to training time.
+
+Cheap control worth running first: a handcrafted veto (e.g. cap dev buys at 5/game) on top of
+the raw policy. If a dumb constraint moves the win rate, it bounds what the search can recover.
+
 ## Cloud training
 
 Self-play generates data on the fly, so there is little to pre-upload. Checkpoints are small
