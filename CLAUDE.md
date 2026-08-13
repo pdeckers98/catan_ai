@@ -150,7 +150,7 @@ action order every process. The same seed produced five different games across f
 this landed. Set `PYTHONHASHSEED=random` to opt out, or any other value to pin a different one.
 
 Two consequences: results are now identical regardless of `--workers`, and **any measurement
-recorded before `1b6a3f2` is not reproducible** — its statistics are still valid, but the exact
+recorded before `c34ab25` is not reproducible** — its statistics are still valid, but the exact
 games cannot be recovered.
 
 ## Code Quality
