@@ -36,6 +36,10 @@ the agent and, later, the web integration.
   choice gets ~2 of ~300 gradient samples per episode, so the main policy learned "settle where
   three tiles meet" but never learned that an 8 beats a 3. The specialist trains on random
   openings labelled with actual game outcomes, using duplicate-board pairs for variance reduction.
+  Two models, used together: a per-corner scorer (`scorer_ppo.pt`) shortlists candidates, and a
+  **bundle scorer** (`bundle_noroads.pt`) ranks whole corner *pairs*, so the first settlement is
+  chosen knowing what the second could be. Pair-search beat greedy corner selection 53.5% over
+  1200 games; three attempts at improving the labels moved strength not at all.
   **No hardcoded placement knowledge**: features are mechanical board facts only, and the
   hand-written scorer in `heuristic.py` is an evaluation yardstick that never plays.
 - **Reward shaping**: none. AlphaZero trains on the sparse win/loss outcome; search provides the
@@ -70,10 +74,12 @@ src/
 ├── placement/           # opening-settlement specialist (self-trained, no heuristics)
 │   ├── features.py      # 45 mechanical per-node board facts
 │   ├── dataset.py       # random openings + duplicate-board outcome labels
-│   ├── model.py         # PlacementNet (small MLP, scores one node)
+│   ├── model.py         # PlacementNet (scores one node) + BundleNet (scores a pair)
+│   ├── chooser.py       # OpeningChooser: shortlist corners, then search pairs
 │   ├── train.py         # supervised fit on the outcome labels
 │   ├── heuristic.py     # hand-written scorer -- EVALUATION YARDSTICK ONLY
 │   ├── evaluate.py      # rank/rho diagnostics on held-out boards
+│   ├── env_wrapper.py   # gym-side equivalent; opens inside reset()
 │   └── player.py        # wraps any agent; takes over only the opening
 ├── eval/
 │   ├── benchmark.py     # any agent vs any agent
@@ -94,15 +100,35 @@ tests/         # Unit & integration tests
 **Train (Phase 2)**: `python -m src.agent.train_az --iterations 200 --games-per-iter 64 --workers 16`
 
 **Train (PPO, sparse + placement + lookahead)**: `python -m src.agent.train --total-steps 3000000
---no-shaping --placement-model checkpoints/placement/scorer.pt --lookahead --eval-games 200
+--no-shaping --placement-model checkpoints/placement/scorer_ppo.pt --lookahead --eval-games 200
 --eval-workers 8 --run-name <name>`
 
-**Train the placement scorer**: `python -m src.placement.dataset --pairs 8000 --workers 8` then
-`python -m src.placement.train --data data/placement/samples.npz`
+`src/agent/train.py` has **no `--bundle-model` flag**, so a training run opens with greedy
+per-corner selection even though pair-search is the stronger rule at eval time. `env_wrapper.py`
+and `arena.py` both accept a bundle; only the train CLI does not plumb it through.
+
+**Train the placement scorer**: generate, then fit each target off the same data:
+
+```bash
+python -m src.placement.dataset --pairs 8000 --workers 8 \
+    --rollout ppo --rollout-model checkpoints/ppo-pool-placement-lookahead/best.zip
+python -m src.placement.train --data data/placement/samples.npz \
+    --target corner --out checkpoints/placement/scorer_ppo.pt
+python -m src.placement.train --data data/placement/samples.npz \
+    --target bundle --out checkpoints/placement/bundle_noroads.pt
+```
 
 **Benchmark**: `python -m src.eval.benchmark --agent az --model checkpoints/<run>/best.pt
---opponent value --games 200` (add `--placement-model checkpoints/placement/scorer.pt` to hand
-the opening to the placement specialist)
+--opponent value --games 200`. To hand the opening to the placement specialist, pass **both**
+models — the corner scorer shortlists, the bundle scorer picks the pair:
+
+```
+--placement-model checkpoints/placement/scorer_ppo.pt \
+--bundle-model    checkpoints/placement/bundle_noroads.pt
+```
+
+`--placement-model` alone still works and falls back to greedy corner-at-a-time selection, which
+is what every measurement before `51a3097` used.
 
 **Search budget**: `python -m src.eval.bench_mcts --simulations 100`
 
@@ -131,7 +157,10 @@ See `docs/` for per-phase guides:
 ## Caveats
 
 **`checkpoints/ppo-pool-placement-lookahead/best.zip` is not a standalone agent — it must ship
-with `checkpoints/placement/scorer.pt`.** Any run trained through `PlacementWrapper` plays the
+with a placement scorer.** It was *trained* against `scorer.pt` (weighted-random labels), so that
+checkpoint is its native opening; `scorer_ppo.pt` measured as a tie and is the better default for
+new work, but swapping it in gives this agent openings it never trained under.
+Any run trained through `PlacementWrapper` plays the
 opening inside `reset()`, so those decisions never enter the rollout buffer and the policy head
 receives **zero gradient on placement**. Deprived of the scorer it places with an untrained head.
 Measured over 200 games each: 100.0% -> 88.2% vs weighted-random, and head-to-head against

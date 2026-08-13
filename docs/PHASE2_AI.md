@@ -110,7 +110,8 @@ beats brick+wood is a judgement and must be learned from outcomes.
 | `features.py` | 45 mechanical facts per node: production rate per resource, tile counts, dice-number histogram, desert count, port one-hot, first/second-settlement flag, both players' holdings, buildable production 2 and 3 edges out. No weighting between blocks. |
 | `dataset.py` | Openings explored **uniformly at random** (sampling from a scorer would bake in its preferences), played out, labelled with the actual outcome. Emits duplicate-board *pairs*. |
 | `../env/dice.py` | `fixed_dice(seed)` — a dedicated roll stream, so both games of a pair see the same dice. |
-| `model.py` | 64-wide 2-layer MLP → scalar. Normalisation stats fitted on the train split, stored as buffers so inference cannot disagree with training. |
+| `model.py` | `PlacementNet`: 64-wide 2-layer MLP → scalar, scoring one corner. `BundleNet`: same body over two concatenated corners, scoring a whole opening. Normalisation stats fitted on the train split, stored as buffers so inference cannot disagree with training. |
+| `chooser.py` | `OpeningChooser` — the selection rule. The corner scorer shortlists 12 first picks and 30 partners; the bundle scorer ranks every pairing. Reads corner width off the checkpoint to decide whether it plans roads. |
 | `heuristic.py` | Hand-written pips × diversity scorer. **Quarantined**: evaluation yardstick only, never in a decision path or in data generation. |
 | `player.py` | Intercepts initial-phase settlements only; everything else, initial roads included, goes to the inner agent. |
 | `env_wrapper.py` | The gym-side equivalent, for learners that step an env rather than acting as a `Player`. |
@@ -186,16 +187,38 @@ whose winner the model calls. Note it is ~0.88 and that is *not* impressive: ope
 random, so most comparisons are a good bundle against an obviously bad one.
 
 ```bash
-python -m src.placement.dataset --pairs 8000 --workers 8 --seed 1   # ~11 min on 8 workers
-python -m src.placement.train --data data/placement/samples.npz
+# ~11 min on 8 workers with weighted rollouts; ~72 min with --rollout ppo
+python -m src.placement.dataset --pairs 8000 --workers 8 --seed 1 \
+    --rollout ppo --rollout-model checkpoints/ppo-pool-placement-lookahead/best.zip
+python -m src.placement.train --data data/placement/samples.npz \
+    --target corner --out checkpoints/placement/scorer_ppo.pt
+python -m src.placement.train --data data/placement/samples.npz \
+    --target bundle --out checkpoints/placement/bundle_noroads.pt
 ```
+
+Both targets read the same `.npz`: `--target corner` trains on the flattened per-settlement view,
+`--target bundle` on the `bundles` array. The rank/rho diagnostic only prints for `corner` — it
+ranks single corners, so it has nothing to say about a bundle. Games are the metric there.
 
 On-disk: `pairs` (P, 4, F) — first seat's two corners then the second's, featurised at pick time in
 game A — plus `deltas` (P,), and the flattened `features`/`labels` view for `--loss mse`.
 
 **Training overfits fast** — early stopping is load-bearing, not tidiness.
 
-Attach to any agent with `--placement-model`, or `AgentSpec(placement_path=...)`.
+**The shipped configuration is both models together.** Attach with `--placement-model` *and*
+`--bundle-model`, or `AgentSpec(placement_path=..., bundle_path=...)`:
+
+```bash
+--placement-model checkpoints/placement/scorer_ppo.pt \
+--bundle-model    checkpoints/placement/bundle_noroads.pt
+```
+
+The corner scorer is not optional and not superseded — in pair-search it is the shortlister that
+makes the search affordable, and the fallback when nothing pairs. `--placement-model` alone drops
+to greedy corner-at-a-time selection, which is what every measurement before `51a3097` used.
+
+`src/agent/train.py` has no `--bundle-model` flag, so PPO runs still open greedily. Closing that
+gap is unmeasured work, not a known win: no run has trained against pair-searched openings.
 
 **For a gym-based learner**, `make_placement_env(model_path)` returns an env that plays the whole
 initial build phase **inside `reset()`** -- both seats -- so the learner's first observation is a
