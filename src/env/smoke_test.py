@@ -65,4 +65,9 @@ def main():
 
 
 if __name__ == "__main__":
+    # Pin PYTHONHASHSEED first, so a seed reproduces the game and not
+    # merely the board; this relaunches once when it is unset.
+    from src.env.determinism import ensure_hash_seed
+
+    ensure_hash_seed()
     main()

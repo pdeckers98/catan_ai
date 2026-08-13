@@ -140,6 +140,19 @@ is what every measurement before `51a3097` used.
 
 **Lint**: `flake8 src/ tests/`
 
+## Reproducibility
+
+Every entry point calls `src/env/determinism.py:ensure_hash_seed()`, which **relaunches the
+process once under `PYTHONHASHSEED=0`** when the variable is unset. Without it a seed fixes the
+board but not the game: Catanatron builds `playable_actions` off sets of enum members, and
+`enum.Enum.__hash__` hashes the member *name string*, so randomised string hashing reshuffles
+action order every process. The same seed produced five different games across five runs before
+this landed. Set `PYTHONHASHSEED=random` to opt out, or any other value to pin a different one.
+
+Two consequences: results are now identical regardless of `--workers`, and **any measurement
+recorded before `1b6a3f2` is not reproducible** — its statistics are still valid, but the exact
+games cannot be recovered.
+
 ## Code Quality
 
 This project uses **flake8** for linting (config in `.flake8`, max line length 100). Before
