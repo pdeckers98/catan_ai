@@ -32,8 +32,19 @@ a policy trained on hidden state degrades the moment it gets there.
   do with their turn. Modelling it means simulating a policy, which is the cost
   this design exists to avoid.
 - A discard is assumed to remove cards *proportionally* across resources. The
-  real choice is the policy's, and it will not be proportional.
+  real choice is the policy's, and it will not be proportional. Note this can
+  leave fractional cards, so a hand holding one wood and one brick among many
+  can read as unable to afford a road after a discard a real player would have
+  taken elsewhere. It is at its least realistic exactly at the thresholds these
+  features exist to measure.
 - Robber placement is read as it stands now; a 7 in the window would move it.
+- **The robber's steal is not modelled at all** -- neither the card you lose
+  when robbed nor the one you gain when robbing. Pricing it means predicting
+  who gets robbed, which needs the robber's next placement, which is a policy
+  decision this design exists to avoid. It is +-1 card at most 1/6 of the time.
+  Consequence worth knowing: on a 7 a hand can currently only shrink, which is
+  what ``test_a_second_roll_seven_actually_discards`` pins down. Model the
+  steal and that stops being true.
 """
 
 import numpy as np

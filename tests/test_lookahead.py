@@ -65,16 +65,39 @@ def test_probabilities_stay_in_range():
     assert 0.0 <= vector[OPP_DISCARD_P] <= 1.0
 
 
-def test_two_rolls_never_afford_less_than_one():
-    """Resources only accumulate, so the two-roll odds must dominate.
+def test_only_a_second_roll_seven_can_cost_affordability():
+    """Two rolls may dominate one by everything except the odds of a discard.
 
-    The one exception a 7 could introduce is a discard, which is why this is a
-    real assertion rather than a tautology -- it catches a discard applied to
-    the wrong branch of the roll grid.
+    An earlier form of this asserted plain dominance, on the reasoning that
+    resources only accumulate. They do not: a 7 on the *second* roll discards,
+    and that can drop a hand below a cost it could already pay. So the honest
+    bound is dominance minus P(7) -- only that one branch of the grid subtracts,
+    and it carries exactly that much probability. A discard leaking into any
+    other branch puts more mass at risk and breaks this.
     """
     for seed in (7, 11, 23, 42):
         vector = lookahead_features(_advanced_game(seed=seed), Color.BLUE)
-        assert (vector[AFFORD_2] >= vector[AFFORD_1] - 1e-6).all()
+        floor = vector[AFFORD_1] - DICE_PROBS[SEVEN] - 1e-9
+        assert (vector[AFFORD_2] >= floor).all()
+
+
+def test_a_second_roll_seven_actually_discards():
+    """The counterpart: prove the discard is applied, not merely bounded.
+
+    The bound above still passes if the second-roll discard were dropped
+    entirely, so this pins the other side with a case where it must bite. No
+    buildings means no production, so neither roll can add anything and the
+    discard is the only thing that moves the hand. 20 cards survive one halving
+    with a road still affordable (1 wood, 1 brick) and fail the second, so the
+    road odds must come out at exactly 1 - P(7)^2.
+    """
+    game = make_1v1_game(seed=7)   # untouched board: nobody has built yet
+    _set_hand(game, Color.BLUE, wood=2, brick=2, sheep=16)
+    vector = lookahead_features(game, Color.BLUE)
+
+    road = 0  # index 0 of the cost block
+    assert vector[AFFORD_1][road] == pytest.approx(1.0)
+    assert vector[AFFORD_2][road] == pytest.approx(1.0 - DICE_PROBS[SEVEN] ** 2)
 
 
 def test_already_affordable_reads_as_certain():
