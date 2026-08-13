@@ -17,6 +17,7 @@ import argparse
 import torch
 
 from src.agent.arena import AgentSpec, play_match
+from src.placement.chooser import PARTNER_RANK
 
 
 def main():
@@ -58,6 +59,14 @@ def main():
                              "it searches; the opening is then chosen as a pair.")
     parser.add_argument("--opponent-bundle-model", default=None,
                         help="Same, for the opponent.")
+    parser.add_argument("--partner-rank", type=int, default=PARTNER_RANK,
+                        help="How pessimistic the challenger's pair search is "
+                             "about its second settlement surviving the "
+                             "opponent's two picks: score each first corner by "
+                             "its Nth best partner. 1 is the plain max. Only "
+                             "affects the first seat, and needs --bundle-model.")
+    parser.add_argument("--opponent-partner-rank", type=int, default=PARTNER_RANK,
+                        help="Same, for the opponent.")
     args = parser.parse_args()
 
     challenger = AgentSpec(
@@ -65,6 +74,7 @@ def main():
         simulations=args.simulations, batch_size=args.batch_size,
         placement_path=args.placement_model,
         bundle_path=args.bundle_model,
+        partner_rank=args.partner_rank,
     )
     opponent = AgentSpec(
         kind=args.opponent, model_path=args.opponent_model,
@@ -72,6 +82,7 @@ def main():
         batch_size=args.batch_size,
         placement_path=args.opponent_placement_model,
         bundle_path=args.opponent_bundle_model,
+        partner_rank=args.opponent_partner_rank,
     )
 
     print(f"{args.agent} vs {args.opponent} over {args.games} games "

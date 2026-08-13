@@ -40,9 +40,21 @@ measured-worse road mode):
   do to each other's expansion rings rarely overlaps. Data generation uses the
   same convention, so train and play agree.
 - **The best partner may not survive.** Between the first seat's two picks the
-  opponent takes two corners, so taking the max over partners is optimistic. It
-  is exact for the second seat, whose picks are consecutive, and the chooser
-  re-searches when its intended corner or road is gone.
+  opponent takes two corners, so taking the max over partners is optimistic --
+  a first corner whose case rests on one specific partner is being overrated.
+  So the first seat scores a first corner by its ``partner_rank``-th best
+  partner rather than its best, which is a cheap stand-in for what is likely to
+  still be there. The second seat picks consecutively, nothing can be taken in
+  between, and the max is exact for it. Either way the chooser still *plans* the
+  best partner and re-searches when its intended corner or road is gone.
+
+  Measured: rank 3 beats rank 1 **1252W-1148L = 52.2%** over 2400 games, CI
+  [50.2, 54.2], p ~ 0.034. It changes the first settlement on 40.5% of boards.
+  Because only the first seat is affected, the first-seat-conditional rate is
+  about 54.4%. The choice of rank barely matters past 2: rank 2 scored 50.7%
+  and rank 5 scored 52.3%, both over 1200 games -- so some pessimism is what
+  pays, not its precise amount, and 3 is kept because two corners is what the
+  opponent actually takes.
 """
 
 import numpy as np
@@ -62,6 +74,12 @@ from src.placement.features import (
 FIRST_K = 12
 PARTNER_K = 30
 
+# Which partner stands in for "the second settlement I will actually get" when
+# scoring a first corner, for the first seat only. The opponent takes two
+# corners in between, so the top two partners are the ones most at risk and the
+# third is the first that has a fair chance of surviving.
+PARTNER_RANK = 3
+
 
 class OpeningChooser:
     """Chooses one seat's opening, across one game.
@@ -72,14 +90,17 @@ class OpeningChooser:
         bundle_model: optional :class:`~src.placement.model.BundleNet`. When
             given, the opening is chosen whole: both settlements and both roads.
         first_k / partner_k: search width; see the module docstring.
+        partner_rank: how pessimistic to be about the second settlement
+            surviving the opponent's two picks. 1 restores the plain max.
     """
 
     def __init__(self, corner_model, bundle_model=None, first_k=FIRST_K,
-                 partner_k=PARTNER_K):
+                 partner_k=PARTNER_K, partner_rank=PARTNER_RANK):
         self.corner_model = corner_model
         self.bundle_model = bundle_model
         self.first_k = first_k
         self.partner_k = partner_k
+        self.partner_rank = max(1, int(partner_rank))
         # A bundle model trained before roads joined the opening takes bare
         # settlement vectors. Read which it is off the checkpoint rather than
         # asking the caller, so an older scorer keeps working and simply leaves
@@ -149,9 +170,37 @@ class OpeningChooser:
             for edge in legal_road_edges(node)
         ]
 
+    @staticmethod
+    def _is_first_seat(game):
+        """True when this is the very first settlement of the game.
+
+        Only the first seat has its two picks separated by the opponent's, so
+        only it needs the pessimistic partner. ``buildings`` holds settlements
+        and cities, not roads, so it is empty exactly at that moment.
+        """
+        return not game.state.board.buildings
+
+    def _partner_value(self, scores, second, rank):
+        """Score a first corner by its ``rank``-th best *distinct* partner node.
+
+        Ranking is by node rather than by row because in road mode one partner
+        contributes several rows -- one per legal road -- and three roads off the
+        same corner are not three surviving partners. Falls back to the worst
+        available when fewer than ``rank`` partners exist.
+        """
+        best_per_node = {}
+        width = len(second)
+        for index, score in enumerate(scores):
+            node = second[index % width][0]
+            if score > best_per_node.get(node, -np.inf):
+                best_per_node[node] = score
+        ordered = sorted(best_per_node.values(), reverse=True)
+        return float(ordered[min(rank, len(ordered)) - 1])
+
     def _choose_first(self, game, color, nodes):
         firsts = self._shortlist(game, color, nodes, self.first_k)
         pool = self._shortlist(game, color, open_nodes(game), self.partner_k)
+        rank = self.partner_rank if self._is_first_seat(game) else 1
 
         best = (-np.inf, None)
         for first in firsts:
@@ -181,10 +230,15 @@ class OpeningChooser:
                 axis=1,
             )
             scores = self.bundle_model.score(openings)
+            # Judge the first corner pessimistically, but still plan the best
+            # pairing -- _choose_second re-searches if it has been taken, so the
+            # plan is a preference and costs nothing if it does not survive.
             top = int(np.argmax(scores))
-            if scores[top] > best[0]:
+            value = (float(scores[top]) if rank == 1
+                     else self._partner_value(scores, second, rank))
+            if value > best[0]:
                 i, j = divmod(top, len(right))
-                best = (float(scores[top]), {
+                best = (value, {
                     "first": (first, own[i][0]),
                     "first_corner": own[i][1],
                     "second": (second[j][0], second[j][1]),

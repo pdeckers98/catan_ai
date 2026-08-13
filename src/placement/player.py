@@ -13,7 +13,7 @@ and inventing a road policy here would smuggle in an extra untested change.
 from catanatron.models.enums import ActionType
 from catanatron.models.player import Player
 
-from src.placement.chooser import OpeningChooser
+from src.placement.chooser import PARTNER_RANK, OpeningChooser
 from src.placement.model import BundleNet, PlacementNet
 
 
@@ -27,14 +27,18 @@ class PlacementPlayer(Player):
         bundle_model: optional :class:`~src.placement.model.BundleNet`; when
             given, the opening is chosen as a pair of corners rather than one
             corner at a time.
+        partner_rank: forwarded to the chooser; see
+            :data:`~src.placement.chooser.PARTNER_RANK`.
     """
 
-    def __init__(self, color, inner, model, bundle_model=None):
+    def __init__(self, color, inner, model, bundle_model=None,
+                 partner_rank=PARTNER_RANK):
         super().__init__(color)
         self.inner = inner
         self.model = model
         # Per-seat: the chooser remembers this player's first pick.
-        self.chooser = OpeningChooser(model, bundle_model)
+        self.chooser = OpeningChooser(model, bundle_model,
+                                      partner_rank=partner_rank)
 
     def decide(self, game, playable_actions):
         if game.state.is_initial_build_phase:
@@ -68,7 +72,8 @@ class PlacementPlayer(Player):
         self.inner.reset_state()
 
 
-def wrap_factory(inner_factory, model_path, bundle_path=None):
+def wrap_factory(inner_factory, model_path, bundle_path=None,
+                 partner_rank=PARTNER_RANK):
     """Wrap a ``callable(Color) -> Player`` so its openings come from the scorer.
 
     Loads the checkpoints once and shares them across seats; the models are
@@ -77,4 +82,6 @@ def wrap_factory(inner_factory, model_path, bundle_path=None):
     """
     model = PlacementNet.load(model_path)
     bundle = BundleNet.load(bundle_path) if bundle_path else None
-    return lambda color: PlacementPlayer(color, inner_factory(color), model, bundle)
+    return lambda color: PlacementPlayer(
+        color, inner_factory(color), model, bundle, partner_rank=partner_rank
+    )

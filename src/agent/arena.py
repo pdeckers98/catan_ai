@@ -30,6 +30,9 @@ from src.agent.evaluator import NetEvaluator, PPOEvaluator, UniformEvaluator
 from src.agent.mcts import MCTSPlayer
 from src.agent.net import AlphaZeroNet
 from src.env.catan_env import MAX_TURNS, make_1v1_game
+# The constant only, so this stays a torch-free import; wrap_factory is still
+# imported lazily inside _with_placement.
+from src.placement.chooser import PARTNER_RANK
 
 BASELINE_BOTS = {
     "random": RandomPlayer,
@@ -353,13 +356,16 @@ class AgentSpec:
     net_blob: dict = None
     placement_path: str = None
     bundle_path: str = None
+    partner_rank: int = PARTNER_RANK
 
     @classmethod
     def from_net(cls, net, simulations: int, batch_size: int = 1,
-                 placement_path: str = None, bundle_path: str = None) -> "AgentSpec":
+                 placement_path: str = None, bundle_path: str = None,
+                 partner_rank: int = PARTNER_RANK) -> "AgentSpec":
         return cls(
             kind="az", simulations=simulations, batch_size=batch_size,
             placement_path=placement_path, bundle_path=bundle_path,
+            partner_rank=partner_rank,
             net_blob={
                 "config": net.config(),
                 "state_dict": {k: v.cpu() for k, v in net.state_dict().items()},
@@ -374,19 +380,21 @@ def build_agent_from_spec(spec: AgentSpec):
         net.load_state_dict(spec.net_blob["state_dict"])
         net.eval()
         factory = net_factory(net, spec.simulations, batch_size=spec.batch_size)
-        return _with_placement(factory, spec.placement_path, spec.bundle_path)
+        return _with_placement(factory, spec.placement_path, spec.bundle_path,
+                               spec.partner_rank)
     return build_agent(
         spec.kind, spec.model_path, spec.simulations, spec.batch_size,
-        spec.placement_path, spec.bundle_path,
+        spec.placement_path, spec.bundle_path, spec.partner_rank,
     )
 
 
-def _with_placement(factory, placement_path, bundle_path=None):
+def _with_placement(factory, placement_path, bundle_path=None,
+                    partner_rank=PARTNER_RANK):
     """Optionally hand the opening to a learned placement scorer."""
     if placement_path is None:
         return factory
     from src.placement.player import wrap_factory
-    return wrap_factory(factory, placement_path, bundle_path)
+    return wrap_factory(factory, placement_path, bundle_path, partner_rank)
 
 
 def _as_factory(agent):
@@ -395,7 +403,8 @@ def _as_factory(agent):
 
 
 def build_agent(spec: str, model_path=None, simulations: int = 100,
-                batch_size: int = 1, placement_path=None, bundle_path=None):
+                batch_size: int = 1, placement_path=None, bundle_path=None,
+                partner_rank: int = PARTNER_RANK):
     """Build an agent factory from a short name.
 
     Specs:
@@ -417,13 +426,17 @@ def build_agent(spec: str, model_path=None, simulations: int = 100,
         bundle_path: optional BundleNet checkpoint. Requires ``placement_path``,
             which shortlists the corners it searches over. Openings are then
             chosen as a pair rather than greedily one corner at a time.
+        partner_rank: how pessimistic the pair search is about the first seat's
+            second settlement surviving; see
+            :data:`~src.placement.chooser.PARTNER_RANK`. Only meaningful
+            alongside ``bundle_path``.
 
     Returns:
         callable(Color) -> Player.
     """
     return _with_placement(
         _build_core_agent(spec, model_path, simulations, batch_size),
-        placement_path, bundle_path,
+        placement_path, bundle_path, partner_rank,
     )
 
 
