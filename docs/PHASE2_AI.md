@@ -421,60 +421,18 @@ Approximations, all deliberate: the opponent acts between the two rolls and none
 (so the projection is optimistic about their turn); a discard is assumed to remove cards
 proportionally, where the real choice is the policy's; and the robber is read where it stands.
 
-## Where we stopped (2026-08-13) — pick up here
-
-Question on the table: **how to beat the 2M PPO checkpoint under the same compute budget.** Search
-at inference was measured first, because it costs no training compute.
-
-**Search is real but small.** `ppo-mcts` against the bare net, mirror match on
-`ppo-8vp-scratch/best.zip` (same checkpoint both seats, search on one side only), 400 games per
-row, all on seed 2 so the boards are shared and the trend is paired:
-
-| sims | record | score | CI | p | wall clock |
-| --- | --- | --- | --- | --- | --- |
-| 50 | 211W-189L | 52.8% | [47.9, 57.7] | 0.27 | 8 min |
-| 100 | 220W-180L | 55.0% | [50.1, 59.9] | 0.024 | 16 min |
-| 200 | 224W-176L | 56.0% | [51.1, 60.9] | 0.008 | 33 min |
-
-Monotone and significant by 200 sims, but flattening hard: 4× the budget buys +3.2 points, and the
-whole span from no-search to 200 sims is about **+6 points (~+42 Elo)**. VP margin moves with it
-(6.0-vs-6.7 at 50 sims → 6.6-vs-6.0 at 200), so it is not an artifact of close games.
-
-**Do not read Stage 0's 80% → 95% as search being worth +15 points.** That was against the
-*weighted bot* over 40 games — search fixing blunders a weak opponent punishes. The mirror match is
-the shipping question, and it answers ~+6.
-
-Consequences for the plan:
-
-- **Expert Iteration is now the weaker bet, not the stronger one.** Distillation needs search to be
-  a much better policy than the net; 56% is a thin gap to distil, and the returns curve says a
-  bigger gap costs exponentially more compute.
-- **Architecture moves up.** MaskablePPO runs a plain 2-layer MLP (`--net-arch`, default
-  `[256, 256]`) with no normalisation, while `net.py`'s 4-block residual trunk with LayerNorm
-  demonstrably learns this problem. Porting it in as a `features_extractor_class` is the best
-  remaining ratio — a 2M run is **~1 hour** on 8 envs (measured off checkpoint mtimes: 100k steps
-  per ~3 min, evals included). Note the current `[256, 256]` default is confounded with the
-  Longest-Road rule change, same as the old "PPO only builds roads" verdict.
-- **Higher ceiling, more work:** a relational encoder over nodes/tiles. A flat 614-vector makes the
-  net learn board adjacency from scratch, which is a plausible cause of the dev-card monoculture —
-  it cannot see expansion geometry, so it buys the resource-agnostic action.
-
-**Bug found, not fixed: search cannot run on the best checkpoint.**
-`ppo-pool-placement-lookahead` is lookahead-trained (642-dim obs) but the MCTS tree encodes 614, so
-the benchmark dies with `Unexpected observation shape (1, 614) ... please use (642,)`. The fix is at
-the tree's two observation sites, `mcts.py:199` and `mcts.py:267` — both already hold the live
-`Game`, which is what `lookahead_features` needs; `evaluator.py` cannot do it because it only ever
-sees vectors. Mirror `opponent.py:69:_wants_lookahead`, which sniffs the policy's observation space
-rather than taking a flag.
-
-Next two actions, in order: **replicate 200 sims on a fresh seed** (~33 min — this project has twice
-had a p≈0.05 result regress to 50% on replication, see the placement notes), then **the
-residual-trunk 2M run** (~1 hour).
-
 ## Other open threads
 
-- **Expert Iteration / warm start.** Downgraded — see the mirror-match numbers above before
-  spending on this. `AlphaZeroNet` and the PPO net share the 614-dim observation
+- **Search at inference is real but small.** Mirror match on `ppo-8vp-scratch/best.zip` (search on
+  one side only, 400 games per row, seed 2): 52.8% / 55.0% / 56.0% at 50/100/200 sims — the whole
+  span is ~+6 points (~+42 Elo) and flattening. Stage 0's 80% → 95% was against the *weighted bot*
+  and does not generalise. Unreplicated on a fresh seed.
+- **Known bug: search cannot run on a lookahead-trained checkpoint.** The MCTS tree encodes
+  614-dim observations, so a 642-dim policy dies on shape. Fix at `mcts.py:199` and `mcts.py:267`
+  (both hold the live `Game` that `lookahead_features` needs), mirroring
+  `opponent.py:_wants_lookahead`'s observation-space sniff.
+- **Expert Iteration / warm start.** Downgraded — the mirror-match numbers above say a 56% teacher
+  is a thin gap to distil. `AlphaZeroNet` and the PPO net share the 614-dim observation
   and 294-action space, so "start from PPO" means distilling PPO's masked policy and critic into a
   fresh `AlphaZeroNet` (`net.py:masked_policy_loss` + MSE), then running `train_az.py` from that
   checkpoint rather than random init.
