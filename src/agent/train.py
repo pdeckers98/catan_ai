@@ -181,6 +181,13 @@ def make_vec_env(num_envs: int, enemy=None, shaping: bool = True, enemies=None,
 
     def make_env(env_enemy):
         def _init():
+            # Runs inside the SubprocVecEnv worker. Torch defaults to one
+            # intra-op thread per core, so 8 workers each running the opponent's
+            # net (and the placement scorer) oversubscribe the CPU and stall
+            # each other; measured 576 -> 819+ steps/s total when pinned. The
+            # learner process keeps its own default thread count.
+            import torch
+            torch.set_num_threads(1)
             if placement_model is not None:
                 from src.placement.env_wrapper import make_placement_env
                 env = make_placement_env(placement_model, enemy=env_enemy)

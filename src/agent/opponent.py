@@ -45,6 +45,7 @@ class PolicyPlayer(Player):
         self.policy = policy_model
         self.model_path = str(model_path) if model_path is not None else None
         self.deterministic = deterministic
+        self._eval_mode_set = False
         # Feature ordering must match training (defaults to 4 players otherwise).
         self._features = get_feature_ordering(num_players, map_type)
 
@@ -53,6 +54,7 @@ class PolicyPlayer(Player):
         state = self.__dict__.copy()
         if self.model_path is not None:
             state["policy"] = None
+            state["_eval_mode_set"] = False
         return state
 
     def _ensure_policy(self):
@@ -64,7 +66,42 @@ class PolicyPlayer(Player):
             self.policy = MaskablePPO.load(
                 self.model_path, device="cpu", custom_objects={"n_steps": 1}
             )
+        if not self._eval_mode_set:
+            # Once, not per call: ``predict`` re-does this walk over every
+            # module on every decision, and it is pure overhead for a frozen
+            # policy (the net is Linear/Tanh only -- no dropout/batchnorm).
+            self.policy.policy.set_training_mode(False)
+            self._eval_mode_set = True
         return self.policy
+
+    def _forward(self, policy, obs, mask):
+        """Masked action from the policy, minus SB3's per-call overhead.
+
+        ``MaskablePPO.predict`` re-enters eval mode each call and constructs the
+        Categorical twice (unmasked, then re-normalised after masking) -- ~60%
+        of the opponent's inference cost, none of it the network itself. This
+        reproduces ``predict``'s outputs exactly: masked argmax when
+        deterministic, and otherwise the same probability tensor handed to
+        ``torch.multinomial`` (same values, same RNG draws) that
+        ``MaskableCategorical.sample`` would use.
+        """
+        import torch as th
+
+        pi = policy.policy
+        obs_t = th.as_tensor(obs, dtype=th.float32).unsqueeze(0)
+        with th.no_grad():
+            features = pi.extract_features(obs_t, pi.pi_features_extractor)
+            latent_pi = pi.mlp_extractor.forward_actor(features)
+            logits = pi.action_net(latent_pi)
+            masked = th.where(
+                th.as_tensor(mask), logits,
+                th.tensor(-1e8, dtype=logits.dtype),
+            )
+            if self.deterministic:
+                return int(masked.argmax())
+            normalized = masked - masked.logsumexp(dim=-1, keepdim=True)
+            probs = th.softmax(normalized, dim=-1)
+            return int(th.multinomial(probs.reshape(1, -1), 1, True).item())
 
     def _wants_lookahead(self, policy) -> bool:
         """Whether this checkpoint was trained with the two-roll dice features.
@@ -101,7 +138,5 @@ class PolicyPlayer(Player):
         if self._wants_lookahead(policy):
             obs = np.concatenate([obs, lookahead_features(game, self.color)])
 
-        action_int, _ = policy.predict(
-            obs, action_masks=mask, deterministic=self.deterministic
-        )
-        return cenv.from_action_space(int(action_int), playable_actions)
+        action_int = self._forward(policy, obs, mask)
+        return cenv.from_action_space(action_int, playable_actions)
