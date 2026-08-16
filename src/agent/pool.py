@@ -137,6 +137,12 @@ def sample_enemies(num_envs: int, checkpoint_dir, weighted_frac: float = 0.1,
     narrow and pointed straight at the win condition -- and a run that beats one
     while losing to the other has told you something a merged slice would hide.
 
+    Pool opponents are drawn *without replacement* while the pool is at least as
+    big as the slots available, so a batch covers as much of the history as it
+    can rather than spending envs on duplicates. Across intervals the draw is
+    still uniform over the whole pool -- old checkpoints are as likely as recent
+    ones, which is the fictitious-play property this module exists for.
+
     Args:
         num_envs: how many opponents to draw.
         checkpoint_dir: run directory holding the pool.
@@ -171,9 +177,19 @@ def sample_enemies(num_envs: int, checkpoint_dir, weighted_frac: float = 0.1,
 
     remaining = num_envs - len(enemies)
     if entries:
+        # Without replacement while the pool can cover the slots. Drawing
+        # independently per env is uniform over history but wastes slots on
+        # duplicates: 6 draws from an 11-entry pool average 4.8 distinct
+        # opponents, and a measured interval of ``ppo-12vp-lr`` ran 6 envs
+        # against only 4 different checkpoints. Every duplicate is a batch that
+        # sees less of the history the pool exists to preserve. Past that point
+        # the pool is smaller than the batch and duplicates are unavoidable.
+        picked = []
+        while len(picked) < remaining:
+            take = min(remaining - len(picked), len(entries))
+            picked += rng.sample(entries, take)
         enemies += [
-            make_enemy(rng.choice(entries), deterministic=deterministic)
-            for _ in range(remaining)
+            make_enemy(path, deterministic=deterministic) for path in picked
         ]
     else:
         # No pool yet -- the first interval of a from-scratch run, before any

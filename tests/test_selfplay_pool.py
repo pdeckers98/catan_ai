@@ -288,3 +288,66 @@ def test_knights_diff_is_shown_with_a_sign(tmp_path):
 
     result = MatchResult(games=4, wins=2, mean_knights=3.0, mean_opp_knights=1.0)
     assert "3.0 knights (+2.0)" in result.summary()
+
+
+def test_pool_draws_cover_distinct_checkpoints(tmp_path):
+    """Six envs and a pool of eleven should mean six *different* opponents.
+
+    Drawing independently per env is uniform but wastes slots: it averages 4.8
+    distinct of 6, so a PPO batch sees less of the history the pool exists to
+    keep.
+    """
+    from src.agent.opponent import PolicyPlayer
+
+    for step in range(200000, 2400000, 200000):
+        opponent_pool.add_to_pool(_fake_checkpoint(tmp_path, step), step, tmp_path)
+
+    enemies = opponent_pool.sample_enemies(
+        8, tmp_path, weighted_frac=0.05, greedy_frac=0.05, rng=random.Random(0)
+    )
+    policies = [e for e in enemies if isinstance(e, PolicyPlayer)]
+    assert len(policies) == 6
+    assert len({p.model_path for p in policies}) == 6
+
+
+def test_a_pool_smaller_than_the_batch_still_fills_every_env(tmp_path):
+    """Early in a run the pool cannot cover the slots; duplicates are correct."""
+    from src.agent.opponent import PolicyPlayer
+
+    for step in (1000, 2000):
+        opponent_pool.add_to_pool(_fake_checkpoint(tmp_path, step), step, tmp_path)
+
+    enemies = opponent_pool.sample_enemies(
+        8, tmp_path, weighted_frac=0.0, greedy_frac=0.0, rng=random.Random(0)
+    )
+    assert len(enemies) == 8
+    assert all(isinstance(e, PolicyPlayer) for e in enemies)
+    assert len({e.model_path for e in enemies}) == 2
+
+
+def test_draws_stay_uniform_over_the_whole_pool(tmp_path):
+    """Sampling must not drift toward recent checkpoints -- that is what makes
+    self-play cycle, and it is the failure this module was written to avoid."""
+    from collections import Counter
+    from pathlib import Path
+
+    from src.agent.opponent import PolicyPlayer
+
+    steps = list(range(200000, 2400000, 200000))
+    for step in steps:
+        opponent_pool.add_to_pool(_fake_checkpoint(tmp_path, step), step, tmp_path)
+
+    rng = random.Random(0)
+    seen = Counter()
+    for _ in range(1000):
+        enemies = opponent_pool.sample_enemies(
+            8, tmp_path, weighted_frac=0.05, greedy_frac=0.05, rng=rng
+        )
+        seen.update(Path(e.model_path).stem for e in enemies
+                    if isinstance(e, PolicyPlayer))
+
+    assert len(seen) == len(steps), "some checkpoint was never drawn"
+    total = sum(seen.values())
+    expected = 1.0 / len(steps)
+    for name, count in seen.items():
+        assert abs(count / total - expected) < 0.02, f"{name} is over/under-drawn"
