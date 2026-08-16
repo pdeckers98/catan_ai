@@ -12,8 +12,8 @@ Key facts about the underlying env (catanatron-gym 4.0.0):
   DISCARD slot into one per resource; most actions are illegal each turn, so the
   valid-action mask is mandatory for any learning agent.
 - Default observation is the 614-dim ``"vector"`` representation.
-- Games are played to ``VPS_TO_WIN`` VP with no Longest Road bonus (see
-  ``src.env.rules``).
+- Games are played to ``VPS_TO_WIN`` VP; whether Longest Road pays its +2 VP is
+  part of the per-run ruleset (see ``src.env.ruleset`` and ``src.env.rules``).
 """
 
 import random
@@ -29,21 +29,29 @@ from catanatron.models.player import RandomPlayer
 from catanatron.players.weighted_random import WeightedRandomPlayer
 
 from src.env.rules import apply_rule_patches
+from src.env.ruleset import MAX_TURNS, VPS_TO_WIN  # noqa: F401 -- re-exported
+
+# ``VPS_TO_WIN`` and ``MAX_TURNS`` are re-exported from :mod:`src.env.ruleset`,
+# where they are read from the environment so that spawned workers agree with the
+# parent. They used to be literals here; the names are unchanged so every
+# existing import still works.
+#
+# On VPS_TO_WIN: briefly 10 (the standard target) for the ppo-10vp run, then 8,
+# because the shorter game keeps the RL horizon manageable and that mattered more
+# than it looked. At 10 VP episodes ran ~250 agent steps, so with gamma=0.99 only
+# ~8% of the terminal win/loss signal survived back to the opening placement; at
+# 8 VP it is ~150 steps. Anything changing this must move ``--gamma`` in
+# src/agent/train.py with it -- see the note there.
+#
+# On MAX_TURNS: a safety net so a degenerate policy cannot stall a game forever,
+# but it has to clear honest games by a wide margin, because a truncated episode
+# pays 0 -- neither win nor loss -- and the agent cannot learn from it. Measured
+# over 30 WeightedRandom mirror games with Longest Road on: median 172 turns at 8
+# VP (mean 214, max 517) rising to a median of 417 at 15 VP (mean 424, max 1000).
+# The old cap of 300 was already truncating a meaningful share of 8-VP games and
+# would have truncated the majority at 15 VP, so the default is now 1000.
 
 ENV_ID = "catanatron-v1"
-
-# Victory points needed to win. With Longest Road disabled, VPs come from
-# settlements, cities, VP dev cards and Largest Army. Briefly 10 (the standard
-# target) for the ppo-10vp run; back to 8 because the shorter game keeps the RL
-# horizon manageable, and that turned out to matter more than it looked. At 10 VP
-# episodes ran ~250 agent steps, so with gamma=0.99 only ~8% of the terminal
-# win/loss signal survived back to the opening placement; at 8 VP it is ~150
-# steps. Anything changing this number must move ``--gamma`` in src/agent/train.py
-# with it -- see the note there.
-VPS_TO_WIN = 8
-
-# Safety net so a degenerate policy cannot stall a game forever.
-MAX_TURNS = 300
 
 # Install custom 1v1 rules (discard only on >9 cards) at import time. This module is
 # imported by every env constructor, so the patch lands in SubprocVecEnv workers too.
@@ -153,34 +161,22 @@ class TurnLimitWrapper(Wrapper):
         return self.env.reset(**kwargs)
 
 
-# Milestone VP thresholds and their one-time bonus rewards. The top milestone
-# tracks "one VP short of winning" and the other two sit at roughly 40% and 60%
-# of the way there, so all three move with VPS_TO_WIN -- hardcoding them would
-# have paid the largest bonus three VP early once the target moved to 10.
-# At 8 VP this reproduces the original {3, 5, 7}.
-_VP_MILESTONES = {
-    round(0.4 * VPS_TO_WIN): 0.1,
-    round(0.6 * VPS_TO_WIN): 0.25,
-    VPS_TO_WIN - 1: 0.5,
-}
+class EpisodeStatsWrapper(Wrapper):
+    """Record end-of-episode VP and build counts in ``info``. Reward untouched.
 
+    This used to be ``RewardShapingWrapper``, which did two unrelated jobs: it
+    paid one-time bonuses for crossing VP milestones, *and* it recorded the
+    telemetry below. The milestones are gone -- the sparse arm answered the
+    question they existed for (~92% vs weighted-random in 3M steps), and at a
+    15-VP target the thresholds would have needed retuning against a game where
+    the whole difficulty is that the reward comes only at the end. Shaping that
+    honestly is a research question, not a config change, so the crutch is
+    removed rather than left lying around half-calibrated.
 
-class RewardShapingWrapper(Wrapper):
-    """Milestone-based reward shaping on top of the sparse win/loss signal.
-
-    Only the PPO training path (``src.agent.train``) uses this. The AlphaZero path
-    (``src.agent.train_az``) trains on the sparse win/loss outcome alone, because
-    MCTS supplies the dense signal that shaping was standing in for.
-
-    One-time bonuses fire the first time the agent crosses each VP threshold in
-    ``_VP_MILESTONES``, which scales with VPS_TO_WIN: +0.10, +0.25, +0.50.
-    The base env still provides +1 on win and -1 on loss.
-
-    Two additional one-time building bonuses:
-      3rd settlement placed -> +0.05
-      1st city built        -> +0.05
-
-    On episode end, records final VPs and build counts in ``info`` for W&B.
+    The telemetry is worth keeping on its own and is now always on: build counts
+    are the sharpest read on whether the agent is actually expanding, and at 15
+    VP it *must* reach 9 VP of buildings, so ``cities_built`` and
+    ``settlements_built`` are the numbers to watch during a run.
 
     Place this OUTSIDE TurnLimitWrapper so it observes turn-limit truncations too.
     """
@@ -188,13 +184,8 @@ class RewardShapingWrapper(Wrapper):
     def __init__(self, env, agent_color=Color.BLUE):
         super().__init__(env)
         self.agent_color = agent_color
-        self._milestones_reached: set = set()
         self._settlements_built = 0
         self._prev_settlements_avail = 5
-        self._3rd_settlement_bonus_given = False
-        self._4th_settlement_bonus_given = False
-        self._1st_city_bonus_given = False
-        self._2nd_city_bonus_given = False
 
     def _actual_vp(self, color):
         state = self.env.unwrapped.game.state
@@ -218,47 +209,23 @@ class RewardShapingWrapper(Wrapper):
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        self._milestones_reached = set()
         self._settlements_built = 0
         self._prev_settlements_avail = self._settlements_available(self.agent_color)
-        self._3rd_settlement_bonus_given = False
-        self._4th_settlement_bonus_given = False
-        self._1st_city_bonus_given = False
-        self._2nd_city_bonus_given = False
         return obs, info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        vp = self._actual_vp(self.agent_color)
 
-        for threshold, bonus in _VP_MILESTONES.items():
-            if vp >= threshold and threshold not in self._milestones_reached:
-                reward += bonus
-                self._milestones_reached.add(threshold)
-
+        # Settlements are counted by watching the piece pool fall rather than
+        # read off it directly: upgrading to a city *returns* the settlement
+        # piece, so the pool alone undercounts everything ever built.
         avail = self._settlements_available(self.agent_color)
         if avail < self._prev_settlements_avail:
             self._settlements_built += self._prev_settlements_avail - avail
         self._prev_settlements_avail = avail
 
-        if self._settlements_built >= 3 and not self._3rd_settlement_bonus_given:
-            reward += 0.05
-            self._3rd_settlement_bonus_given = True
-
-        if self._settlements_built >= 4 and not self._4th_settlement_bonus_given:
-            reward += 0.05
-            self._4th_settlement_bonus_given = True
-
-        cities = self._cities_built(self.agent_color)
-        if cities >= 1 and not self._1st_city_bonus_given:
-            reward += 0.05
-            self._1st_city_bonus_given = True
-
-        if cities >= 2 and not self._2nd_city_bonus_given:
-            reward += 0.05
-            self._2nd_city_bonus_given = True
-
         if terminated or truncated:
+            vp = self._actual_vp(self.agent_color)
             opponent = next(
                 c for c in self.env.unwrapped.game.state.colors
                 if c != self.agent_color

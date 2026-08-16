@@ -1,6 +1,13 @@
 [flake8]
 max-line-length = 100
 extend-ignore = E203, W503
+# E402 (import not at top of file) is unavoidable in entry points that select the
+# ruleset: src.env.rules installs -- or skips -- the Longest Road patch at import
+# time, so src.env.ruleset.apply_cli_overrides() has to run before the engine
+# imports. See the note at the top of src/agent/train.py.
+per-file-ignores =
+    src/agent/train.py: E402
+    src/eval/benchmark.py: E402
 exclude =
     .git,
     __pycache__,

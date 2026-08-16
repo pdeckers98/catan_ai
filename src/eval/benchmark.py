@@ -14,9 +14,16 @@ Agent specs: random, weighted, value, mcts, ppo, ppo-mcts, az.
 
 import argparse
 
+# Before any engine import: src.env.rules decides at import time whether Longest
+# Road pays its VP, so the ruleset has to be selected first. See src/env/ruleset.py.
+from src.env.ruleset import apply_cli_overrides
+
+apply_cli_overrides()
+
 import torch
 
 from src.agent.arena import AgentSpec, play_match
+from src.env import ruleset
 from src.placement.chooser import PARTNER_RANK
 
 
@@ -38,6 +45,14 @@ def main():
                         help="Playouts per decision for search-backed specs.")
     parser.add_argument("--opponent-simulations", type=int, default=None,
                         help="Defaults to --simulations.")
+    parser.add_argument("--vps-to-win", type=int, default=ruleset.VPS_TO_WIN,
+                        help="Victory points to win. Must match the ruleset the "
+                             "checkpoints were trained under to mean anything.")
+    parser.add_argument("--longest-road", action=argparse.BooleanOptionalAction,
+                        default=ruleset.LONGEST_ROAD_VP,
+                        help="Award Longest Road its +2 VP.")
+    parser.add_argument("--max-turns", type=int, default=ruleset.MAX_TURNS,
+                        help="Turn cap before a game is scored as a draw.")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--progress", action="store_true")
     parser.add_argument("--workers", type=int, default=0,
@@ -68,6 +83,7 @@ def main():
     parser.add_argument("--opponent-partner-rank", type=int, default=PARTNER_RANK,
                         help="Same, for the opponent.")
     args = parser.parse_args()
+    print(f"[Rules] {ruleset.describe()}")
 
     challenger = AgentSpec(
         kind=args.agent, model_path=args.model,

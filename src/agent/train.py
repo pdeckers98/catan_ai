@@ -14,12 +14,10 @@ This module is set up to settle that, cheaply: PPO spends one network forward
 per decision against AlphaZero's ~200, so if it works at all it is worth roughly
 two orders of magnitude of compute.
 
-The re-test is two arms, differing only in ``--shaping``:
-
-- ``--no-shaping`` -- sparse win/loss only. The arm that answers whether PPO can
-  actually solve this. Run this one first.
-- ``--shaping`` -- milestone VP bonuses. A crutch tuned against the old rules;
-  useful only as a fallback if the sparse arm flatlines.
+The reward is the sparse win/loss outcome and nothing else. The milestone-bonus
+arm this module used to carry (``--shaping``) is gone: the sparse arm answered
+the question it existed as a fallback for, and its thresholds were calibrated
+against an 8-VP game.
 
 Evaluation deliberately goes through ``src.agent.arena``, the same harness the
 AlphaZero track uses, so the numbers are directly comparable to it (the feas02
@@ -31,8 +29,15 @@ out. ``--opponent pool`` is the follow-on -- frozen past checkpoints mixed with 
 slice of scripted games, rated by Elo against the run's own ladder rather than by
 a win rate that cannot exceed 100%.
 
+The ruleset (VP target, Longest Road, turn cap) is per-run and set through
+``src.env.ruleset``; see the note on ``apply_cli_overrides`` below for why it is
+read before the imports rather than from ``args``.
+
 Usage:
-    python -m src.agent.train --total-steps 2000000 --no-shaping --run-name ppo-sparse
+    python -m src.agent.train --total-steps 2000000 --run-name ppo-sparse
+    python -m src.agent.train --vps-to-win 15 --longest-road --gamma 0.999 \
+        --placement-model checkpoints/placement/scorer_ppo.pt \
+        --bundle-model checkpoints/placement/bundle_noroads.pt
     python -m src.agent.train --opponent pool --resume checkpoints/<run>/best.zip
 """
 
@@ -40,6 +45,14 @@ import argparse
 import random
 import shutil
 from pathlib import Path
+
+# MUST run before any import that reaches the engine: ``src.env.rules`` decides
+# at *import* time whether to suppress the Longest Road VP award, and the env
+# constants are read at import too. By the time argparse runs inside main() the
+# ruleset is already baked into this process -- and into every worker it spawns.
+from src.env.ruleset import apply_cli_overrides
+
+apply_cli_overrides()
 
 import numpy as np
 import wandb
@@ -62,9 +75,10 @@ from src.agent.checkpoint_manager import (
 from src.agent.elo import Ladder, elo_delta
 from src.agent import pool as opponent_pool
 from src.env.catan_env import (
-    MAX_TURNS, VPS_TO_WIN, make_1v1_env, valid_action_mask, TurnLimitWrapper,
-    RewardShapingWrapper,
+    MAX_TURNS, make_1v1_env, valid_action_mask, TurnLimitWrapper,
+    EpisodeStatsWrapper,
 )
+from src.env import ruleset
 
 
 class GameTurnCallback(BaseCallback):
@@ -141,8 +155,9 @@ class GameTurnCallback(BaseCallback):
             self._cities = [], [], [], [], [], []
 
 
-def make_vec_env(num_envs: int, enemy=None, shaping: bool = True, enemies=None,
-                 placement_model=None, lookahead: bool = False):
+def make_vec_env(num_envs: int, enemy=None, enemies=None,
+                 placement_model=None, lookahead: bool = False,
+                 bundle_model=None):
     """Create a vectorized environment with num_envs parallel games.
 
     Args:
@@ -151,13 +166,15 @@ def make_vec_env(num_envs: int, enemy=None, shaping: bool = True, enemies=None,
         enemies: one opponent per env, overriding ``enemy``. Self-play uses this
             to face a mixture within a single batch -- see
             :func:`src.agent.pool.sample_enemies`.
-        shaping: wrap in :class:`RewardShapingWrapper`. This is the re-test's
-            independent variable, so it must be switchable -- the wrapper's
-            milestone bonuses were tuned against the pre-08-11 rules and leaving
-            them permanently on would carry that confound into the answer.
         placement_model: PlacementNet checkpoint. Both seats then open with the
             scorer, inside ``reset()``, so the learner's episode starts at a
             mid-game position and contains no placement decisions at all.
+        bundle_model: BundleNet checkpoint. Openings are then chosen as a *pair*
+            of corners rather than greedily one at a time, which measured
+            53.5% over 1200 games. Without it training opens greedily while
+            ``src.eval.benchmark`` can be pointed at a bundle, so the agent
+            would be trained on one distribution of openings and graded on
+            another.
         lookahead: append the two-roll dice projection to the observation
             (614 -> 642). Must match the checkpoint at evaluation time, which
             :class:`~src.agent.opponent.PolicyPlayer` infers from the model's
@@ -167,10 +184,11 @@ def make_vec_env(num_envs: int, enemy=None, shaping: bool = True, enemies=None,
         SubprocVecEnv with num_envs workers.
 
     Note:
-        Without shaping the per-episode ``info`` fields the wrapper injects
-        (``final_vp``, ``settlements_built``, ...) are absent, so
-        :class:`GameTurnCallback` logs turns only. Build telemetry still arrives
-        from the fixed evaluation, which does not depend on the wrapper.
+        The ruleset is not an argument here. It travels to the workers through
+        the environment (:mod:`src.env.ruleset`), because ``SubprocVecEnv``
+        spawns rather than forks on Windows and re-imports every module in the
+        child -- an argument captured in this closure would not survive the
+        engine's import-time patching.
     """
     if enemies is None:
         if enemy is None:
@@ -190,7 +208,8 @@ def make_vec_env(num_envs: int, enemy=None, shaping: bool = True, enemies=None,
             torch.set_num_threads(1)
             if placement_model is not None:
                 from src.placement.env_wrapper import make_placement_env
-                env = make_placement_env(placement_model, enemy=env_enemy)
+                env = make_placement_env(placement_model, enemy=env_enemy,
+                                         bundle_path=bundle_model)
             else:
                 env = make_1v1_env(enemy=env_enemy)
             if lookahead:
@@ -199,9 +218,7 @@ def make_vec_env(num_envs: int, enemy=None, shaping: bool = True, enemies=None,
             env = TurnLimitWrapper(
                 ActionMasker(env, valid_action_mask), max_turns=MAX_TURNS
             )
-            if shaping:
-                env = RewardShapingWrapper(env)
-            return env
+            return EpisodeStatsWrapper(env)
         return _init
 
     return SubprocVecEnv([make_env(e) for e in enemies])
@@ -226,7 +243,7 @@ def sample_opponent(checkpoint_dir):
 
 def evaluate(model_path, num_games: int, workers: int = 0, seed=None,
              gauntlet_games: int = 0, gauntlet_simulations: int = 400,
-             placement_model=None) -> dict:
+             placement_model=None, bundle_model=None) -> dict:
     """Score a checkpoint against fixed yardsticks, via the shared arena.
 
     The previous version of this played against ``sample_opponent()`` -- a
@@ -247,12 +264,15 @@ def evaluate(model_path, num_games: int, workers: int = 0, seed=None,
         placement_model: PlacementNet checkpoint. Must be passed whenever
             training used one -- otherwise the run trains with good openings and
             is graded with the policy's own, which measures neither cleanly.
+        bundle_model: BundleNet checkpoint. Same argument: match training, or
+            the openings differ between the run and its own scoreboard.
 
     Returns:
         Metrics dict ready for ``wandb.log``.
     """
     challenger = AgentSpec(kind="ppo", model_path=str(model_path),
-                           placement_path=placement_model)
+                           placement_path=placement_model,
+                           bundle_path=bundle_model)
     baseline = play_match(
         challenger, AgentSpec(kind="weighted"), num_games,
         seed=seed, workers=workers,
@@ -287,7 +307,8 @@ def evaluate(model_path, num_games: int, workers: int = 0, seed=None,
 
 def evaluate_ladder(model_path, ladder: Ladder, num_games: int, workers: int = 0,
                     seed=None, promote_score: float = 0.70,
-                    promote_path=None, step: int = 0):
+                    promote_path=None, step: int = 0,
+                    placement_model=None, bundle_model=None):
     """Rate a checkpoint against the top of its own Elo ladder.
 
     Only the top anchor is played, not every anchor. A full round robin would
@@ -307,14 +328,22 @@ def evaluate_ladder(model_path, ladder: Ladder, num_games: int, workers: int = 0
         promote_path: durable path to register if promoted (a pool entry --
             ``agent_step_*`` files get pruned, and an anchor must outlive that).
         step: training step, recorded with the anchor.
+        placement_model: PlacementNet checkpoint, given to both sides.
+        bundle_model: BundleNet checkpoint, given to both sides.
 
     Returns:
         ``(rating, result, promoted)``.
     """
     anchor = ladder.top()
+    # Both sides get the opening scorer. Leaving it off is symmetric and so does
+    # not bias the score, but a checkpoint trained through PlacementWrapper has
+    # an untrained placement head -- both agents would open near-randomly and the
+    # ladder would be rating them on positions neither will ever play from.
     result = play_match(
-        AgentSpec(kind="ppo", model_path=str(model_path)),
-        AgentSpec(kind="ppo", model_path=anchor.path),
+        AgentSpec(kind="ppo", model_path=str(model_path),
+                  placement_path=placement_model, bundle_path=bundle_model),
+        AgentSpec(kind="ppo", model_path=anchor.path,
+                  placement_path=placement_model, bundle_path=bundle_model),
         num_games, seed=seed, workers=workers,
     )
     rating = anchor.elo + elo_delta(result.score, num_games)
@@ -347,17 +376,18 @@ def main():
                              "the job is refinement: the ppo-10vp run resumed at "
                              "5e-4 and drifted to 45.5%% over 500 games against its "
                              "own starting checkpoint, never once scoring above it.")
-    parser.add_argument("--gamma", type=float, default=0.995,
+    parser.add_argument("--gamma", type=float, default=0.999,
                         help="Discount factor. Must be read against episode "
-                             "length, which at VPS_TO_WIN=8 is ~150 agent steps "
-                             "(~250 at 10 VP). The SB3 default of 0.99 is a "
-                             "100-step horizon, which discounted the terminal "
-                             "win/loss -- the only reward this project gives -- "
-                             "to ~22%% by the opening placement, and ~8%% at 10 "
-                             "VP. 0.995 doubles the horizon to 200 steps so the "
-                             "opening is trained on roughly half the win signal "
-                             "rather than a tenth. Raise it if VPS_TO_WIN or "
-                             "MAX_TURNS grows.")
+                             "length: ~150 agent steps at 8 VP, and games run "
+                             "~2.4x longer at 15 VP (median 417 turns vs 172). "
+                             "The terminal win/loss is the only reward this "
+                             "project gives, so the horizon decides how much of "
+                             "it survives back to the early game. SB3's 0.99 is "
+                             "a 100-step horizon -- ~22%% reaching the opening "
+                             "at 8 VP. 0.995 was the 8-VP setting at ~50%%; it "
+                             "would deliver ~16%% at 15 VP, which is why the "
+                             "default is now 0.999 (a ~1000-step horizon). Drop "
+                             "it back to 0.995 for short-game runs.")
     parser.add_argument("--ent-coef", type=float, default=0.01,
                         help="Entropy bonus coefficient. Was 0.05, raised at the "
                              "time to fight 'collapsing to road-heavy policies' "
@@ -372,16 +402,40 @@ def main():
                              "256 wide.")
     parser.add_argument("--num-envs", type=int, default=8,
                         help="Parallel envs for rollout collection.")
-    parser.add_argument("--shaping", action=argparse.BooleanOptionalAction,
-                        default=False,
-                        help="Milestone VP reward bonuses. Defaults off: the "
-                             "sparse arm is the one that answers whether PPO can "
-                             "solve this without a hand-tuned crutch.")
+    # Ruleset flags. Declared here so --help and W&B see them, but they are read
+    # from sys.argv by apply_cli_overrides() at import time -- argparse runs far
+    # too late to affect the engine's import-time patching. Keep the names in
+    # sync with src/env/ruleset.py.
+    parser.add_argument("--vps-to-win", type=int, default=ruleset.VPS_TO_WIN,
+                        help="Victory points to win. Buildings cap at 9 VP (5 "
+                             "settlements, 4 of them upgraded), so at 12 the "
+                             "agent still needs Largest Army or Longest Road, "
+                             "and at 15 it needs VP cards as well. Raise "
+                             "--gamma with this: episodes run ~172 turns at 8 "
+                             "VP and ~417 at 15.")
+    parser.add_argument("--longest-road", action=argparse.BooleanOptionalAction,
+                        default=ruleset.LONGEST_ROAD_VP,
+                        help="Award Longest Road its +2 VP. Off historically "
+                             "because at 8 VP it was a fifth of the win "
+                             "condition and drove road-spam; on for the "
+                             "colonist.io 1v1 target ruleset.")
+    parser.add_argument("--max-turns", type=int, default=ruleset.MAX_TURNS,
+                        help="Turn cap before a game is truncated as a draw. A "
+                             "truncated episode pays 0 -- neither win nor loss "
+                             "-- so this has to clear honest games by a wide "
+                             "margin or the agent trains on unlearnable "
+                             "episodes.")
     parser.add_argument("--placement-model", default=None,
                         help="PlacementNet checkpoint. Both seats then open "
                              "with the scorer during reset(), so the episode the "
                              "learner sees contains no placement decisions and "
                              "starts from a strong opening.")
+    parser.add_argument("--bundle-model", default=None,
+                        help="BundleNet checkpoint, used with --placement-model. "
+                             "Openings are chosen as a pair of corners rather "
+                             "than greedily one at a time (53.5%% over 1200 "
+                             "games). Pass it whenever evaluation will, or the "
+                             "run trains and is graded on different openings.")
     parser.add_argument("--lookahead", action=argparse.BooleanOptionalAction,
                         default=False,
                         help="Append the two-roll dice projection to the "
@@ -423,6 +477,20 @@ def main():
                              "Step count is parsed from the filename (agent_step_XXXXXXXX).")
     args = parser.parse_args()
 
+    # The ruleset was fixed at import time by apply_cli_overrides(). If argparse
+    # disagrees with it, the pre-pass did not see these flags -- main() called in
+    # process, say -- and the run would silently train under the wrong rules
+    # while reporting the requested ones. Fail loudly instead.
+    requested = (args.vps_to_win, args.longest_road, args.max_turns)
+    active = (ruleset.VPS_TO_WIN, ruleset.LONGEST_ROAD_VP, ruleset.MAX_TURNS)
+    if requested != active:
+        raise SystemExit(
+            f"ruleset mismatch: requested {requested}, engine imported with "
+            f"{active}. src.env.ruleset.apply_cli_overrides() must run before "
+            f"any engine import; see the note at the top of this module."
+        )
+    print(f"[Rules] {ruleset.describe()}")
+
     seed = args.seed if args.seed is not None else random.randint(0, 2**31 - 1)
     random.seed(seed)
     np.random.seed(seed)
@@ -441,8 +509,9 @@ def main():
             "learning_rate": args.learning_rate,
             "gamma": args.gamma,
             "ent_coef": args.ent_coef,
-            "vps_to_win": VPS_TO_WIN,
-            "shaping": args.shaping,
+            **ruleset.as_config(),
+            "placement_model": args.placement_model,
+            "bundle_model": args.bundle_model,
             "opponent": args.opponent,
             "pool_weighted_frac": args.pool_weighted_frac,
             "pool_max": args.pool_max,
@@ -485,13 +554,15 @@ def main():
         )
         print(f"[Pool] Opponents: {opponent_pool.describe(enemies)}")
         env = make_vec_env(
-            num_envs=num_envs, enemies=enemies, shaping=args.shaping,
+            num_envs=num_envs, enemies=enemies,
             placement_model=args.placement_model, lookahead=args.lookahead,
+            bundle_model=args.bundle_model,
         )
     else:
         env = make_vec_env(
-            num_envs=num_envs, shaping=args.shaping,
+            num_envs=num_envs,
             placement_model=args.placement_model, lookahead=args.lookahead,
+            bundle_model=args.bundle_model,
         )
 
     if args.resume:
@@ -570,6 +641,7 @@ def main():
             gauntlet_games=args.gauntlet_games,
             gauntlet_simulations=args.gauntlet_simulations,
             placement_model=args.placement_model,
+            bundle_model=args.bundle_model,
         )
         score = metrics["eval/score_vs_weighted_random"]
         print(f" {baseline.summary()}")
@@ -594,7 +666,8 @@ def main():
                 latest, ladder, args.elo_games, workers=args.eval_workers,
                 seed=int(np.random.randint(2**31 - 1)),
                 promote_score=args.elo_promote, promote_path=pool_entry,
-                step=steps_done,
+                step=steps_done, placement_model=args.placement_model,
+                bundle_model=args.bundle_model,
             )
             metrics["eval/elo"] = rating
             metrics["eval/score_vs_anchor"] = ladder_result.score
@@ -624,17 +697,17 @@ def main():
                 )
                 print(f"[Pool] Opponents: {opponent_pool.describe(enemies)}")
                 new_env = make_vec_env(
-                    num_envs=num_envs, enemies=enemies, shaping=args.shaping,
+                    num_envs=num_envs, enemies=enemies,
                     placement_model=args.placement_model,
-                    lookahead=args.lookahead,
+                    lookahead=args.lookahead, bundle_model=args.bundle_model,
                 )
             else:
                 opponent = sample_opponent(checkpoint_dir)
                 print(f"[Self-play] Swapping to {opponent.__class__.__name__}")
                 new_env = make_vec_env(
-                    num_envs=num_envs, enemy=opponent, shaping=args.shaping,
+                    num_envs=num_envs, enemy=opponent,
                     placement_model=args.placement_model,
-                    lookahead=args.lookahead,
+                    lookahead=args.lookahead, bundle_model=args.bundle_model,
                 )
             model.set_env(new_env)
             # The old vector env owns ``num_envs`` live subprocesses. Rebinding

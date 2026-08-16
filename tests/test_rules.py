@@ -1,5 +1,9 @@
 """Tests for the custom 1v1 rule patches in ``src.env.rules``."""
 
+import contextlib
+import os
+from unittest import mock
+
 import numpy as np
 
 from catanatron import Color
@@ -9,6 +13,7 @@ from catanatron.state_functions import player_key
 from src.agent.encoding import action_size
 from src.env.catan_env import VPS_TO_WIN, make_1v1_game
 from src.env.rules import DISCARD_LIMIT
+from src.env import ruleset
 
 
 def test_action_space_expanded_to_one_discard_per_resource():
@@ -17,17 +22,97 @@ def test_action_space_expanded_to_one_discard_per_resource():
     assert action_size() == 294
 
 
-def test_games_are_played_to_eight_points():
-    assert VPS_TO_WIN == 8
+def test_default_victory_point_target_is_eight():
+    """The default ruleset, i.e. no CATAN_* variables set in the environment.
+
+    The target is per-run now (``--vps-to-win`` / ``CATAN_VPS_TO_WIN``), so this
+    pins the default rather than the only possible value.
+    """
+    assert VPS_TO_WIN == ruleset.VPS_TO_WIN == 8
     assert make_1v1_game().vps_to_win == 8
+
+
+def test_victory_point_target_is_configurable():
+    assert make_1v1_game(vps_to_win=15).vps_to_win == 15
+
+
+def test_ruleset_reads_flags_off_the_command_line(monkeypatch):
+    """``apply_cli_overrides`` is a pre-pass over argv, so test it as one.
+
+    It sets environment variables rather than returning values, because the
+    processes that need them are spawned later and inherit the environment.
+    Both the ``--flag value`` and ``--flag=value`` spellings must work.
+    """
+    for form in (["--vps-to-win", "15", "--longest-road"],
+                 ["--vps-to-win=15", "--longest-road"]):
+        monkeypatch.delenv("CATAN_VPS_TO_WIN", raising=False)
+        monkeypatch.delenv("CATAN_LONGEST_ROAD", raising=False)
+        ruleset.apply_cli_overrides(form)
+        assert os.environ["CATAN_VPS_TO_WIN"] == "15"
+        assert os.environ["CATAN_LONGEST_ROAD"] == "1"
+
+    ruleset.apply_cli_overrides(["--no-longest-road"])
+    assert os.environ["CATAN_LONGEST_ROAD"] == "0"
+
+
+def test_cli_overrides_rebind_the_module_constants(monkeypatch):
+    """Setting the environment is not enough -- the parent must see it too.
+
+    ``apply_cli_overrides`` is imported *from* this module, so the module's
+    constants are read one statement before the override is applied. Without a
+    re-read the new ruleset would reach spawned children (fresh interpreters,
+    fresh import) but not the parent -- and the parent is the process that
+    installs, or skips, the Longest Road patch.
+    """
+    original = (ruleset.VPS_TO_WIN, ruleset.MAX_TURNS, ruleset.LONGEST_ROAD_VP)
+    try:
+        monkeypatch.setenv("CATAN_VPS_TO_WIN", "8")
+        ruleset.apply_cli_overrides(["--vps-to-win", "15", "--longest-road"])
+        assert ruleset.VPS_TO_WIN == 15
+        assert ruleset.LONGEST_ROAD_VP is True
+        assert "15 VP" in ruleset.describe()
+        assert ruleset.as_config()["vps_to_win"] == 15
+    finally:
+        (ruleset.VPS_TO_WIN, ruleset.MAX_TURNS,
+         ruleset.LONGEST_ROAD_VP) = original
 
 
 def test_discard_limit_is_nine():
     assert make_1v1_game().state.discard_limit == DISCARD_LIMIT == 9
 
 
+def test_longest_road_patch_is_skipped_when_the_award_is_enabled():
+    """``longest_road_vp=True`` must leave stock scoring alone.
+
+    Every ``_patch_*`` is stubbed and the applied-once flag cleared, so this
+    exercises the wiring without actually re-patching catanatron -- re-running
+    the real patches inside a live test session would double-wrap
+    ``Game.__init__`` and corrupt every test after it.
+    """
+    import src.env.rules as rules_mod
+
+    applied = []
+    names = [n for n in dir(rules_mod) if n.startswith("_patch_")]
+    with mock.patch.object(rules_mod._game_mod, rules_mod._PATCH_FLAG, False,
+                           create=True):
+        with contextlib.ExitStack() as stack:
+            for name in names:
+                stack.enter_context(mock.patch.object(
+                    rules_mod, name,
+                    side_effect=lambda *a, _n=name, **k: applied.append(_n),
+                ))
+            rules_mod.apply_rule_patches(longest_road_vp=True)
+    assert "_patch_no_longest_road" not in applied
+    # The other six still go on -- only the road award is in question.
+    assert "_patch_robber_placement" in applied
+    assert "_patch_sequential_discard" in applied
+
+
 def test_longest_road_awards_no_victory_points():
-    """Building a 5-road chain must not move VPs or set HAS_ROAD."""
+    """Building a 5-road chain must not move VPs or set HAS_ROAD.
+
+    Asserts the *default* ruleset (``CATAN_LONGEST_ROAD`` unset).
+    """
     game = make_1v1_game(seed=11)
     state = game.state
     color = state.current_color()

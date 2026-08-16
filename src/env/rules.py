@@ -32,12 +32,19 @@ Seven things happen here:
    If all tiles are excluded by both rules (degenerate edge case), the filter is
    lifted so the engine always has at least one legal action.
 
-5. **Longest Road awards no victory points.** Stock Catanatron grants +2 VP to the
-   holder of the longest road. In a short 8-VP 1v1 game that single swing is close
-   to a third of the win condition and it rewards exactly the degenerate road-spam
-   behaviour we are trying to train away from. ``LONGEST_ROAD_LENGTH`` is still
-   tracked (it stays in the observation vector); only the VP award and the
-   ``HAS_ROAD`` flag are suppressed.
+5. **Longest Road awards no victory points -- optionally.** Stock Catanatron
+   grants +2 VP to the holder of the longest road. In a short 8-VP 1v1 game that
+   single swing is close to a third of the win condition and it rewards exactly
+   the degenerate road-spam behaviour we were trying to train away from, so it is
+   suppressed by default: ``LONGEST_ROAD_LENGTH`` is still tracked (it stays in
+   the observation vector), only the VP award and the ``HAS_ROAD`` flag go.
+
+   Set ``CATAN_LONGEST_ROAD=1`` (see :mod:`src.env.ruleset`) to leave stock
+   behaviour alone. The target ruleset for this project -- colonist.io 1v1 at 15
+   VP -- has Longest Road enabled, and at that target it stops being a
+   distortion: buildings cap at 9 VP (5 settlements, 4 of them upgraded), so 15
+   is unreachable without Longest Road, Largest Army *and* VP cards. The patch
+   only ever made sense for the short game.
 
 6. **A development card cannot be played on the turn it was bought.** Stock
    ``buy_dev_card`` records only that a card entered the hand, never when, so a
@@ -67,15 +74,26 @@ from catanatron.state_functions import (
     player_key, player_num_resource_cards, player_deck_subtract,
 )
 
+from src.env.ruleset import LONGEST_ROAD_VP
+
 DISCARD_LIMIT = 9
 
 _PATCH_FLAG = "_catan_rules_patched"
 
 
-def apply_rule_patches(discard_limit: int = DISCARD_LIMIT) -> None:
+def apply_rule_patches(discard_limit: int = DISCARD_LIMIT,
+                       longest_road_vp: bool = LONGEST_ROAD_VP) -> None:
     """Idempotently install the custom-rule monkeypatches.
 
     Safe to call from any module/process; only the first call takes effect.
+
+    Args:
+        discard_limit: hold more than this many cards and a 7 makes you discard.
+        longest_road_vp: leave stock Longest Road scoring (+2 VP) in place.
+            Defaults to :data:`src.env.ruleset.LONGEST_ROAD_VP`, i.e. off unless
+            ``CATAN_LONGEST_ROAD=1`` is set in the environment. Passing it
+            explicitly is for tests; a training run sets the variable, because
+            the patch has to land the same way in every spawned worker.
     """
     if getattr(_game_mod, _PATCH_FLAG, False):
         return
@@ -83,7 +101,8 @@ def apply_rule_patches(discard_limit: int = DISCARD_LIMIT) -> None:
     _patch_sequential_discard()
     _patch_state_copy()
     _patch_robber_placement()
-    _patch_no_longest_road()
+    if not longest_road_vp:
+        _patch_no_longest_road()
     _patch_dev_card_summoning_sickness()
     _patch_gym_action_space()
     setattr(_game_mod, _PATCH_FLAG, True)

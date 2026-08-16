@@ -20,7 +20,12 @@ the agent and, later, the web integration.
   **`MaskablePPO` (`src/agent/train.py`) is the active track** -- one forward per decision vs
   AlphaZero's ~200, and ~92% vs weighted-random at 3M steps vs AlphaZero's 70.8%. The old "PPO only
   builds roads" verdict predates the Longest-Road rule change and is confounded by it.
-- **Game mode**: 1v1 (`enemies=[one bot]`, `map_type="BASE"`, `vps_to_win=8`)
+- **Game mode**: 1v1 (`enemies=[one bot]`, `map_type="BASE"`). The VP target, the
+  Longest Road award and the turn cap are **per-run**, selected via `src/env/ruleset.py`
+  (`--vps-to-win` / `--longest-road` / `--max-turns`, or `CATAN_*` env vars). Defaults
+  reproduce the historical setup: 8 VP, no Longest Road. **The eventual target is the
+  colonist.io 1v1 ruleset: 15 VP with Longest Road enabled**, which nothing has trained
+  under yet.
 - **Custom rules**: `src/env/rules.py` monkeypatches Catanatron at import time. Applied
   automatically via `src/env/catan_env.py`. Seven patches:
   1. discard on a 7 only above **9** cards (`discard_limit=9`, vs. stock 7)
@@ -28,7 +33,8 @@ the agent and, later, the web integration.
      (expands the action space 290 → **294**)
   3. correct multi-discarder sequencing (fixes an upstream `> 7` hardcode)
   4. Colonist.io 1v1 robber placement restrictions
-  5. **Longest Road awards no VP** (length still tracked, `HAS_ROAD` never set)
+  5. **Longest Road awards no VP** by default (length still tracked, `HAS_ROAD` never
+     set); `--longest-road` restores stock scoring
   6. a dev card **cannot be played the turn it was bought** (one-per-turn is already
      enforced upstream)
   7. `_discard_remaining` survives `State.copy()` — required for MCTS
@@ -42,8 +48,10 @@ the agent and, later, the web integration.
   1200 games; three attempts at improving the labels moved strength not at all.
   **No hardcoded placement knowledge**: features are mechanical board facts only, and the
   hand-written scorer in `heuristic.py` is an evaluation yardstick that never plays.
-- **Reward shaping**: none. AlphaZero trains on the sparse win/loss outcome; search provides the
-  dense signal that milestone bonuses used to stand in for.
+- **Reward shaping**: none, on either track, and the machinery is gone rather than merely
+  switched off. `EpisodeStatsWrapper` keeps the end-of-episode telemetry the old
+  `RewardShapingWrapper` also carried (VPs, settlements, cities, roads) without touching
+  the reward.
 - **Action masking**: mandatory — most of the 294 actions are illegal each turn; always respect
   `info["valid_actions"]` / `env.unwrapped.get_valid_actions()`, or
   `src/agent/encoding.py:legal_action_mask` off a raw `Game`.
@@ -57,6 +65,7 @@ the agent and, later, the web integration.
 ```
 src/
 ├── env/
+│   ├── ruleset.py       # per-run rules (VP target, longest road, turn cap) via env vars
 │   ├── rules.py         # custom-rule monkeypatches (applied at import)
 │   ├── catan_env.py     # gym env + raw-Game factory, shared constants
 │   └── lookahead.py     # two-roll dice features (P(afford), discard risk)
@@ -100,12 +109,33 @@ tests/         # Unit & integration tests
 **Train (Phase 2)**: `python -m src.agent.train_az --iterations 200 --games-per-iter 64 --workers 16`
 
 **Train (PPO, sparse + placement + lookahead)**: `python -m src.agent.train --total-steps 3000000
---no-shaping --placement-model checkpoints/placement/scorer_ppo.pt --lookahead --eval-games 200
---eval-workers 8 --run-name <name>`
+--placement-model checkpoints/placement/scorer_ppo.pt --bundle-model
+checkpoints/placement/bundle_noroads.pt --lookahead --eval-games 200 --eval-workers 8
+--run-name <name>`
 
-`src/agent/train.py` has **no `--bundle-model` flag**, so a training run opens with greedy
-per-corner selection even though pair-search is the stronger rule at eval time. `env_wrapper.py`
-and `arena.py` both accept a bundle; only the train CLI does not plumb it through.
+**Train under the target ruleset** (15 VP, Longest Road on). Raise `--gamma` with the VP
+target -- games run ~2.4x longer at 15 VP than at 8 (median 417 turns vs 172, measured over
+30 WeightedRandom mirror games), and the terminal win/loss is the only reward there is:
+
+```bash
+python -m src.agent.train --vps-to-win 15 --longest-road --gamma 0.999     --total-steps 3000000 --lookahead     --placement-model checkpoints/placement/scorer_ppo.pt     --bundle-model checkpoints/placement/bundle_noroads.pt --run-name <name>
+```
+
+**How the ruleset travels.** `src/env/rules.py` decides at *import* time whether to suppress
+the Longest Road award, and `SubprocVecEnv` / arena workers are **spawned** on Windows, so
+they re-import everything from a fresh interpreter. A function argument therefore cannot
+carry the ruleset. It lives in environment variables instead (`CATAN_VPS_TO_WIN`,
+`CATAN_LONGEST_ROAD`, `CATAN_MAX_TURNS`), which children inherit for free -- the same
+mechanism `determinism.py` uses for `PYTHONHASHSEED`. Entry points call
+`ruleset.apply_cli_overrides()` as their **first statement, above the engine imports**;
+`train.py` then hard-fails if argparse disagrees with the ruleset the engine imported under,
+so a run can never quietly train under the wrong rules. This is why `.flake8` grants E402 to
+`train.py` and `benchmark.py`.
+
+**Why 15 VP is a different game.** Buildings cap at **9 VP** (5 settlements, 4 of them
+upgraded to cities). So 12 VP is unreachable without Largest Army or Longest Road, and 15 is
+unreachable without VP cards on top. Road-building stops being the pathology the old rules
+made it and becomes mandatory.
 
 **Train the placement scorer**: generate, then fit each target off the same data:
 
