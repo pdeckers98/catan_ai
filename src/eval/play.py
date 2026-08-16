@@ -1,8 +1,9 @@
 """Play a 1v1 game against the trained agent in a matplotlib window.
 
 You are RED; the trained agent is BLUE -- the side it trained on (P0). Both hands
-are shown god-mode (resources AND dev cards). Games are to 8 VP with no Longest
-Road bonus, matching training.
+are shown god-mode (resources AND dev cards). The ruleset is per-run and must
+match what the checkpoint trained under: ``--vps-to-win`` / ``--longest-road``
+(see ``src/env/ruleset.py``); the defaults are 8 VP with no Longest Road.
 
 Flow:
 - The board labels node ids, so a textual move like ``BUILD_ROAD edge (12, 13)``
@@ -12,12 +13,27 @@ Flow:
 - When you END your turn, click **Next turn** to let the AI play; review the
   result, then it's your turn again.
 
-Run: ``python -m src.eval.play --agent az --model checkpoints/<run>/best.pt``
-(also ``--agent ppo`` for a legacy MaskablePPO zip; optional ``--seed N``)
+Run the current agent the way it is meant to be deployed -- search at inference,
+opening handed to the placement specialist::
+
+    python -m src.eval.play --vps-to-win 15 --longest-road \\
+        --agent ppo-mcts --model checkpoints/archive/ppo-15vp-lr-step400000.zip \\
+        --simulations 50 \\
+        --placement-model checkpoints/placement/scorer_ppo.pt \\
+        --bundle-model    checkpoints/placement/bundle_noroads.pt
+
+(also ``--agent az`` for an AlphaZeroNet ``.pt``, ``--agent ppo`` to play a
+MaskablePPO zip directly without search; optional ``--seed N``)
 """
 
 import argparse
 import random
+
+# Before any engine import: src.env.rules decides at import time whether Longest
+# Road pays its VP, so the ruleset has to be selected first. See src/env/ruleset.py.
+from src.env.ruleset import apply_cli_overrides
+
+apply_cli_overrides()
 
 import matplotlib.pyplot as plt
 from matplotlib.widgets import TextBox, Button
@@ -28,8 +44,10 @@ from catanatron.models.enums import (
     ActionType, ActionPrompt, RESOURCES, DEVELOPMENT_CARDS,
 )
 from src.agent.arena import build_agent
+from src.env import ruleset
 from src.env.catan_env import make_1v1_game
 from src.env.render import render_board
+from src.placement.chooser import PARTNER_RANK
 
 HUMAN = Color.RED
 AI = Color.BLUE
@@ -102,14 +120,21 @@ def _hand_text(state, color, label):
 class HumanVsAI:
     """Drives a manual game loop: human (RED) vs frozen policy (BLUE)."""
 
-    def __init__(self, agent_spec, model_path, seed=None, simulations=100):
-        self.ai = build_agent(agent_spec, model_path, simulations)(AI)
+    def __init__(self, agent_spec, model_path, seed=None, simulations=100,
+                 placement_path=None, bundle_path=None,
+                 partner_rank=PARTNER_RANK):
+        self.ai = build_agent(
+            agent_spec, model_path, simulations,
+            placement_path=placement_path, bundle_path=bundle_path,
+            partner_rank=partner_rank,
+        )(AI)
         # Placeholder players: this loop drives the engine itself and never calls
         # their decide(). Seating is randomized so the human isn't always second.
         players = [RandomPlayer(AI), RandomPlayer(HUMAN)]
         if random.random() < 0.5:
             players = [RandomPlayer(HUMAN), RandomPlayer(AI)]
-        self.game = make_1v1_game(players=players, seed=seed)
+        self.game = make_1v1_game(players=players, seed=seed,
+                                  vps_to_win=ruleset.VPS_TO_WIN)
         self.mode = HUMAN_TURN
         self.message = ""
         self._build_ui()
@@ -204,7 +229,9 @@ class HumanVsAI:
         state = self.game.state
         render_board(
             self.game, ax=self.ax_board, label_nodes=True, show_info=False,
-            title=f"You are RED  |  turn {state.num_turns}",
+            title=(f"You are RED  |  turn {state.num_turns}  |  "
+                   f"first to {ruleset.VPS_TO_WIN} VP"
+                   + ("  (longest road +2)" if ruleset.LONGEST_ROAD_VP else "")),
         )
 
         self.ax_side.clear()
@@ -259,11 +286,41 @@ def main():
     parser.add_argument("--model", default=None,
                         help="Checkpoint path (.pt for az, .zip for ppo).")
     parser.add_argument("--simulations", type=int, default=100,
-                        help="MCTS playouts per move for search-backed agents.")
+                        help="MCTS playouts per move for search-backed agents. "
+                             "50 is where search saturates and keeps the wait "
+                             "between moves short.")
+    parser.add_argument("--placement-model", default=None,
+                        help="PlacementNet checkpoint that plays the AI's "
+                             "opening settlements. Every archived checkpoint "
+                             "needs one -- without it the AI opens with an "
+                             "untrained head.")
+    parser.add_argument("--bundle-model", default=None,
+                        help="BundleNet checkpoint scoring whole corner pairs. "
+                             "Requires --placement-model, which shortlists the "
+                             "corners it searches over.")
+    parser.add_argument("--partner-rank", type=int, default=PARTNER_RANK,
+                        help="Pessimism of the pair search about the first "
+                             "seat's second settlement surviving. Needs "
+                             "--bundle-model.")
+    parser.add_argument("--vps-to-win", type=int, default=ruleset.VPS_TO_WIN,
+                        help="Victory points to win. Must match the ruleset the "
+                             "checkpoint was trained under to mean anything.")
+    parser.add_argument("--longest-road", action=argparse.BooleanOptionalAction,
+                        default=ruleset.LONGEST_ROAD_VP,
+                        help="Award Longest Road its +2 VP.")
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
-    HumanVsAI(args.agent, args.model, seed=args.seed, simulations=args.simulations)
+    # argparse only re-declares the ruleset flags so --help lists them;
+    # apply_cli_overrides already put them in the environment before the engine
+    # imported. Print what actually took effect.
+    print(f"[Rules] {ruleset.describe()}")
+
+    HumanVsAI(args.agent, args.model, seed=args.seed,
+              simulations=args.simulations,
+              placement_path=args.placement_model,
+              bundle_path=args.bundle_model,
+              partner_rank=args.partner_rank)
     plt.show()
 
 
