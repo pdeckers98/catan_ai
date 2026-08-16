@@ -206,7 +206,7 @@ number, click "Next turn" to let the AI play). Give it the same ruleset, search 
 models a benchmark would, or you are not playing the agent that was measured:
 
 ```bash
-python -m src.eval.play --vps-to-win 15 --longest-road \
+python -m src.eval.play --vps-to-win 15 --longest-road --max-turns 1500 \
     --agent ppo-mcts --model checkpoints/archive/ppo-15vp-lr-step400000.zip \
     --simulations 50 \
     --placement-model checkpoints/placement/scorer_ppo.pt \
