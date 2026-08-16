@@ -191,3 +191,58 @@ def test_mcts_player_skips_search_on_forced_moves():
     only = game.state.playable_actions[:1]
 
     assert player.decide(game, only) is only[0]
+
+
+# --------------------------------------------------------------------------
+# Lookahead features across the search boundary
+# --------------------------------------------------------------------------
+def test_encode_observation_appends_the_lookahead_features():
+    from src.agent.encoding import encode_observation
+    from src.env.lookahead import LOOKAHEAD_SIZE
+
+    game = make_1v1_game(seed=3)
+    plain = encode_observation(game, Color.BLUE)
+    wide = encode_observation(game, Color.BLUE, lookahead=True)
+
+    assert len(plain) == obs_size()
+    assert len(wide) == obs_size() + LOOKAHEAD_SIZE
+    assert np.array_equal(wide[:obs_size()], plain), "base features shifted"
+
+
+def test_search_feeds_the_evaluator_the_width_it_asks_for():
+    """The search builds observations; only the evaluator knows the net's shape.
+
+    A 642-trained checkpoint used to receive 614 values here and crash -- or
+    worse, be silently misread -- because the requirement never travelled from
+    the evaluator to the encoder.
+    """
+    from src.agent.evaluator import Evaluator
+    from src.env.lookahead import LOOKAHEAD_SIZE
+
+    class WidthRecorder(Evaluator):
+        wants_lookahead = True
+
+        def __init__(self):
+            self.widths = []
+
+        def evaluate_batch(self, obs_batch, mask_batch):
+            self.widths.append(np.asarray(obs_batch).shape[-1])
+            n = np.asarray(mask_batch).shape[0]
+            return (np.ones((n, action_size()), dtype=np.float32),
+                    np.zeros(n, dtype=np.float32))
+
+    evaluator = WidthRecorder()
+    game = make_1v1_game(seed=5)
+    MCTSPlayer(Color.BLUE, evaluator, simulations=8).decide(
+        game, game.state.playable_actions
+    )
+
+    assert evaluator.widths, "evaluator was never called"
+    assert set(evaluator.widths) == {obs_size() + LOOKAHEAD_SIZE}
+
+
+def test_an_evaluator_that_does_not_want_lookahead_still_gets_the_base_width():
+    """The default must stay 614 -- AlphaZero nets are trained without it."""
+    evaluator = UniformEvaluator()
+    assert not getattr(evaluator, "wants_lookahead", False)
+    assert MCTS(evaluator, simulations=2)._lookahead is False
