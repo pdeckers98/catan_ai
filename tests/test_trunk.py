@@ -102,3 +102,21 @@ def test_ppo_builds_a_policy_whose_heads_share_the_trunk():
     # which is what lets the value loss shape the policy's features.
     assert policy.pi_features_extractor is policy.vf_features_extractor
     env.close()
+
+
+def test_the_cli_parser_builds():
+    """argparse %-formats help strings, so a literal % in one is a crash.
+
+    It crashes at add_argument time, before any flag is parsed, so it takes the
+    whole entry point down -- and no other test touches the parser. A bare
+    --help is the cheapest thing that would have caught it.
+    """
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", "src.agent.train", "--help"],
+        capture_output=True, text=True, timeout=300,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--trunk" in result.stdout

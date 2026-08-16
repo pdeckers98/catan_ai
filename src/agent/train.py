@@ -490,7 +490,7 @@ def main():
                              "Sparse reward makes the critic the only dense "
                              "signal in the run, and without a shared trunk none "
                              "of what it learns reaches the policy. Also swaps "
-                             "Tanh for LayerNorm+GELU. Costs ~24% of rollout "
+                             "Tanh for LayerNorm+GELU. Costs ~24%% of rollout "
                              "throughput at 512x512.")
     parser.add_argument("--num-envs", type=int, default=8,
                         help="Parallel envs for rollout collection.")
