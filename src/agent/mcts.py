@@ -173,6 +173,9 @@ class MCTS:
         self.batch_size = max(1, int(batch_size))
         self.virtual_loss = max(0, int(virtual_loss))
         self.num_actions = action_size()
+        # The search builds observations; only the evaluator knows what its
+        # network was trained on. Read it once here rather than per leaf.
+        self._lookahead = bool(getattr(evaluator, "wants_lookahead", False))
 
     # ---- node construction ----------------------------------------------
     def _terminal_value(self, game, to_play):
@@ -196,7 +199,8 @@ class MCTS:
         """The evaluator inputs for a live position."""
         to_play = game.state.current_color()
         actions = list(game.state.playable_actions)
-        return to_play, actions, encode_observation(game, to_play), \
+        return to_play, actions, \
+            encode_observation(game, to_play, lookahead=self._lookahead), \
             legal_action_mask(actions)
 
     def _expand(self, game, to_play, actions, priors_full, value):
@@ -264,7 +268,7 @@ class MCTS:
             for _ in range(self.simulations):
                 self._simulate(root)
 
-        obs = encode_observation(game, root.to_play)
+        obs = encode_observation(game, root.to_play, lookahead=self._lookahead)
         mask = legal_action_mask(root.actions)
 
         policy = np.zeros(self.num_actions, dtype=np.float32)

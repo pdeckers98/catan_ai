@@ -18,12 +18,18 @@ loop is the compute bottleneck.
 import numpy as np
 import torch
 
-from src.agent.encoding import action_size
+from src.agent.encoding import action_size, obs_size
 from src.agent.net import AlphaZeroNet
+from src.env.lookahead import LOOKAHEAD_SIZE
 
 
 class Evaluator:
     """Base class: implement ``evaluate_batch``; ``evaluate`` is derived."""
+
+    #: Whether this evaluator's network expects the two-roll dice features
+    #: appended to the observation. The search builds observations, not the
+    #: evaluator, so the requirement has to travel outward from here.
+    wants_lookahead = False
 
     def evaluate_batch(self, obs_batch, mask_batch):
         """Args: (B, obs_dim) float32, (B, num_actions) bool.
@@ -84,6 +90,12 @@ class PPOEvaluator(Evaluator):
         self.model = model
         self.value_scale = value_scale
         self.num_actions = action_size()
+        # Inferred from the checkpoint rather than passed in, for the same
+        # reason PolicyPlayer infers it: a caller who forgets the flag gets a
+        # shape crash at best and 614 values read into 642 slots at worst.
+        self.wants_lookahead = (
+            int(model.observation_space.shape[0]) == obs_size() + LOOKAHEAD_SIZE
+        )
 
     @classmethod
     def from_path(cls, path, value_scale: float = 1.0) -> "PPOEvaluator":

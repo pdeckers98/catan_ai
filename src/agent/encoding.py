@@ -40,12 +40,26 @@ def action_size() -> int:
     return cenv.ACTION_SPACE_SIZE
 
 
-def encode_observation(game, color, map_type: str = "BASE") -> np.ndarray:
-    """Feature vector for ``game`` from ``color``'s point of view."""
+def encode_observation(game, color, map_type: str = "BASE",
+                       lookahead: bool = False) -> np.ndarray:
+    """Feature vector for ``game`` from ``color``'s point of view.
+
+    Args:
+        game: a live ``Game``.
+        color: whose point of view.
+        map_type: board type, for the feature ordering.
+        lookahead: append the two-roll dice features. Must match how the
+            consuming network was trained -- a checkpoint trained with
+            ``--lookahead`` reads 642 values and gets 614 without this.
+    """
     features = feature_ordering(len(game.state.colors), map_type)
-    return np.asarray(
+    obs = np.asarray(
         create_sample_vector(game, color, features), dtype=np.float32
     )
+    if lookahead:
+        from src.env.lookahead import lookahead_features
+        obs = np.concatenate([obs, lookahead_features(game, color)])
+    return obs.astype(np.float32)
 
 
 def legal_action_mask(playable_actions) -> np.ndarray:
