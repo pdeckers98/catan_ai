@@ -155,6 +155,26 @@ class GameTurnCallback(BaseCallback):
             self._cities = [], [], [], [], [], []
 
 
+def _opponent_opens_with_scorer(enemy) -> bool:
+    """Whether this opponent should be handed the placement scorer.
+
+    Trained opponents: yes, and it is not optional. A checkpoint trained through
+    ``PlacementWrapper`` never received a gradient on placement, so without the
+    scorer it opens with an untrained head -- measured at 100.0% -> 88.2% vs
+    weighted-random. The learner would spend those envs beating an opponent that
+    threw the game away before move one.
+
+    Scripted bots: no. They are in the mixture as *fixed difficulty references*,
+    and a bot that plays randomly for 300 turns off a grandmaster opening is
+    neither the reference it was chosen to be nor an opponent that exists.
+    The cost is real and worth naming: on those envs the learner starts with an
+    opening edge it will not have against anything competent, so its win rate
+    there overstates it. That is why they are a small slice.
+    """
+    from src.agent.opponent import PolicyPlayer
+    return isinstance(enemy, PolicyPlayer)
+
+
 def make_vec_env(num_envs: int, enemy=None, enemies=None,
                  placement_model=None, lookahead: bool = False,
                  bundle_model=None):
@@ -166,9 +186,11 @@ def make_vec_env(num_envs: int, enemy=None, enemies=None,
         enemies: one opponent per env, overriding ``enemy``. Self-play uses this
             to face a mixture within a single batch -- see
             :func:`src.agent.pool.sample_enemies`.
-        placement_model: PlacementNet checkpoint. Both seats then open with the
-            scorer, inside ``reset()``, so the learner's episode starts at a
-            mid-game position and contains no placement decisions at all.
+        placement_model: PlacementNet checkpoint. The learner then opens with the
+            scorer, inside ``reset()``, so its episode starts at a mid-game
+            position and contains no placement decisions at all. Trained
+            *opponents* get the scorer too; the scripted bots deliberately do not
+            -- see :func:`_opponent_opens_with_scorer`.
         bundle_model: BundleNet checkpoint. Openings are then chosen as a *pair*
             of corners rather than greedily one at a time, which measured
             53.5% over 1200 games. Without it training opens greedily while
@@ -208,8 +230,10 @@ def make_vec_env(num_envs: int, enemy=None, enemies=None,
             torch.set_num_threads(1)
             if placement_model is not None:
                 from src.placement.env_wrapper import make_placement_env
-                env = make_placement_env(placement_model, enemy=env_enemy,
-                                         bundle_path=bundle_model)
+                env = make_placement_env(
+                    placement_model, enemy=env_enemy, bundle_path=bundle_model,
+                    opponent_scorer=_opponent_opens_with_scorer(env_enemy),
+                )
             else:
                 env = make_1v1_env(enemy=env_enemy)
             if lookahead:
@@ -243,7 +267,8 @@ def sample_opponent(checkpoint_dir):
 
 def evaluate(model_path, num_games: int, workers: int = 0, seed=None,
              gauntlet_games: int = 0, gauntlet_simulations: int = 400,
-             placement_model=None, bundle_model=None) -> dict:
+             placement_model=None, bundle_model=None,
+             greedy_games: int = 0) -> dict:
     """Score a checkpoint against fixed yardsticks, via the shared arena.
 
     The previous version of this played against ``sample_opponent()`` -- a
@@ -266,6 +291,10 @@ def evaluate(model_path, num_games: int, workers: int = 0, seed=None,
             is graded with the policy's own, which measures neither cleanly.
         bundle_model: BundleNet checkpoint. Same argument: match training, or
             the openings differ between the run and its own scoreboard.
+        greedy_games: games against VictoryPointPlayer; 0 skips it. Worth paying
+            for whenever greedy is in the training mixture, because the two
+            scripted bots saturate at different points -- weighted-random tops
+            out near 92% and stops discriminating long before greedy does.
 
     Returns:
         Metrics dict ready for ``wandb.log``.
@@ -294,6 +323,15 @@ def evaluate(model_path, num_games: int, workers: int = 0, seed=None,
     # the sharpest single tell: feas02 improved 2.41 -> 1.54 as it learned.
     if baseline.mean_vp > 0:
         metrics["eval/roads_per_vp"] = baseline.mean_roads / baseline.mean_vp
+
+    if greedy_games:
+        greedy = play_match(
+            challenger, AgentSpec(kind="value"), greedy_games,
+            seed=seed, workers=workers,
+        )
+        metrics["eval/score_vs_greedy"] = greedy.score
+        metrics["eval/vp_vs_greedy"] = greedy.mean_vp
+        metrics["eval/opp_vp_vs_greedy"] = greedy.mean_opp_vp
 
     if gauntlet_games:
         gauntlet = play_match(
@@ -455,6 +493,13 @@ def main():
                         help="Share of envs facing WeightedRandomPlayer under "
                              "--opponent pool. Rounded up to at least one env, so "
                              "the fixed reference never disappears entirely.")
+    parser.add_argument("--pool-greedy-frac", type=float, default=0.1,
+                        help="Share of envs facing VictoryPointPlayer (greedy) "
+                             "under --opponent pool. Kept as a slice of its own "
+                             "rather than folded into --pool-weighted-frac "
+                             "because the two fail differently: weighted-random "
+                             "is broad and weak, greedy walks straight at the "
+                             "win condition. Also rounded up to at least one env.")
     parser.add_argument("--pool-max", type=int, default=25,
                         help="Opponent pool size (~6 MB per entry).")
     parser.add_argument("--pool-deterministic", action="store_true",
@@ -467,6 +512,11 @@ def main():
     parser.add_argument("--elo-promote", type=float, default=0.70,
                         help="Score needed to become the new top anchor.")
     parser.add_argument("--eval-games", type=int, default=100)
+    parser.add_argument("--eval-greedy-games", type=int, default=0,
+                        help="Games vs VictoryPointPlayer at each eval; 0 "
+                             "disables. Pass it whenever greedy is in the "
+                             "training mixture -- weighted-random saturates "
+                             "near 92%% and stops telling you anything.")
     parser.add_argument("--eval-workers", type=int, default=0,
                         help="Processes for evaluation matches.")
     parser.add_argument("--gauntlet-games", type=int, default=0,
@@ -514,6 +564,7 @@ def main():
             "bundle_model": args.bundle_model,
             "opponent": args.opponent,
             "pool_weighted_frac": args.pool_weighted_frac,
+            "pool_greedy_frac": args.pool_greedy_frac,
             "pool_max": args.pool_max,
             "seed": seed,
         },
@@ -551,6 +602,7 @@ def main():
         enemies = opponent_pool.sample_enemies(
             num_envs, checkpoint_dir, args.pool_weighted_frac, rng,
             deterministic=args.pool_deterministic,
+            greedy_frac=args.pool_greedy_frac,
         )
         print(f"[Pool] Opponents: {opponent_pool.describe(enemies)}")
         env = make_vec_env(
@@ -642,9 +694,14 @@ def main():
             gauntlet_simulations=args.gauntlet_simulations,
             placement_model=args.placement_model,
             bundle_model=args.bundle_model,
+            greedy_games=args.eval_greedy_games,
         )
         score = metrics["eval/score_vs_weighted_random"]
         print(f" {baseline.summary()}")
+        if "eval/score_vs_greedy" in metrics:
+            print(f"[Eval] vs greedy: {metrics['eval/score_vs_greedy']:.1%} "
+                  f"(VP {metrics['eval/vp_vs_greedy']:.1f} vs "
+                  f"{metrics['eval/opp_vp_vs_greedy']:.1f})")
 
         # Grow the pool before rating, so a promoted checkpoint has a durable
         # file to point at (``agent_step_*`` entries get pruned three intervals
@@ -694,6 +751,7 @@ def main():
                 enemies = opponent_pool.sample_enemies(
                     num_envs, checkpoint_dir, args.pool_weighted_frac, rng,
                     deterministic=args.pool_deterministic,
+                    greedy_frac=args.pool_greedy_frac,
                 )
                 print(f"[Pool] Opponents: {opponent_pool.describe(enemies)}")
                 new_env = make_vec_env(

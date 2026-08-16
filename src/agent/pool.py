@@ -19,6 +19,7 @@ import shutil
 from pathlib import Path
 
 from catanatron import Color
+from catanatron.players.search import VictoryPointPlayer
 from catanatron.players.weighted_random import WeightedRandomPlayer
 
 POOL_DIRNAME = "pool"
@@ -88,34 +89,53 @@ def thin_pool(checkpoint_dir, max_size: int, protected=None) -> list[Path]:
     return removed
 
 
-def make_enemy(path=None, color=Color.RED, deterministic: bool = False):
-    """Build one opponent: a pool checkpoint, or the scripted bot if ``path`` is None.
+SCRIPTED_BOTS = {
+    "weighted": WeightedRandomPlayer,
+    "greedy": VictoryPointPlayer,
+}
+
+
+def make_enemy(path=None, color=Color.RED, deterministic: bool = False,
+               kind: str = "weighted"):
+    """Build one opponent: a pool checkpoint, or a scripted bot if ``path`` is None.
 
     Pool opponents act *stochastically* by default. A greedy opponent plays one
     fixed line per position, so the learner sees a vanishingly narrow slice of
     the game and can overfit to beating that exact line; sampling from the frozen
     policy keeps the opponent distribution wide.
+
+    Args:
+        path: pool checkpoint to load, or None for a scripted bot.
+        color: seat colour.
+        deterministic: play a pool opponent greedily.
+        kind: which scripted bot, when ``path`` is None. ``weighted`` is
+            catanatron's WeightedRandomPlayer; ``greedy`` is VictoryPointPlayer,
+            which plays the move that most immediately raises its own VP.
     """
     if path is None:
-        return WeightedRandomPlayer(color)
+        return SCRIPTED_BOTS[kind](color)
     from src.agent.opponent import PolicyPlayer
     return PolicyPlayer(color, model_path=path, deterministic=deterministic)
 
 
 def sample_enemies(num_envs: int, checkpoint_dir, weighted_frac: float = 0.1,
-                   rng=None, deterministic: bool = False) -> list:
-    """Draw one opponent per environment: a mixture of pool and scripted bot.
+                   rng=None, deterministic: bool = False,
+                   greedy_frac: float = 0.1) -> list:
+    """Draw one opponent per environment: a mixture of pool and scripted bots.
 
     The mixture is spread across environments rather than across time, so every
-    PPO update is computed from a batch containing both opponent types. Swapping
+    PPO update is computed from a batch containing every opponent type. Swapping
     the whole vector env between opponents instead would make each update see
     one opponent only, which is a noisier gradient and lets the policy drift
     toward whatever it faced most recently.
 
-    Keeping a slice of scripted games is deliberate: it is the only opponent
-    whose difficulty never moves, so it stops the run from wandering off into a
+    Keeping a slice of scripted games is deliberate: they are the only opponents
+    whose difficulty never moves, so they stop the run from wandering off into a
     private equilibrium where the agent and its ghosts co-adapt to something
-    that no longer resembles Catan.
+    that no longer resembles Catan. The two are kept as *separate* slices
+    because they fail differently -- weighted-random is broad and weak, greedy is
+    narrow and pointed straight at the win condition -- and a run that beats one
+    while losing to the other has told you something a merged slice would hide.
 
     Args:
         num_envs: how many opponents to draw.
@@ -123,28 +143,50 @@ def sample_enemies(num_envs: int, checkpoint_dir, weighted_frac: float = 0.1,
         weighted_frac: target share of envs facing WeightedRandomPlayer.
         rng: ``random.Random``, or None for the module-level RNG.
         deterministic: play pool opponents greedily.
+        greedy_frac: target share of envs facing VictoryPointPlayer.
 
     Returns:
         A list of ``num_envs`` Player instances.
     """
     rng = rng or random
     entries = list_pool(checkpoint_dir)
-    if not entries:
-        return [make_enemy(None) for _ in range(num_envs)]
 
-    # At least one scripted env whenever the fraction is non-zero: with 8 envs a
-    # 10% target rounds to 0.8, and silently dropping it would quietly remove the
-    # only fixed reference from training.
-    num_weighted = round(weighted_frac * num_envs)
-    if weighted_frac > 0:
-        num_weighted = max(1, num_weighted)
+    # At least one env per scripted bot whenever its fraction is non-zero: with 8
+    # envs a 10% target rounds to 0.8, and silently dropping it would quietly
+    # remove a fixed reference from training.
+    def slice_size(frac):
+        count = round(frac * num_envs)
+        return max(1, count) if frac > 0 else 0
+
+    num_weighted = slice_size(weighted_frac)
+    num_greedy = slice_size(greedy_frac)
+    # The pool is what gives way when the fractions over-subscribe the envs, but
+    # it cannot go below zero -- trim greedy first, then weighted, so a
+    # degenerate config still returns exactly ``num_envs`` players.
+    num_greedy = min(num_greedy, num_envs - num_weighted) if num_envs else 0
     num_weighted = min(num_weighted, num_envs)
 
-    enemies = [make_enemy(None) for _ in range(num_weighted)]
-    enemies += [
-        make_enemy(rng.choice(entries), deterministic=deterministic)
-        for _ in range(num_envs - num_weighted)
-    ]
+    enemies = [make_enemy(None, kind="weighted") for _ in range(num_weighted)]
+    enemies += [make_enemy(None, kind="greedy") for _ in range(num_greedy)]
+
+    remaining = num_envs - len(enemies)
+    if entries:
+        enemies += [
+            make_enemy(rng.choice(entries), deterministic=deterministic)
+            for _ in range(remaining)
+        ]
+    else:
+        # No pool yet -- the first interval of a from-scratch run, before any
+        # checkpoint exists. Fill with the scripted bots rather than leaving the
+        # envs unassigned, split in proportion to the two fractions so the phase
+        # is not silently all weighted-random.
+        total = weighted_frac + greedy_frac
+        share = greedy_frac / total if total else 0.0
+        extra_greedy = round(share * remaining)
+        enemies += [make_enemy(None, kind="greedy") for _ in range(extra_greedy)]
+        enemies += [make_enemy(None, kind="weighted")
+                    for _ in range(remaining - extra_greedy)]
+
     rng.shuffle(enemies)
     return enemies
 
@@ -156,5 +198,7 @@ def describe(enemies) -> str:
         Path(e.model_path).stem.split("_")[-1]
         for e in enemies if isinstance(e, PolicyPlayer)
     ]
-    scripted = len(enemies) - len(steps)
-    return f"{scripted} weighted-random + pool steps {sorted(set(steps))}"
+    weighted = sum(isinstance(e, WeightedRandomPlayer) for e in enemies)
+    greedy = sum(isinstance(e, VictoryPointPlayer) for e in enemies)
+    return (f"{weighted} weighted-random + {greedy} greedy + "
+            f"pool steps {sorted(set(steps))}")

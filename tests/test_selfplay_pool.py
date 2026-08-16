@@ -5,6 +5,7 @@ import random
 import pytest
 
 from catanatron import Color
+from catanatron.players.search import VictoryPointPlayer
 from catanatron.players.weighted_random import WeightedRandomPlayer
 
 from src.agent import pool as opponent_pool
@@ -131,44 +132,85 @@ def test_thinning_never_deletes_a_ladder_anchor(tmp_path):
     assert str(second) in survivors
 
 
-def test_empty_pool_falls_back_to_the_scripted_bot(tmp_path):
-    enemies = opponent_pool.sample_enemies(8, tmp_path, weighted_frac=0.1)
+def test_empty_pool_falls_back_to_the_scripted_bots(tmp_path):
+    """Before the first checkpoint exists there is nothing else to play.
+
+    The fallback splits the envs between the two scripted bots rather than
+    handing them all to weighted-random, or the opening interval of a
+    from-scratch run would train against a single opponent by accident.
+    """
+    enemies = opponent_pool.sample_enemies(8, tmp_path, weighted_frac=0.1,
+                                           greedy_frac=0.1)
     assert len(enemies) == 8
-    assert all(isinstance(e, WeightedRandomPlayer) for e in enemies)
+    assert all(isinstance(e, (WeightedRandomPlayer, VictoryPointPlayer))
+               for e in enemies)
+    assert sum(isinstance(e, VictoryPointPlayer) for e in enemies) == 4
 
 
-def test_mixture_keeps_one_scripted_env_when_the_fraction_rounds_to_zero(tmp_path):
-    """0.1 * 8 = 0.8 rounds to 0; the fixed reference must survive that."""
+def test_mixture_keeps_one_env_per_scripted_bot_when_the_fraction_rounds_to_zero(
+        tmp_path):
+    """0.1 * 8 = 0.8 rounds to 0; both fixed references must survive that."""
     from src.agent.opponent import PolicyPlayer
 
     for step in (1000, 2000):
         opponent_pool.add_to_pool(_fake_checkpoint(tmp_path, step), step, tmp_path)
 
     enemies = opponent_pool.sample_enemies(
-        8, tmp_path, weighted_frac=0.1, rng=random.Random(0)
+        8, tmp_path, weighted_frac=0.1, greedy_frac=0.1, rng=random.Random(0)
     )
-    scripted = [e for e in enemies if isinstance(e, WeightedRandomPlayer)]
+    weighted = [e for e in enemies if isinstance(e, WeightedRandomPlayer)]
+    greedy = [e for e in enemies if isinstance(e, VictoryPointPlayer)]
     policies = [e for e in enemies if isinstance(e, PolicyPlayer)]
-    assert len(scripted) == 1
-    assert len(policies) == 7
+    assert len(weighted) == 1
+    assert len(greedy) == 1
+    assert len(policies) == 6
     assert all(e.color == Color.RED for e in enemies)
 
 
 def test_zero_fraction_means_no_scripted_games(tmp_path):
     opponent_pool.add_to_pool(_fake_checkpoint(tmp_path, 1000), 1000, tmp_path)
     enemies = opponent_pool.sample_enemies(
-        4, tmp_path, weighted_frac=0.0, rng=random.Random(0)
+        4, tmp_path, weighted_frac=0.0, greedy_frac=0.0, rng=random.Random(0)
     )
-    assert not any(isinstance(e, WeightedRandomPlayer) for e in enemies)
+    assert not any(
+        isinstance(e, (WeightedRandomPlayer, VictoryPointPlayer)) for e in enemies
+    )
+
+
+def test_scripted_slices_never_crowd_out_the_whole_batch(tmp_path):
+    """Over-subscribed fractions must still return exactly ``num_envs``."""
+    opponent_pool.add_to_pool(_fake_checkpoint(tmp_path, 1000), 1000, tmp_path)
+    enemies = opponent_pool.sample_enemies(
+        2, tmp_path, weighted_frac=0.9, greedy_frac=0.9, rng=random.Random(0)
+    )
+    assert len(enemies) == 2
 
 
 def test_pool_opponents_are_stochastic_by_default(tmp_path):
     """A greedy opponent plays one line per position and is easy to overfit to."""
     opponent_pool.add_to_pool(_fake_checkpoint(tmp_path, 1000), 1000, tmp_path)
     enemies = opponent_pool.sample_enemies(
-        4, tmp_path, weighted_frac=0.0, rng=random.Random(0)
+        4, tmp_path, weighted_frac=0.0, greedy_frac=0.0, rng=random.Random(0)
     )
     assert all(not e.deterministic for e in enemies)
+
+
+def test_only_trained_opponents_are_given_the_placement_scorer(tmp_path):
+    """The scorer follows the opponent type, not the run configuration.
+
+    A checkpoint opponent has an untrained placement head and would throw the
+    opening away without it. A scripted bot is in the mixture as a fixed
+    difficulty reference, and is no longer that reference if it opens like a
+    specialist.
+    """
+    from src.agent.opponent import PolicyPlayer
+    from src.agent.train import _opponent_opens_with_scorer
+
+    assert not _opponent_opens_with_scorer(WeightedRandomPlayer(Color.RED))
+    assert not _opponent_opens_with_scorer(VictoryPointPlayer(Color.RED))
+    assert _opponent_opens_with_scorer(
+        PolicyPlayer(Color.RED, model_path=str(_fake_checkpoint(tmp_path, 1000)))
+    )
 
 
 def test_policy_player_pickles_by_path_not_by_weights(tmp_path):
