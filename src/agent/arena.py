@@ -47,7 +47,8 @@ class MatchResult:
     __slots__ = ("wins", "losses", "draws", "games", "mean_turns",
                  "mean_vp", "mean_opp_vp", "mean_settlements", "mean_cities",
                  "mean_roads", "mean_knights", "mean_opp_knights",
-                 "mean_dev_bought", "mean_dev_unplayed", "mean_end_hand",
+                 "mean_dev_bought", "mean_dev_unplayed", "mean_vp_from_dev",
+                 "mean_end_hand",
                  "mean_final_hand", "mean_trailing_roads",
                  "loss_final_hand", "loss_dev_unplayed", "loss_trailing_roads")
 
@@ -81,7 +82,8 @@ class MatchResult:
             f"avg turns {self.mean_turns:.0f}, VP {self.mean_vp:.1f} vs "
             f"{self.mean_opp_vp:.1f}, built {self.mean_settlements:.1f} settlements / "
             f"{self.mean_cities:.1f} cities / {self.mean_roads:.1f} roads, "
-            f"played {self.mean_knights:.1f} knights ({self.knights_diff:+.1f})\n"
+            f"played {self.mean_knights:.1f} knights ({self.knights_diff:+.1f}), "
+            f"{self.mean_vp_from_dev:.1f} VP from dev cards\n"
             f"waste: {self.mean_dev_bought:.1f} dev bought "
             f"({self.mean_dev_unplayed:.1f} dead), "
             f"{self.mean_trailing_roads:.1f} trailing roads, hand "
@@ -127,6 +129,11 @@ def _player_stats(state, color) -> dict:
         "dev_unplayed": sum(
             state.player_state[f"{key}_{card}_IN_HAND"] for card in DEAD_DEV_CARDS
         ),
+        # VP held in victory-point cards. Buildings cap at 9 VP, so above that
+        # target the remainder comes from Largest Army, Longest Road or these;
+        # separating them says which route the agent actually took.
+        "vp_from_dev": (state.player_state[f"{key}_VICTORY_POINT_IN_HAND"]
+                        + state.player_state[f"{key}_PLAYED_VICTORY_POINT"]),
     }
 
 
@@ -221,6 +228,7 @@ def _play_one_game(challenger_factory, opponent_factory, index: int, seed: int) 
         "opp_knights": theirs["knights"],
         "final_hand": mine["final_hand"],
         "dev_unplayed": mine["dev_unplayed"],
+        "vp_from_dev": mine["vp_from_dev"],
         "dev_bought": log_stats["dev_bought"],
         "trailing_roads": log_stats["trailing_roads"],
         "end_hand": float(np.mean(end_hands)) if end_hands else 0.0,
@@ -243,6 +251,7 @@ def _collect(records, num_games: int) -> MatchResult:
         mean_roads=mean("roads"), mean_knights=mean("knights"),
         mean_opp_knights=mean("opp_knights"),
         mean_dev_bought=mean("dev_bought"), mean_dev_unplayed=mean("dev_unplayed"),
+        mean_vp_from_dev=mean("vp_from_dev"),
         mean_end_hand=mean("end_hand"), mean_final_hand=mean("final_hand"),
         mean_trailing_roads=mean("trailing_roads"),
         loss_final_hand=mean("final_hand", lost),

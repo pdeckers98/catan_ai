@@ -53,6 +53,10 @@ from src.env.ruleset import MAX_TURNS, VPS_TO_WIN  # noqa: F401 -- re-exported
 
 ENV_ID = "catanatron-v1"
 
+# The five development-card types, as they appear in ``player_state`` keys.
+DEV_CARDS = ("KNIGHT", "MONOPOLY", "YEAR_OF_PLENTY", "ROAD_BUILDING",
+             "VICTORY_POINT")
+
 # Install custom 1v1 rules (discard only on >9 cards) at import time. This module is
 # imported by every env constructor, so the patch lands in SubprocVecEnv workers too.
 apply_rule_patches()
@@ -207,6 +211,36 @@ class EpisodeStatsWrapper(Wrapper):
         key = f"P{state.color_to_index[color]}"
         return 4 - state.player_state[f"{key}_CITIES_AVAILABLE"]
 
+    def _dev_bought(self, color):
+        """Development cards bought over the game, in hand and played alike.
+
+        Derived from the piece counts rather than by counting
+        BUY_DEVELOPMENT_CARD actions: a card is only ever in one of the two
+        places, so the sum is exact and costs no action-log scan. The arena
+        counts the same quantity off the log, and the two agree.
+        """
+        state = self.env.unwrapped.game.state
+        key = f"P{state.color_to_index[color]}"
+        return sum(
+            state.player_state[f"{key}_{card}_IN_HAND"]
+            + state.player_state[f"{key}_PLAYED_{card}"]
+            for card in DEV_CARDS
+        )
+
+    def _vp_from_dev(self, color):
+        """VP the agent holds in victory-point cards.
+
+        The split that ``final_vp`` alone hides. Buildings cap at 9 VP, so at a
+        12- or 15-VP target the rest has to come from Largest Army, Longest Road
+        or these; this is the only one of the three that is pure card luck
+        bought with ore and sheep, and a run drifting into a dev-card monoculture
+        shows up here first.
+        """
+        state = self.env.unwrapped.game.state
+        key = f"P{state.color_to_index[color]}"
+        return (state.player_state[f"{key}_VICTORY_POINT_IN_HAND"]
+                + state.player_state[f"{key}_PLAYED_VICTORY_POINT"])
+
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self._settlements_built = 0
@@ -235,6 +269,8 @@ class EpisodeStatsWrapper(Wrapper):
             info["settlements_built"] = self._settlements_built
             info["roads_built"] = self._roads_built(self.agent_color)
             info["cities_built"] = self._cities_built(self.agent_color)
+            info["dev_bought"] = self._dev_bought(self.agent_color)
+            info["vp_from_dev"] = self._vp_from_dev(self.agent_color)
         return obs, reward, terminated, truncated, info
 
 

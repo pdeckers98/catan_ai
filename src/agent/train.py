@@ -55,6 +55,7 @@ from src.env.ruleset import apply_cli_overrides
 apply_cli_overrides()
 
 import numpy as np
+import torch.nn as nn
 import wandb
 from wandb.integration.sb3 import WandbCallback
 from sb3_contrib import MaskablePPO
@@ -98,6 +99,8 @@ class GameTurnCallback(BaseCallback):
         self._settlements: list[int] = []
         self._roads: list[int] = []
         self._cities: list[int] = []
+        self._dev_bought: list[int] = []
+        self._vp_from_dev: list[int] = []
 
     def _on_step(self) -> bool:
         for info in self.locals.get("infos", []):
@@ -113,6 +116,10 @@ class GameTurnCallback(BaseCallback):
                 self._roads.append(info["roads_built"])
             if "cities_built" in info:
                 self._cities.append(info["cities_built"])
+            if "dev_bought" in info:
+                self._dev_bought.append(info["dev_bought"])
+            if "vp_from_dev" in info:
+                self._vp_from_dev.append(info["vp_from_dev"])
         return True
 
     def _on_rollout_end(self) -> None:
@@ -145,6 +152,14 @@ class GameTurnCallback(BaseCallback):
             mean_cities = float(np.mean(self._cities))
             self.logger.record("rollout/mean_cities_built", mean_cities)
             log["train/mean_cities_built"] = mean_cities
+        if self._dev_bought:
+            mean_dev = float(np.mean(self._dev_bought))
+            self.logger.record("rollout/mean_dev_bought", mean_dev)
+            log["train/mean_dev_bought"] = mean_dev
+        if self._vp_from_dev:
+            mean_dev_vp = float(np.mean(self._vp_from_dev))
+            self.logger.record("rollout/mean_vp_from_dev", mean_dev_vp)
+            log["train/mean_vp_from_dev"] = mean_dev_vp
         if self.model is not None:
             lr = self.model.lr_schedule(self.model._current_progress_remaining)
             self.logger.record("train/learning_rate", lr)
@@ -152,7 +167,33 @@ class GameTurnCallback(BaseCallback):
         if wandb.run is not None:
             wandb.log(log)
         self._turns, self._vps, self._opp_vps, self._settlements, self._roads, \
-            self._cities = [], [], [], [], [], []
+            self._cities, self._dev_bought, self._vp_from_dev = (
+                [], [], [], [], [], [], [], [])
+
+
+def _policy_kwargs(args) -> dict:
+    """Assemble ``policy_kwargs``, with or without the shared trunk.
+
+    Without --trunk this is exactly what the run always used, so the flag is
+    additive and an unflagged command is bit-for-bit the old configuration.
+
+    With it, ``net_arch`` stops meaning "the towers" and starts meaning "the
+    heads on top of the trunk" -- SB3 applies ``net_arch`` *after* the features
+    extractor. Passing the default [256, 256] alongside a trunk therefore builds
+    something deeper than intended rather than something wrong, which is easy to
+    do by accident, so it is worth being deliberate about the head sizes.
+    """
+    if not args.trunk:
+        return {"net_arch": args.net_arch}
+    from src.agent.trunk import SharedTrunk
+    return {
+        "net_arch": args.net_arch,
+        "features_extractor_class": SharedTrunk,
+        "features_extractor_kwargs": {"hidden_sizes": tuple(args.trunk)},
+        # The trunk normalises and uses GELU; leaving the heads on Tanh would
+        # reintroduce the saturation the trunk exists to avoid.
+        "activation_fn": nn.GELU,
+    }
 
 
 def _opponent_opens_with_scorer(enemy) -> bool:
@@ -318,6 +359,8 @@ def evaluate(model_path, num_games: int, workers: int = 0, seed=None,
         "eval/knights_played": baseline.mean_knights,
         "eval/opp_knights_played": baseline.mean_opp_knights,
         "eval/knights_diff": baseline.knights_diff,
+        "eval/dev_bought": baseline.mean_dev_bought,
+        "eval/vp_from_dev": baseline.mean_vp_from_dev,
     }
     # The failure mode this whole re-test is about. Roads per victory point is
     # the sharpest single tell: feas02 improved 2.41 -> 1.54 as it learned.
@@ -437,7 +480,18 @@ def main():
                              "small for a 614-dim observation and 294 actions and "
                              "is a plausible independent cause of the original "
                              "failure; the AlphaZero net that does learn here is "
-                             "256 wide.")
+                             "256 wide. With --trunk these are the *head* sizes "
+                             "on top of the shared trunk, so pass something "
+                             "thinner (e.g. 256).")
+    parser.add_argument("--trunk", type=int, nargs="+", default=None,
+                        help="Share a trunk of these widths between the policy "
+                             "and value heads (e.g. --trunk 512 512). Off by "
+                             "default, which is SB3's two independent towers. "
+                             "Sparse reward makes the critic the only dense "
+                             "signal in the run, and without a shared trunk none "
+                             "of what it learns reaches the policy. Also swaps "
+                             "Tanh for LayerNorm+GELU. Costs ~24% of rollout "
+                             "throughput at 512x512.")
     parser.add_argument("--num-envs", type=int, default=8,
                         help="Parallel envs for rollout collection.")
     # Ruleset flags. Declared here so --help and W&B see them, but they are read
@@ -553,6 +607,7 @@ def main():
             "model": "MaskablePPO",
             "policy": "MlpPolicy",
             "net_arch": args.net_arch,
+            "trunk": args.trunk,
             "num_envs": args.num_envs,
             "n_steps": args.n_steps,
             "batch_size": args.batch_size,
@@ -619,6 +674,20 @@ def main():
 
     if args.resume:
         model = MaskablePPO.load(str(resume_path), env=env, device="cpu")
+        # Architecture is baked into the weights, so --trunk cannot be applied to
+        # a checkpoint that was not trained with it (or dropped from one that
+        # was). ``load`` would silently keep the saved architecture and the run
+        # would report a configuration it is not using -- the same failure the
+        # ruleset check above exists to prevent.
+        from src.agent.trunk import SharedTrunk
+        loaded_trunk = isinstance(model.policy.features_extractor, SharedTrunk)
+        if loaded_trunk != bool(args.trunk):
+            raise SystemExit(
+                f"--trunk mismatch: {resume_path.name} was trained "
+                f"{'with' if loaded_trunk else 'without'} a shared trunk, but "
+                f"--trunk was {'given' if args.trunk else 'omitted'}. "
+                f"Architecture cannot change on a resume; start a new run."
+            )
         # ``load`` restores the *saved* hyperparameters, so --learning-rate and
         # --gamma would be silently ignored on every resumed run. Rebind the lr
         # in both places: SB3 reads ``lr_schedule`` each update, but
@@ -645,7 +714,7 @@ def main():
             n_steps=args.n_steps,
             batch_size=args.batch_size,
             ent_coef=args.ent_coef,
-            policy_kwargs={"net_arch": args.net_arch},
+            policy_kwargs=_policy_kwargs(args),
             verbose=1,
             device="cpu",
         )
