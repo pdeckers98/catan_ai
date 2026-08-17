@@ -107,7 +107,10 @@ src/
 ├── eval/
 │   ├── benchmark.py     # any agent vs any agent
 │   └── play.py          # human vs AI (matplotlib)
-└── bridge/              # (Phase 3) colonist.io WebSocket reader + Playwright clicker
+└── bridge/              # (Phase 3) colonist.io bridge, one Playwright session for read+click
+    ├── board.py         # exact board reconstruction (BoardSpec -> CatanMap)
+    ├── replay.py        # GameReplay: a Game advanced by observed actions; DesyncError
+    └── player.py        # the deployed agent, all three artifacts or nothing
 docs/          # Per-phase guides (see below)
 checkpoints/   # Saved models (git-ignored)
 tests/         # Unit & integration tests

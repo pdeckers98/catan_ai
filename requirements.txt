@@ -8,8 +8,8 @@ gymnasium==0.29.1   # pinned by catanatron-gym 4.0.0; SB3 2.9 works with it
 
 # Deep RL (PyTorch under the hood)
 torch>=2.12
-# Needed only to LOAD the retained ppo-8vp-scratch benchmark checkpoint (the
-# `ppo` / `ppo-mcts` agent specs). The PPO training loop itself was removed.
+# MaskablePPO (sb3-contrib) is the project's only trainer, src/agent/train.py,
+# and also loads the shipped checkpoints for the `ppo` / `ppo-mcts` agent specs.
 stable-baselines3==2.9.0
 sb3-contrib==2.9.0
 
@@ -18,5 +18,7 @@ flake8
 pytest
 wandb
 
-# Phase 3 (colonist.io bridge) — uncomment when reaching Phase 3
-# playwright
+# Phase 3 (colonist.io bridge). Drives the browser AND reads the game's
+# WebSocket frames over CDP, so it is the whole transport, not just the clicker.
+# After installing: playwright install chromium
+playwright

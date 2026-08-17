@@ -214,6 +214,39 @@ def test_sequential_discard_drops_exactly_half_the_hand():
     assert total_after == 6
 
 
+def test_every_discard_lands_in_the_action_log():
+    """The patched discard has to log itself; upstream's ``apply_action`` did.
+
+    The log is the record a game is reconstructed from -- the colonist.io bridge
+    replays live positions off exactly this list. Discards that mutate five cards
+    out of a hand without leaving a trace desync any replay the moment a 7 lands,
+    and they do it silently.
+    """
+    game = make_1v1_game(seed=5)
+    state = game.state
+    while state.is_initial_build_phase:
+        game.execute(state.playable_actions[0], validate_action=False)
+
+    color = state.current_color()
+    key = player_key(state, color)
+    for resource in ("WOOD", "BRICK", "SHEEP", "WHEAT"):
+        state.player_state[f"{key}_{resource}_IN_HAND"] = 3
+
+    game.execute(Action(color, ActionType.ROLL, (3, 4)), validate_action=False)
+    logged_before = len(state.actions)
+
+    discarded = []
+    while state.is_discarding:
+        action = state.playable_actions[0]
+        discarded.append(action.value)
+        game.execute(action, validate_action=False)
+
+    new = state.actions[logged_before:]
+    assert [a.action_type for a in new] == [ActionType.DISCARD] * len(discarded)
+    assert [a.value for a in new] == discarded
+    assert all(a.color == color for a in new)
+
+
 def test_robber_cannot_camp_opponent_before_third_settlement():
     """Colonist.io 1v1 restriction: no robbing a freshly-set-up opponent."""
     from catanatron.models.actions import robber_possibilities

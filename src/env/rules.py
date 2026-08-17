@@ -191,6 +191,16 @@ def _apply_single_discard(state, action):
         _advance_after_discarder(state, color)
 
     state.playable_actions = _state_mod.generate_playable_actions(state)
+
+    # Upstream ``apply_action`` logs every action on its way out; this patch
+    # replaces that function for DISCARD and has to do the same, or a game's
+    # action log silently omits its discards. That log is the record the
+    # colonist.io bridge replays a live position from (src/bridge/replay.py),
+    # and a replay missing five discarded cards desyncs the moment a 7 lands.
+    # The *resolved* resource is logged, not the possibly-None value asked for,
+    # matching how the engine rewrites ROLL and MOVE_ROBBER with their outcomes.
+    action = Action(color, ActionType.DISCARD, resource)
+    state.actions.append(action)
     return action
 
 
