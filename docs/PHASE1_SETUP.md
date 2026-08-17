@@ -39,11 +39,13 @@
   expands the single `(DISCARD, None)` slot into one per resource, so everything downstream sees
   **`Discrete(294)`**.
 - **Observation:** default `"vector"` representation → flat `Box` of shape **(614,)**
-  (alternative `"mixed"` gives a board tensor + numeric dict).
+  (alternative `"mixed"` gives a board tensor + numeric dict). With `--lookahead` the project
+  appends 28 two-roll dice features, giving **642**; see `src/env/lookahead.py`.
 - **Valid actions / masking:** `env.unwrapped.get_valid_actions()` returns the legal action ints;
   also exposed as `info["valid_actions"]` after `reset()`/`step()`.
 - **`config` keys** (with defaults): `enemies` (`[RandomPlayer(RED)]`), `map_type` (`"BASE"`),
-  `vps_to_win` (`10` upstream; this project passes **`8`**), `representation` (`"vector"`),
+  `vps_to_win` (`10` upstream; this project passes whatever `src/env/ruleset.py` resolved),
+  `representation` (`"vector"`),
   `reward_function` (built-in win/loss/draw),
   `invalid_action_reward` (`-1`).
 - **Reward:** built-in `simple_reward` → `+1` win / `-1` loss / `0` draw (or truncation at turn 1000).
@@ -57,19 +59,24 @@ The pip release only ships:
 - `catanatron.players.search.VictoryPointPlayer` (greedy VP maximizer)
 
 The strong **AlphaBeta / MCTS / ValueFunction** bots referenced in older write-ups are **not** in
-this packaged version. The Phase 2 benchmark ladder is therefore
-`Random → WeightedRandom → VictoryPoint`. Reaching a stronger search benchmark later would mean
-installing from Catanatron source/experimental or implementing one ourselves.
+this packaged version. The benchmark ladder is therefore
+`Random → WeightedRandom → VictoryPoint`, and the agent has long since exhausted it — the current
+references are frozen past checkpoints of itself (`src/agent/pool.py`) and mirror matches.
+
+**The ladder is not ordered.** Over 200 games each, one checkpoint scored 70.8% vs
+`WeightedRandomPlayer` and 71.8% vs `VictoryPointPlayer` — statistically identical. A result
+against one does not transfer to the other.
 
 ## What was built
 
 - `src/env/catan_env.py`
   - `make_1v1_env(enemy=None, map_type="BASE", vps_to_win=VPS_TO_WIN, representation="vector",
     reward_function=None)` — constructs the 1v1 env (default enemy: `WeightedRandomPlayer(RED)`).
-  - `make_1v1_game(players=None, seed=None, ...)` — a **raw `Game`** for MCTS and AlphaZero
-    self-play, which drive the engine directly rather than through the gym `step` interface.
-  - `VPS_TO_WIN` (`8`) and `MAX_TURNS` (`300`) — the shared constants; import them rather than
-    hardcoding.
+  - `make_1v1_game(players=None, seed=None, ...)` — a **raw `Game`** for MCTS and for arena
+    matches, which drive the engine directly rather than through the gym `step` interface.
+  - `VPS_TO_WIN` and `MAX_TURNS` — re-exported from `src/env/ruleset.py`, which reads them from
+    the environment (defaults 8 VP / 1000 turns; the target ruleset is 15 VP / 1500). Import them
+    rather than hardcoding.
   - For a boolean action mask off a raw `Game`, use `src/agent/encoding.py:legal_action_mask`.
     (`valid_action_mask(env)`, the SB3-Contrib `ActionMasker` helper, was removed with the PPO
     training loop.)
@@ -93,5 +100,4 @@ legal agent should lose to the weighted-random opponent. This is the baseline Ph
 
 ## Next
 
-→ `PHASE2_AI.md`: train a `MaskablePPO` agent that beats `WeightedRandomPlayer`, then push toward
-`VictoryPointPlayer` and self-play.
+→ `PHASE2_AI.md` for the agent, `PHASE3_WEB.md` for the colonist.io bridge.

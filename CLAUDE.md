@@ -15,13 +15,10 @@ the agent and, later, the web integration.
 - **Language**: Python 3.10+ (developed on the `catan` conda env, Python 3.14)
 - **Game engine**: [Catanatron](https://github.com/bcollazo/catanatron) (GPL-3.0) — fast pure-Python
   Catan simulator with a Gymnasium env, action masking, and strong baseline bots
-- **Learning algorithm**: **`MaskablePPO` (`src/agent/train.py`) is the active track** — one
-  forward per decision vs AlphaZero's ~200. Under 12 VP with Longest Road it reaches
-  98–99% vs weighted-random and 96–98% vs greedy; at 15 VP it wins 15.0 VP in ~150 turns.
-  AlphaZero (`src/agent/train_az.py`) — one net, policy + value heads, PUCT search supplying
-  the improved policy target — remains the standing alternative and is now the *interesting*
-  one, for the reason under "What actually helps" below. The old "PPO only builds roads"
-  verdict predates the Longest-Road rule change and is confounded by it.
+- **Learning algorithm**: **`MaskablePPO` (`src/agent/train.py`) is the only trainer.** Under
+  12 VP with Longest Road it reaches 98–99% vs weighted-random and 96–98% vs greedy; at 15 VP it
+  wins 15.0 VP in ~150 turns. **The deployed agent is that checkpoint plus 50-sim PUCT search plus
+  both placement models** — three artifacts, never one.
 - **What actually helps** (measured 2026-08-16, all at 12/15 VP with Longest Road):
   **search at inference dominates further training.** In a mirror match — identical weights,
   the only difference being search — 50 sims/move is worth **+9.8 points** (59.8% over 200
@@ -29,9 +26,12 @@ the agent and, later, the web integration.
   over 800 games) and 800k steps of 15 VP fine-tuning bought −1.5 (not significant).
   100 sims scores 60.8%, i.e. **search saturates by 50 sims** — the ceiling is critic quality,
   not search budget, since PPO's value head estimates a discounted return rather than a win
-  probability and never trained on the positions search explores. That is the argument for
-  the AlphaZero value head. Every PPO run so far plateaus once it beats its references, so
-  **reach for search, or harder opponents, before another training run.**
+  probability and never trained on the positions search explores. Every PPO run so far plateaus
+  once it beats its references, so **reach for search, or harder opponents, before another
+  training run.**
+- **An AlphaZero track existed and was removed** (`train_az.py`, `selfplay.py`, `net.py`). It never
+  got past feasibility at 70.8% vs weighted-random. Recoverable from git history; the argument for
+  it was always the value head, and that argument is still open. Don't rebuild it casually.
 - **Game mode**: 1v1 (`enemies=[one bot]`, `map_type="BASE"`). The VP target, the
   Longest Road award and the turn cap are **per-run**, selected via `src/env/ruleset.py`
   (`--vps-to-win` / `--longest-road` / `--max-turns`, or `CATAN_*` env vars). Defaults
@@ -59,9 +59,12 @@ the agent and, later, the web integration.
   **bundle scorer** (`bundle_noroads.pt`) ranks whole corner *pairs*, so the first settlement is
   chosen knowing what the second could be. Pair-search beat greedy corner selection 53.5% over
   1200 games; three attempts at improving the labels moved strength not at all.
-  **No hardcoded placement knowledge**: features are mechanical board facts only, and the
-  hand-written scorer in `heuristic.py` is an evaluation yardstick that never plays.
-- **Reward shaping**: none, on either track, and the machinery is gone rather than merely
+  **No hardcoded placement knowledge**: features are mechanical board facts only. The hand-written
+  pip scorer that used to serve as an evaluation yardstick (`heuristic.py`, `evaluate.py`) has been
+  removed, so **games are now the only check on a refit** — budget 800+ of them.
+  Opening *roads* are deliberately unmodelled: a bundle over (settlement, road) × 2 scored 44.1%
+  over 1200 games and was cut. The road replay in data generation stays; it is a correct control.
+- **Reward shaping**: none, and the machinery is gone rather than merely
   switched off. `EpisodeStatsWrapper` keeps the end-of-episode telemetry the old
   `RewardShapingWrapper` also carried (VPs, settlements, cities, roads) without touching
   the reward.
@@ -81,17 +84,16 @@ src/
 │   ├── ruleset.py       # per-run rules (VP target, longest road, turn cap) via env vars
 │   ├── rules.py         # custom-rule monkeypatches (applied at import)
 │   ├── catan_env.py     # gym env + raw-Game factory, shared constants
-│   └── lookahead.py     # two-roll dice features (P(afford), discard risk)
+│   ├── lookahead.py     # two-roll dice features (P(afford), discard risk)
+│   ├── dice.py          # fixed_dice: a dedicated roll stream for paired games
+│   └── render.py        # matplotlib board renderer (used by eval/play.py)
 ├── agent/
 │   ├── encoding.py      # obs vector + action mask off a live Game
-│   ├── net.py           # AlphaZeroNet (residual MLP, policy + value heads)
-│   ├── evaluator.py     # leaf evaluators: net, PPO adapter, uniform control
-│   ├── mcts.py          # PUCT search with chance nodes; MCTSPlayer
-│   ├── selfplay.py      # self-play game generation + value targets
-│   ├── train_az.py      # AlphaZero training loop  <-- the standing alternative
+│   ├── evaluator.py     # leaf evaluators: PPO adapter, uniform control
+│   ├── mcts.py          # PUCT search with chance nodes; MCTSPlayer  <-- the +10 points
+│   ├── train.py         # MaskablePPO loop  <-- the only trainer
+│   ├── trunk.py         # shared policy/value trunk; REQUIRED to load the shipped model
 │   ├── arena.py         # head-to-head match play + agent-by-name registry
-│   ├── train.py         # MaskablePPO loop  <-- the active track
-│   ├── trunk.py         # optional shared policy/value trunk (--trunk), off by default
 │   ├── pool.py / elo.py / checkpoint_manager.py   # self-play ladder for train.py
 │   └── opponent.py      # PolicyPlayer (frozen PPO checkpoint as a Player)
 ├── placement/           # opening-settlement specialist (self-trained, no heuristics)
@@ -100,13 +102,10 @@ src/
 │   ├── model.py         # PlacementNet (scores one node) + BundleNet (scores a pair)
 │   ├── chooser.py       # OpeningChooser: shortlist corners, then search pairs
 │   ├── train.py         # supervised fit on the outcome labels
-│   ├── heuristic.py     # hand-written scorer -- EVALUATION YARDSTICK ONLY
-│   ├── evaluate.py      # rank/rho diagnostics on held-out boards
 │   ├── env_wrapper.py   # gym-side equivalent; opens inside reset()
 │   └── player.py        # wraps any agent; takes over only the opening
 ├── eval/
 │   ├── benchmark.py     # any agent vs any agent
-│   ├── bench_mcts.py    # search compute-budget profiler
 │   └── play.py          # human vs AI (matplotlib)
 └── bridge/              # (Phase 3) colonist.io WebSocket reader + Playwright clicker
 docs/          # Per-phase guides (see below)
@@ -118,22 +117,17 @@ tests/         # Unit & integration tests
 
 **Setup**: `pip install -r requirements.txt`
 
-**Smoke test (Phase 1)**: `python -m src.env.smoke_test`
+**Smoke test**: `python -m src.env.smoke_test`
 
-**Train (Phase 2)**: `python -m src.agent.train_az --iterations 200 --games-per-iter 64 --workers 16`
-
-**Train (PPO, sparse + placement + lookahead)**: `python -m src.agent.train --total-steps 3000000
---placement-model checkpoints/placement/scorer_ppo.pt --bundle-model
-checkpoints/placement/bundle_noroads.pt --lookahead --eval-games 200 --eval-workers 8
---run-name <name>`
-
-**Train under the target ruleset** (15 VP, Longest Road on). Raise `--gamma` with the VP
-target -- games run ~2.4x longer at 15 VP than at 8 (median 417 turns vs 172, measured over
+**Train under the target ruleset** (15 VP, Longest Road on, 1500-turn cap). Raise `--gamma` with
+the VP target -- games run ~2.4x longer at 15 VP than at 8 (median 417 turns vs 172, measured over
 30 WeightedRandom mirror games), and the terminal win/loss is the only reward there is:
 
 ```bash
-python -m src.agent.train --vps-to-win 15 --longest-road --gamma 0.999     --total-steps 3000000 --lookahead     --placement-model checkpoints/placement/scorer_ppo.pt     --bundle-model checkpoints/placement/bundle_noroads.pt --run-name <name>
+python -m src.agent.train --vps-to-win 15 --longest-road --max-turns 1500 --gamma 0.999     --total-steps 3000000 --lookahead --opponent pool     --placement-model checkpoints/placement/scorer_ppo.pt     --bundle-model checkpoints/placement/bundle_noroads.pt     --eval-games 200 --eval-workers 8 --run-name <name>
 ```
+
+But read "What actually helps" above first: **another training run is usually the wrong move.**
 
 **How the ruleset travels.** `src/env/rules.py` decides at *import* time whether to suppress
 the Longest Road award, and `SubprocVecEnv` / arena workers are **spawned** on Windows, so
@@ -162,7 +156,7 @@ python -m src.placement.train --data data/placement/samples.npz \
     --target bundle --out checkpoints/placement/bundle_noroads.pt
 ```
 
-**Benchmark**: `python -m src.eval.benchmark --agent az --model checkpoints/<run>/best.pt
+**Benchmark**: `python -m src.eval.benchmark --agent ppo-mcts --model checkpoints/<run>/best.zip
 --opponent value --games 200`. To hand the opening to the placement specialist, pass **both**
 models — the corner scorer shortlists, the bundle scorer picks the pair:
 
@@ -193,8 +187,6 @@ checkpoint trained with `--lookahead`. The older "80% → 95% vs weighted-random
 52.8/55.0/56.0% mirror figures at 50/100/200 sims were measured on pre-lookahead models and
 do not describe the current agents. The evaluator now declares `wants_lookahead` (inferred
 from its own checkpoint) and the search reads it once at construction.
-
-**Search budget**: `python -m src.eval.bench_mcts --simulations 100`
 
 **Sample sizes.** A 300-game head-to-head reported a 3-point edge that a 500-game run at a
 different seed did not reproduce (56.0% then 51.0%; pooled 52.9% ± 1.8% over 800). Budget
@@ -229,6 +221,9 @@ else). **None of these can place their own opening** — see the Caveats below.
 | `ppo-12vp-trunk-step2000000.zip` | 12 VP, LR | shared trunk, 932k params; its parent |
 | `ppo-12vp-lr-step1800000.zip` | 12 VP, LR | two-tower `[256,256]`, 537k params; a statistical tie with the trunk model |
 
+The first two are **trunk models**: their `policy_kwargs` names `src.agent.trunk.SharedTrunk` by
+module path, so `src/agent/trunk.py` cannot be moved or deleted without breaking them.
+
 The 12 VP models play 15 VP without retraining (80–0 vs weighted-random out of the box,
 15.0 VP in 145 turns) — the win condition changes, the mechanics do not. 800k steps of 15 VP
 fine-tuning on top measured 48.5% ± 2.5% against its own starting point, i.e. nothing.
@@ -256,8 +251,8 @@ presenting any code change, verify it passes flake8.
 See `docs/` for per-phase guides:
 
 - **`PHASE1_SETUP.md`** — Catanatron install, 1v1 env wiring, smoke test
-- **`PHASE2_AI.md`** — the AlphaZero agent (MCTS + self-play), the PPO track it replaced,
-  cloud training, eval
+- **`PHASE2_AI.md`** — the shipped agent: PPO training, PUCT search at inference, the opening
+  specialist, benchmarking, and a list of measured dead ends so they are not re-run
 - **`PHASE3_WEB.md`** — colonist.io bridge (WebSocket read + Playwright clicks)
 
 ## Caveats
@@ -272,11 +267,8 @@ Measured over 200 games each: 100.0% -> 88.2% vs weighted-random, and head-to-he
 than the older agent that at least learned placement badly. This applies to the Phase 3
 colonist.io bridge too: the scorer has to be part of the deployed agent, not an eval-time extra.
 
-`checkpoints/ppo-pool-placement-lookahead/best.zip` carries an extra wrinkle: it was *trained*
-against `scorer.pt` (weighted-random labels), so that checkpoint is its native opening.
-`scorer_ppo.pt` measured as a tie and is the right default for new work, but swapping it in
-gives that particular agent openings it never trained under.
-
 **The placement specialist was fitted under the old rules**, on rollouts that never ran to 12
 or 15 VP. Whether corner values shift when the game runs longer is untested, and it is the
-most likely place a stale assumption is still costing points.
+most likely place a stale assumption is still costing points. Refitting it against
+`ppo-15vp-lr-step400000.zip` rollouts is the clearest open piece of work — and note the
+rank/rho diagnostic is gone, so validate a refit with 800+ benchmark games, not with the loss.

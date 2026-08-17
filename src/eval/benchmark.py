@@ -1,15 +1,21 @@
 """Benchmark any agent against any other, over alternating seats.
 
 Examples:
-    # AlphaZero net vs the strongest built-in bot
-    python -m src.eval.benchmark --agent az --model checkpoints/run/best.pt \\
-        --opponent value --games 200
+    # The shipped agent vs the strongest built-in bot, under the target ruleset
+    python -m src.eval.benchmark --vps-to-win 15 --longest-road --max-turns 1500 \\
+        --agent ppo-mcts --model checkpoints/archive/ppo-15vp-lr-step400000.zip \\
+        --simulations 50 --opponent value --games 200 \\
+        --placement-model checkpoints/placement/scorer_ppo.pt \\
+        --bundle-model    checkpoints/placement/bundle_noroads.pt
 
-    # Does search help the old PPO net at all?
-    python -m src.eval.benchmark --agent ppo-mcts --model checkpoints/old/agent_final.zip \\
-        --opponent ppo --opponent-model checkpoints/old/agent_final.zip --games 100
+    # What is search alone worth? Mirror match, same weights, search on one side.
+    python -m src.eval.benchmark --agent ppo-mcts --model <ckpt> --simulations 50 \\
+        --opponent ppo --opponent-model <ckpt> --games 800
 
-Agent specs: random, weighted, value, mcts, ppo, ppo-mcts, az.
+Agent specs: random, weighted, value, mcts, ppo, ppo-mcts.
+
+Budget 800+ games before believing any difference under ~5 points; 200 games
+resolves nothing finer than ~7.
 """
 
 import argparse
@@ -31,12 +37,12 @@ def main():
     # Search evaluates one leaf at a time, so every forward pass is batch 1.
     # Torch's intra-op threads cost more in synchronisation than they save on
     # matmuls that small -- left at the default this spawns ~6 threads per
-    # process and runs slower than a single core. Same reasoning as the
-    # self-play workers in src/agent/selfplay.py.
+    # process and runs slower than a single core. Same reasoning as the arena
+    # match workers in src/agent/arena.py.
     torch.set_num_threads(1)
 
     parser = argparse.ArgumentParser(description="Benchmark two agents head to head.")
-    parser.add_argument("--agent", default="az", help="Challenger spec.")
+    parser.add_argument("--agent", default="ppo-mcts", help="Challenger spec.")
     parser.add_argument("--model", default=None, help="Challenger checkpoint.")
     parser.add_argument("--opponent", default="weighted", help="Opponent spec.")
     parser.add_argument("--opponent-model", default=None, help="Opponent checkpoint.")

@@ -11,7 +11,6 @@ from catanatron.models.enums import ActionType
 
 from src.env.catan_env import make_1v1_game
 from src.placement.dataset import flatten_pairs, generate_pair
-from src.placement.evaluate import diagnose
 from src.placement.features import (
     FEATURE_SLICES,
     NUMBERS,
@@ -21,7 +20,6 @@ from src.placement.features import (
     feature_size,
     node_features,
 )
-from src.placement.heuristic import pip_score, rank_of, spearman
 from src.placement.model import PlacementNet
 from src.placement.player import PlacementPlayer
 
@@ -78,34 +76,15 @@ def test_encode_candidates_handles_the_empty_case():
     assert empty.shape == (0, feature_size())
 
 
-def test_heuristic_ranks_a_richer_corner_higher():
-    """Sanity check on the yardstick itself, not on any learned model."""
-    game = make_1v1_game(seed=42)
-    catan_map = game.state.board.map
-    nodes = candidate_nodes(game.state.playable_actions)
-    best = max(nodes, key=lambda n: pip_score(catan_map, n))
-    assert rank_of(catan_map, best, nodes) == 1
-
-
-def test_spearman_endpoints():
-    assert spearman([1, 2, 3], [1, 2, 3]) == pytest.approx(1.0)
-    assert spearman([1, 2, 3], [3, 2, 1]) == pytest.approx(-1.0)
-    # A constant column has no ranking to correlate with.
-    assert spearman([1, 2, 3], [5, 5, 5]) == 0.0
-
-
 def test_generate_pair_shape_and_delta_range():
     pairs, deltas, bundles = generate_pair(7)
     assert pairs.shape == (1, 4, feature_size())
     assert deltas.shape == (1,)
-    # Same two openings, re-encoded as bundles: [seat][corner][settlement+road].
-    from src.placement.features import corner_feature_size
-
-    assert bundles.shape == (1, 2, 2, corner_feature_size())
-    # A bundle corner opens with its settlement block, unchanged from the pair.
-    width = feature_size()
-    assert np.array_equal(bundles[0, 0, 0, :width], pairs[0, 0])
-    assert np.array_equal(bundles[0, 1, 0, :width], pairs[0, 2])
+    # Same two openings, re-encoded as bundles: [seat][corner][settlement].
+    assert bundles.shape == (1, 2, 2, feature_size())
+    # A bundle corner is exactly the settlement vector from the pair.
+    assert np.array_equal(bundles[0, 0, 0], pairs[0, 0])
+    assert np.array_equal(bundles[0, 1, 0], pairs[0, 2])
     # Its second corner is encoded with the first assumed built, so it carries
     # the second-settlement flag even though nothing is on the board yet.
     first, last = FEATURE_SLICES["placement_index"]
@@ -192,41 +171,6 @@ def test_assume_owned_encodes_a_hypothetical_first_settlement():
         assert np.array_equal(bare[lo:hi], with_first[lo:hi])
 
 
-def test_road_features_distinguish_directions():
-    """A road's whole value here is where it lets you build next."""
-    from src.placement.features import (
-        ROAD_FEATURE_SLICES, legal_road_edges, road_far_end, road_features,
-    )
-
-    game = make_1v1_game(seed=3)
-    color = game.state.colors[0]
-    node = sorted(game.state.board.map.land_nodes)[0]
-    edges = legal_road_edges(node)
-    vectors = [road_features(game, color, node, e) for e in edges]
-
-    # The three roads off one corner must not encode identically -- if they did,
-    # the model could not prefer one and the choice would be a coin flip.
-    assert any(not np.array_equal(vectors[0], v) for v in vectors[1:])
-
-    lo, hi = ROAD_FEATURE_SLICES["reach_1"]
-    for edge, vector in zip(edges, vectors):
-        far = road_far_end(node, edge)
-        assert far != node
-        # Count of settleable corners one road on, and it excludes the corner
-        # we just settled and everything adjacent to it.
-        assert vector[lo] >= 0
-        assert vector[lo + 1] >= vector[lo + 2]  # best >= mean
-
-
-def test_road_far_end_rejects_a_foreign_edge():
-    from src.placement.features import road_far_end
-
-    assert road_far_end(3, (3, 4)) == 4
-    assert road_far_end(4, (3, 4)) == 3
-    with pytest.raises(ValueError):
-        road_far_end(9, (3, 4))
-
-
 def test_opening_swap_replays_the_same_roads():
     """Roads travel with their settlement, or the pair is not a controlled test."""
     from src.placement.dataset import _draft_order, _draft_roads, _play
@@ -250,33 +194,34 @@ def test_opening_swap_replays_the_same_roads():
     assert sorted(n for _, n in _draft_order(game_b)) == sorted(nodes)
 
 
-def test_bundle_chooser_plans_roads_with_settlements():
+def test_bundle_chooser_picks_a_legal_complementary_pair():
+    """Pair search must commit to a second corner, and a legal one.
+
+    Roads are deliberately not part of this search -- a bundle over
+    (settlement, road) x 2 measured 44.1% against this -- so the chooser has an
+    opinion about corners only.
+    """
     from src.placement.chooser import OpeningChooser
-    from src.placement.features import corner_feature_size, legal_road_edges
     from src.placement.model import BundleNet
 
     game = make_1v1_game(seed=11)
     color = game.state.colors[0]
-    chooser = OpeningChooser(PlacementNet(),
-                             BundleNet(feature_dim=corner_feature_size()),
+    chooser = OpeningChooser(PlacementNet(), BundleNet(feature_dim=feature_size()),
                              first_k=4, partner_k=8)
     nodes = sorted(game.state.board.map.land_nodes)
 
     first = chooser.choose(game, color, nodes)
-    edge = chooser.choose_road(game, color, legal_road_edges(first))
-    assert first in edge and edge in [tuple(e) for e in legal_road_edges(first)]
+    assert first in nodes
 
-    second, second_road = chooser._plan["second"]
+    second = chooser._plan["second"]
     assert second != first
     assert second not in STATIC_GRAPH.neighbors(first)
-    assert second in second_road
 
-    # Losing the planned road falls back inside the model, not to a coin flip.
-    others = [e for e in legal_road_edges(first) if tuple(e) != edge]
-    if others:
-        assert tuple(chooser.choose_road(game, color, others)) in [
-            tuple(e) for e in others
-        ]
+    # Losing the planned partner re-searches rather than failing.
+    remaining = [n for n in nodes
+                 if n != first and n not in STATIC_GRAPH.neighbors(first)
+                 and n != second]
+    assert chooser.choose(game, color, remaining) in remaining
 
 
 def test_bundle_net_round_trip_and_shape(tmp_path):
@@ -348,13 +293,6 @@ def test_placement_player_only_touches_the_opening():
     assert len(settled) == 2
 
 
-def test_diagnose_reports_a_rank_within_range():
-    result = diagnose(PlacementNet(), seeds=range(900_000, 900_004))
-    assert result["boards"] == 4
-    assert 1.0 <= result["mean_rank"] <= result["mean_candidates"]
-    assert -1.0 <= result["mean_rho"] <= 1.0
-
-
 # --------------------------------------------------------------------------
 # Gym-side wrapper
 # --------------------------------------------------------------------------
@@ -424,11 +362,12 @@ def test_opponent_scorer_flag_controls_the_enemy(tmp_path):
 def test_trained_scorer_opens_far_better_than_chance():
     """End-to-end: the shipped checkpoint must pick genuinely good corners.
 
-    Ranked against the env's *own* board -- ``env.reset(seed=n)`` does not
-    control the layout, so a board built separately from the same seed is a
-    different board (see the wrapper docstring).
+    Ranked by total node production -- a raw board fact that is already one of
+    the input features, not a hand-written opinion about what makes a corner
+    good. Ranked against the env's *own* board, because ``env.reset(seed=n)``
+    does not control the layout (see the wrapper docstring).
     """
-    checkpoint = Path("checkpoints/placement/scorer.pt")
+    checkpoint = Path("checkpoints/placement/scorer_ppo.pt")
     if not checkpoint.exists():
         pytest.skip("no trained placement scorer available")
 
@@ -441,8 +380,14 @@ def test_trained_scorer_opens_far_better_than_chance():
         catan_map = env.unwrapped.game.state.board.map
         # The first pick saw an empty board, so every land node was legal.
         nodes = sorted(catan_map.land_nodes)
-        ranks.append(rank_of(catan_map, env.opening_nodes[0], nodes))
+        production = {
+            n: sum(catan_map.node_production[n].values()) for n in nodes
+        }
+        chosen = env.opening_nodes[0]
+        ranks.append(
+            1 + sum(1 for n in nodes if production[n] > production[chosen])
+        )
 
-    # Chance is ~27/54. Measured ~4.3 over 20 boards; 12 leaves ample headroom
-    # for board variance without passing a model that learned nothing.
+    # Chance is ~27/54. A scorer that learned anything lands in the top handful;
+    # 12 leaves ample headroom for board variance.
     assert np.mean(ranks) < 12.0

@@ -1,6 +1,6 @@
 """Head-to-head match play and a registry for building any agent by name.
 
-Used by the AlphaZero promotion gate (``src.agent.train_az``) and by
+Used by the PPO self-play ladder (``src.agent.train``) and by
 ``src.eval.benchmark``, so every comparison in the project runs the same
 alternating-seat protocol.
 
@@ -26,9 +26,8 @@ from catanatron.models.player import RandomPlayer
 from catanatron.players.search import VictoryPointPlayer
 from catanatron.players.weighted_random import WeightedRandomPlayer
 
-from src.agent.evaluator import NetEvaluator, PPOEvaluator, UniformEvaluator
+from src.agent.evaluator import PPOEvaluator, UniformEvaluator
 from src.agent.mcts import MCTSPlayer
-from src.agent.net import AlphaZeroNet
 from src.env.catan_env import MAX_TURNS, make_1v1_game
 # The constant only, so this stays a torch-free import; wrap_factory is still
 # imported lazily inside _with_placement.
@@ -340,57 +339,21 @@ def play_match(challenger, opponent, num_games: int, seed=None,
 # --------------------------------------------------------------------------
 # Agent factories
 # --------------------------------------------------------------------------
-def net_factory(net, simulations: int, **mcts_kwargs):
-    """MCTS on an AlphaZeroNet. Evaluation play: greedy, no root noise."""
-    evaluator = NetEvaluator(net)
-    return lambda color: MCTSPlayer(
-        color, evaluator, simulations=simulations,
-        dirichlet_epsilon=0.0, **mcts_kwargs
-    )
-
-
 @dataclass
 class AgentSpec:
-    """A picklable description of an agent, for matches that span processes.
-
-    ``net_blob`` carries an in-memory network (config + CPU state dict) so the
-    training loop can arena its live challenger without writing a checkpoint
-    first; ``model_path`` covers agents loaded from disk.
-    """
+    """A picklable description of an agent, for matches that span processes."""
 
     kind: str
     model_path: str = None
     simulations: int = 100
     batch_size: int = 1
-    net_blob: dict = None
     placement_path: str = None
     bundle_path: str = None
     partner_rank: int = PARTNER_RANK
 
-    @classmethod
-    def from_net(cls, net, simulations: int, batch_size: int = 1,
-                 placement_path: str = None, bundle_path: str = None,
-                 partner_rank: int = PARTNER_RANK) -> "AgentSpec":
-        return cls(
-            kind="az", simulations=simulations, batch_size=batch_size,
-            placement_path=placement_path, bundle_path=bundle_path,
-            partner_rank=partner_rank,
-            net_blob={
-                "config": net.config(),
-                "state_dict": {k: v.cpu() for k, v in net.state_dict().items()},
-            },
-        )
-
 
 def build_agent_from_spec(spec: AgentSpec):
     """Rebuild an agent factory from its spec, inside whatever process needs it."""
-    if spec.net_blob is not None:
-        net = AlphaZeroNet(**spec.net_blob["config"])
-        net.load_state_dict(spec.net_blob["state_dict"])
-        net.eval()
-        factory = net_factory(net, spec.simulations, batch_size=spec.batch_size)
-        return _with_placement(factory, spec.placement_path, spec.bundle_path,
-                               spec.partner_rank)
     return build_agent(
         spec.kind, spec.model_path, spec.simulations, spec.batch_size,
         spec.placement_path, spec.bundle_path, spec.partner_rank,
@@ -420,9 +383,10 @@ def build_agent(spec: str, model_path=None, simulations: int = 100,
         ``random`` / ``weighted`` / ``value`` -- catanatron's built-in bots.
         ``mcts``      -- bare PUCT search with uniform priors and no value net.
                          The control that isolates lookahead from knowledge.
-        ``ppo``       -- a MaskablePPO checkpoint played greedily (the old agent).
+        ``ppo``       -- a MaskablePPO checkpoint played greedily.
         ``ppo-mcts``  -- MCTS using that same PPO net for priors and values.
-        ``az``        -- MCTS on an AlphaZeroNet checkpoint.
+                         **This is the shipped agent**; it is worth ~10 points
+                         over ``ppo`` on the same weights.
 
     Args:
         spec: one of the names above.
@@ -475,13 +439,6 @@ def _build_core_agent(spec: str, model_path, simulations: int, batch_size: int):
         return lambda color: MCTSPlayer(
             color, evaluator, simulations=simulations, dirichlet_epsilon=0.0,
             batch_size=batch_size,
-        )
-
-    if spec == "az":
-        if model_path is None:
-            raise ValueError("'az' requires --model")
-        return net_factory(
-            AlphaZeroNet.load(model_path), simulations, batch_size=batch_size
         )
 
     raise ValueError(f"Unknown agent spec: {spec}")

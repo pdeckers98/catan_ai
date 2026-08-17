@@ -6,9 +6,9 @@ An evaluator maps a position to ``(priors, value)``:
 - ``value``: the expected result in [-1, 1] **from the perspective of the player
   to move at that position**.
 
-Keeping this behind one interface is what makes Stage 0 possible: the same tree
-search runs on a random prior, on the existing MaskablePPO checkpoint, or on the
-AlphaZero net, so their strengths are directly comparable.
+Keeping this behind one interface is what lets the same tree search run on the
+trained MaskablePPO checkpoint or on a uniform prior, so the contribution of the
+network and the contribution of the search are separable.
 
 The interface is batched (``evaluate_batch``) because a batched forward pass is
 several times cheaper per leaf than 294-wide single-row inference, and the search
@@ -19,7 +19,6 @@ import numpy as np
 import torch
 
 from src.agent.encoding import action_size, obs_size
-from src.agent.net import AlphaZeroNet
 from src.env.lookahead import LOOKAHEAD_SIZE
 
 
@@ -45,10 +44,11 @@ class Evaluator:
 
 
 class UniformEvaluator(Evaluator):
-    """Uniform priors, value 0. The no-network control for Stage 0.
+    """Uniform priors, value 0. The no-network control.
 
     Search on top of this is pure PUCT with no knowledge, which isolates how much
-    of any improvement comes from lookahead versus from the network.
+    of any improvement comes from lookahead versus from the network. Reachable as
+    ``--agent mcts``.
     """
 
     def evaluate_batch(self, obs_batch, mask_batch):
@@ -58,32 +58,20 @@ class UniformEvaluator(Evaluator):
         return priors, values
 
 
-class NetEvaluator(Evaluator):
-    """Wraps an :class:`AlphaZeroNet`."""
-
-    def __init__(self, net: AlphaZeroNet, device="cpu"):
-        self.net = net.to(device).eval()
-        self.device = device
-
-    @classmethod
-    def from_path(cls, path, device="cpu") -> "NetEvaluator":
-        return cls(AlphaZeroNet.load(path, device=device), device=device)
-
-    def evaluate_batch(self, obs_batch, mask_batch):
-        return self.net.infer(obs_batch, mask_batch)
-
-
 class PPOEvaluator(Evaluator):
     """Wraps a trained MaskablePPO checkpoint as an MCTS evaluator.
 
-    This is the Stage 0 adapter. Two caveats worth remembering when reading its
-    numbers:
+    This is what ``--agent ppo-mcts`` runs on, and it is the shipped
+    configuration. Two caveats worth remembering when reading its numbers:
 
-    - PPO's critic predicts a *shaped, discounted return*, not a win probability,
-      so its scale is arbitrary. We squash it with ``tanh`` to land in [-1, 1].
-      Ordering is preserved, which is what PUCT actually needs; calibration is not.
+    - PPO's critic predicts a *discounted return*, not a win probability, so its
+      scale is arbitrary. We squash it with ``tanh`` to land in [-1, 1]. Ordering
+      is preserved, which is what PUCT actually needs; calibration is not.
     - That critic was trained only on states the PPO policy itself visited, so it
       is extrapolating on the positions search drags it into.
+
+    Together those two are why search saturates by ~50 simulations here: the
+    ceiling is critic quality, not search budget.
     """
 
     def __init__(self, model, value_scale: float = 1.0):

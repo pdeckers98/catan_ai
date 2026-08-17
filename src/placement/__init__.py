@@ -10,6 +10,7 @@ This package fixes that by *data*, not by hand-written rules: openings are
 explored at random, labelled with the game's actual outcome, and a small model
 learns to score nodes from mechanical board facts. Nothing here encodes an
 opinion about what makes a placement good -- see :mod:`src.placement.features`
-for where that line is drawn, and :mod:`src.placement.heuristic` for the
-hand-written scorer, which exists only as an evaluation yardstick.
+for where that line is drawn. A hand-written pip scorer once lived here as an
+evaluation yardstick; it has been removed, so head-to-head games are now the
+only check on whether a refitted scorer is any good.
 """

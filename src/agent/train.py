@@ -1,41 +1,29 @@
-"""Phase 2 training: MaskablePPO with self-play and W&B logging.
+"""MaskablePPO training with self-play and W&B logging -- the agent's only trainer.
 
-Long treated as the superseded track -- ``src.agent.train_az`` replaces the
-policy-gradient update with AlphaZero-style search + supervised distillation --
-but the evidence for abandoning it does not survive inspection. Every PPO run
-happened on 2026-06-26; the rules that disable the Longest Road VP bonus landed
-on 2026-08-11, in the same sitting as AlphaZero. So the failure that condemned
-PPO ("the agent only builds roads") was observed when Longest Road was worth +2
-VP out of 10, i.e. when road-spam genuinely *was* the highest-EV line and the
-policy was right to find it. The rule change and the algorithm change are
-completely confounded, and PPO has never run under the current rules.
+The reward is the sparse win/loss outcome and nothing else; there is no shaping
+and no machinery for it. ``EpisodeStatsWrapper`` keeps the end-of-episode
+telemetry (VPs, settlements, cities, roads) without touching the reward.
 
-This module is set up to settle that, cheaply: PPO spends one network forward
-per decision against AlphaZero's ~200, so if it works at all it is worth roughly
-two orders of magnitude of compute.
+``--opponent pool`` is the strongest setting: frozen past checkpoints mixed with
+a slice of scripted games, rated by Elo against the run's own ladder rather than
+by a win rate that cannot exceed 100%. Every run so far plateaus once it beats
+its references, which is why **search at inference, or a harder opponent, is a
+better next move than more steps** -- 50-sim search is worth ~+10 points on the
+same weights, where 800k further steps of fine-tuning measured as nothing.
 
-The reward is the sparse win/loss outcome and nothing else. The milestone-bonus
-arm this module used to carry (``--shaping``) is gone: the sparse arm answered
-the question it existed as a fallback for, and its thresholds were calibrated
-against an 8-VP game.
-
-Evaluation deliberately goes through ``src.agent.arena``, the same harness the
-AlphaZero track uses, so the numbers are directly comparable to it (the feas02
-checkpoint scored 70.8% vs weighted-random over 200 games).
-
-The re-test answered yes: sparse PPO reached ~92% vs weighted-random (400 games)
-in 3M steps, at which point both the training opponent and the yardstick had run
-out. ``--opponent pool`` is the follow-on -- frozen past checkpoints mixed with a
-slice of scripted games, rated by Elo against the run's own ladder rather than by
-a win rate that cannot exceed 100%.
+Evaluation goes through ``src.agent.arena``, the same harness ``src.eval.benchmark``
+uses, so in-run numbers and reported numbers are directly comparable.
 
 The ruleset (VP target, Longest Road, turn cap) is per-run and set through
 ``src.env.ruleset``; see the note on ``apply_cli_overrides`` below for why it is
-read before the imports rather than from ``args``.
+read before the imports rather than from ``args``. Raise ``--gamma`` with the VP
+target: games run ~2.4x longer at 15 VP than at 8, and the terminal result is the
+only reward there is.
 
 Usage:
     python -m src.agent.train --total-steps 2000000 --run-name ppo-sparse
-    python -m src.agent.train --vps-to-win 15 --longest-road --gamma 0.999 \
+    python -m src.agent.train --vps-to-win 15 --longest-road --max-turns 1500 \
+        --gamma 0.999 --lookahead \
         --placement-model checkpoints/placement/scorer_ppo.pt \
         --bundle-model checkpoints/placement/bundle_noroads.pt
     python -m src.agent.train --opponent pool --resume checkpoints/<run>/best.zip

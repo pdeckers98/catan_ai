@@ -1,38 +1,37 @@
-"""Tests for MCTS, the network, and the self-play value targets."""
+"""Tests for the PUCT search that ``--agent ppo-mcts`` runs on."""
 
 import numpy as np
 
 from catanatron import Color
 
 from src.agent.encoding import action_size, obs_size
-from src.agent.evaluator import NetEvaluator, UniformEvaluator
+from src.agent.evaluator import Evaluator, UniformEvaluator
 from src.agent.mcts import MCTS, MCTSPlayer, _outcome_key
-from src.agent.net import AlphaZeroNet
-from src.agent.selfplay import SelfPlayConfig, compute_value_targets, play_game
 from src.env.catan_env import make_1v1_game
 
 
-def small_net():
-    return AlphaZeroNet(width=32, blocks=1)
+class NoisyEvaluator(Evaluator):
+    """A stand-in for a trained net: non-flat priors and non-zero values.
 
+    UniformEvaluator is degenerate in exactly the ways some of these assertions
+    care about -- every prior equal, every value 0 -- so the bookkeeping tests
+    use this instead to make sure nothing is passing by accident.
+    """
 
-def test_net_infer_respects_the_action_mask():
-    net = small_net()
-    mask = np.zeros(action_size(), dtype=bool)
-    mask[[0, 5, 17]] = True
-    obs = np.zeros((1, obs_size()), dtype=np.float32)
+    def __init__(self, seed=0):
+        self.rng = np.random.default_rng(seed)
 
-    priors, values = net.infer(obs, mask[None, :])
-
-    assert priors.shape == (1, action_size())
-    assert np.isclose(priors.sum(), 1.0)
-    assert np.allclose(priors[0, ~mask], 0.0)
-    assert -1.0 <= values[0] <= 1.0
+    def evaluate_batch(self, obs_batch, mask_batch):
+        mask = np.asarray(mask_batch)
+        priors = self.rng.random(mask.shape).astype(np.float32) * mask
+        priors /= np.maximum(priors.sum(axis=-1, keepdims=True), 1e-9)
+        values = self.rng.uniform(-1.0, 1.0, len(mask)).astype(np.float32)
+        return priors, values
 
 
 def test_search_returns_a_normalized_policy_over_legal_actions():
     game = make_1v1_game(seed=2)
-    mcts = MCTS(NetEvaluator(small_net()), simulations=32)
+    mcts = MCTS(NoisyEvaluator(), simulations=32)
     result = mcts.search(game)
 
     assert np.isclose(result.policy.sum(), 1.0)
@@ -51,7 +50,7 @@ def test_batched_search_spends_exactly_the_simulation_budget():
     for batch_size in (1, 4, 16, 64):
         game = make_1v1_game(seed=2)
         result = MCTS(
-            NetEvaluator(small_net()), simulations=48, batch_size=batch_size
+            NoisyEvaluator(seed=1), simulations=48, batch_size=batch_size
         ).search(game, rng=np.random.default_rng(0))
 
         assert result.visits.sum() == 48, f"batch_size={batch_size}"
@@ -131,54 +130,6 @@ def test_puct_concentrates_visits_on_a_spiked_prior():
     assert result.visits[favoured] / result.visits.sum() > 3.0 / len(result.actions)
 
 
-def test_value_targets_blend_outcome_with_bootstrap():
-    colors = [Color.BLUE, Color.RED, Color.BLUE, Color.RED, Color.BLUE]
-    root_values = [0.5, -0.2, 0.6, -0.4, 0.9]
-
-    targets = compute_value_targets(
-        colors, root_values, winner=Color.BLUE, nstep=2, mix=0.5
-    )
-
-    # t=0 is BLUE: outcome +1, bootstrap is root_values[2] (also BLUE, so no flip).
-    assert np.isclose(targets[0], 0.5 * 1.0 + 0.5 * 0.6)
-    # t=1 is RED: outcome -1, bootstrap is root_values[3] (also RED).
-    assert np.isclose(targets[1], 0.5 * -1.0 + 0.5 * -0.4)
-    # The tail has nothing to bootstrap from and falls back to the outcome.
-    assert np.isclose(targets[4], 1.0)
-
-
-def test_value_target_sign_flips_across_players():
-    colors = [Color.BLUE, Color.RED]
-    targets = compute_value_targets(
-        colors, [0.0, 0.8], winner=None, nstep=1, mix=0.0
-    )
-    # Bootstrapping from RED's +0.8 into BLUE's slot must become -0.8.
-    assert np.isclose(targets[0], -0.8)
-
-
-def test_pure_outcome_mix_reproduces_textbook_alphazero():
-    colors = [Color.BLUE, Color.RED, Color.BLUE]
-    targets = compute_value_targets(
-        colors, [0.9, 0.9, 0.9], winner=Color.RED, nstep=1, mix=1.0
-    )
-    assert np.allclose(targets, [-1.0, 1.0, -1.0])
-
-
-def test_self_play_produces_aligned_training_arrays():
-    config = SelfPlayConfig(simulations=8, temperature_moves=3)
-    result = play_game(NetEvaluator(small_net()), config, seed=17)
-
-    count = len(result.values)
-    assert count > 0
-    assert result.obs.shape == (count, obs_size())
-    assert result.masks.shape == (count, action_size())
-    assert result.policies.shape == (count, action_size())
-    # Policies are zero wherever the position said the action was illegal.
-    assert np.allclose(result.policies[~result.masks], 0.0)
-    assert np.all(np.abs(result.values) <= 1.0)
-    assert result.stats["decisions"] == count
-
-
 def test_mcts_player_skips_search_on_forced_moves():
     """A single legal action must be returned without touching the evaluator."""
 
@@ -242,7 +193,7 @@ def test_search_feeds_the_evaluator_the_width_it_asks_for():
 
 
 def test_an_evaluator_that_does_not_want_lookahead_still_gets_the_base_width():
-    """The default must stay 614 -- AlphaZero nets are trained without it."""
+    """The default must stay 614 -- an evaluator opts in, it is not assumed."""
     evaluator = UniformEvaluator()
     assert not getattr(evaluator, "wants_lookahead", False)
     assert MCTS(evaluator, simulations=2)._lookahead is False

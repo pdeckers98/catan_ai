@@ -16,14 +16,14 @@ Flow:
 Run the current agent the way it is meant to be deployed -- search at inference,
 opening handed to the placement specialist::
 
-    python -m src.eval.play --vps-to-win 15 --longest-road \\
+    python -m src.eval.play --vps-to-win 15 --longest-road --max-turns 1500 \\
         --agent ppo-mcts --model checkpoints/archive/ppo-15vp-lr-step400000.zip \\
         --simulations 50 \\
         --placement-model checkpoints/placement/scorer_ppo.pt \\
         --bundle-model    checkpoints/placement/bundle_noroads.pt
 
-(also ``--agent az`` for an AlphaZeroNet ``.pt``, ``--agent ppo`` to play a
-MaskablePPO zip directly without search; optional ``--seed N``)
+(also ``--agent ppo`` to play the same zip directly without search, which is
+about 10 points weaker; optional ``--seed N``)
 """
 
 import argparse
@@ -281,10 +281,10 @@ class HumanVsAI:
 
 def main():
     parser = argparse.ArgumentParser(description="Play 1v1 Catan vs the trained AI.")
-    parser.add_argument("--agent", default="az",
-                        help="Agent spec: az, ppo, ppo-mcts, mcts, value, weighted.")
+    parser.add_argument("--agent", default="ppo-mcts",
+                        help="Agent spec: ppo-mcts, ppo, mcts, value, weighted.")
     parser.add_argument("--model", default=None,
-                        help="Checkpoint path (.pt for az, .zip for ppo).")
+                        help="MaskablePPO checkpoint (.zip).")
     parser.add_argument("--simulations", type=int, default=100,
                         help="MCTS playouts per move for search-backed agents. "
                              "50 is where search saturates and keeps the wait "

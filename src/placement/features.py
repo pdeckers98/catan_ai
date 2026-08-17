@@ -6,8 +6,8 @@ placement skill has to be learned rather than typed in:
 
 - "this node touches a tile numbered 8, whose roll probability is 5/36" is a
   fact -- 5/36 is a property of two dice, not an opinion about Catan.
-- "pips x 1.15 for a third resource" is a judgement, and lives in
-  :mod:`src.placement.heuristic`, which is only ever used as a yardstick.
+- "pips x 1.15 for a third resource" is a judgement, and does not appear
+  anywhere in this package -- not even as a tie-break.
 
 So the encoder hands the model raw production rates, a number histogram, port
 type, what each player already owns, and how much room is left to expand -- with
@@ -145,80 +145,6 @@ def _expansion_features(game, node_id, blocked) -> np.ndarray:
     return np.array(features, dtype=np.float32)
 
 
-def legal_road_edges(node_id: int):
-    """The 2-3 edges an initial road off ``node_id`` can take."""
-    return tuple(sorted((node_id, other)) for other in STATIC_GRAPH.neighbors(node_id))
-
-
-def road_far_end(node_id: int, edge) -> int:
-    """The endpoint of ``edge`` that is not ``node_id``."""
-    a, b = edge
-    if node_id not in (a, b):
-        raise ValueError(f"edge {edge} does not touch node {node_id}")
-    return b if a == node_id else a
-
-
-def road_features(game, color, node_id: int, edge, assume_owned=()) -> np.ndarray:
-    """What an opening road off ``node_id`` opens up.
-
-    A settlement's expansion block is undirected -- it counts room in every
-    direction at once. The free road spends that optionality on one direction,
-    so this measures the same thing from the road's far end: how many settleable
-    corners it brings within one and two further roads, how good they are, and
-    which ports come into reach.
-
-    Under these house rules Longest Road is worth no VP, so a road's only value
-    *is* where it lets you build next. That makes this block the whole of the
-    decision rather than one term in it.
-
-    The road's own settlement is always treated as built, since the road is only
-    ever placed immediately after it.
-    """
-    catan_map = game.state.board.map
-    far = road_far_end(node_id, edge)
-
-    blocked = _occupied_or_blocked(game)
-    for owned in (node_id,) + tuple(assume_owned):
-        blocked = blocked | {owned} | set(STATIC_GRAPH.neighbors(owned))
-    land = catan_map.land_nodes
-
-    reachable, features = [], []
-    for distance in (1, 2):
-        ring = [
-            other for other in _nodes_at_distance(far, distance)
-            if other in land and other not in blocked
-        ]
-        reachable.extend(ring)
-        totals = [float(sum(catan_map.node_production[n].values())) for n in ring]
-        features.extend([
-            float(len(totals)),
-            max(totals) if totals else 0.0,
-            float(np.mean(totals)) if totals else 0.0,
-        ])
-
-    # Multi-hot, not one-hot: a road can open onto more than one port.
-    ports = np.zeros(len(PORT_KINDS), dtype=np.float32)
-    lookup = _port_lookup(catan_map)
-    for other in reachable:
-        index = lookup.get(other)
-        if index is not None:
-            ports[index] = 1.0
-
-    return np.concatenate([np.array(features, dtype=np.float32), ports])
-
-
-_ROAD_BLOCK_WIDTHS = (
-    ("reach_1", 3),   # settleable corners one road further: count, best, mean
-    ("reach_2", 3),   # and two roads further
-    ("reach_ports", len(PORT_KINDS)),
-)
-
-
-def road_feature_size() -> int:
-    """Length of a :func:`road_features` vector."""
-    return sum(width for _, width in _ROAD_BLOCK_WIDTHS)
-
-
 def node_features(game, color, node_id: int, assume_owned=()) -> np.ndarray:
     """Encode one candidate settlement node from ``color``'s point of view.
 
@@ -320,24 +246,6 @@ def _build_offsets(widths=_BLOCK_WIDTHS):
 
 
 FEATURE_SLICES, _TOTAL_WIDTH = _build_offsets()
-ROAD_FEATURE_SLICES, _ROAD_WIDTH = _build_offsets(_ROAD_BLOCK_WIDTHS)
-
-
-def corner_features(game, color, node_id, edge, assume_owned=()) -> np.ndarray:
-    """One opening corner: the settlement and the road that comes with it.
-
-    Concatenation order is fixed -- settlement block then road block -- so a
-    model reading these keeps a consistent meaning for each slice.
-    """
-    return np.concatenate([
-        node_features(game, color, node_id, assume_owned=assume_owned),
-        road_features(game, color, node_id, edge, assume_owned=assume_owned),
-    ])
-
-
-def corner_feature_size() -> int:
-    """Length of a :func:`corner_features` vector."""
-    return feature_size() + road_feature_size()
 
 
 def feature_size() -> int:

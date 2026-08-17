@@ -6,8 +6,9 @@ seam is what makes the comparison clean: the same agent with and without the
 scorer differs only in its opening, so a benchmark between them measures the
 opening and nothing else.
 
-Initial *roads* are left to the inner agent on purpose. The scorer ranks corners,
-and inventing a road policy here would smuggle in an extra untested change.
+Initial *roads* are left to the inner agent on purpose. The scorer ranks corners;
+a bundle model over corners *and* roads was tried and measured 44.1% against this
+one, so the narrow seam is also the stronger one.
 """
 
 from catanatron.models.enums import ActionType
@@ -50,21 +51,6 @@ class PlacementPlayer(Player):
                 nodes = [a.value for a in settlements]
                 chosen = self.chooser.choose(game, self.color, nodes)
                 return next(a for a in settlements if a.value == chosen)
-
-            roads = [
-                a for a in playable_actions
-                if a.action_type == ActionType.BUILD_ROAD
-            ]
-            # Only when the chooser is actually planning openings. Without a
-            # bundle model it has no opinion about roads, and the inner agent
-            # keeps them -- which is what every earlier measurement did.
-            if roads and self.chooser.plans_roads:
-                edge = self.chooser.choose_road(
-                    game, self.color, [a.value for a in roads]
-                )
-                return next(
-                    a for a in roads if tuple(sorted(a.value)) == tuple(sorted(edge))
-                )
         return self.inner.decide(game, playable_actions)
 
     def reset_state(self):

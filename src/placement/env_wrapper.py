@@ -77,15 +77,7 @@ class PlacementWrapper(Wrapper):
             a for a in actions if a.action_type == ActionType.BUILD_SETTLEMENT
         ]
         if not settlements:
-            roads = [a for a in actions if a.action_type == ActionType.BUILD_ROAD]
-            if roads and self.chooser.plans_roads:
-                edge = self.chooser.choose_road(
-                    game, color, [a.value for a in roads]
-                )
-                return next(
-                    a for a in roads
-                    if tuple(sorted(a.value)) == tuple(sorted(edge))
-                )
+            # Initial roads: the scorer has no opinion about them, by design.
             return self.rng.choice(list(actions))
 
         nodes = [a.value for a in settlements]

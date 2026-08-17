@@ -20,8 +20,15 @@ before the second exists, so it cannot know what it will be paired with. See
 Two things about the loss are worth expecting in advance. It will look terrible
 -- labels are +-1 and 0 with enormous variance, so a validation MSE near 0.8 is
 normal and improving it to 0.7 is a large gain. And it is not the number to
-steer by: :mod:`src.placement.evaluate` reports whether the model learned dice
-numbers, and :mod:`src.eval.benchmark` reports whether that wins games.
+steer by: only :mod:`src.eval.benchmark` reports whether a scorer wins games.
+The rank/rho diagnostic that used to print here was removed along with the
+hand-written yardstick it scored against, so **games are now the only check on a
+refit** -- budget 800+ of them.
+
+**The shipped scorers were fitted under the old rules**, on rollouts that never
+ran to 12 or 15 VP. Whether corner values shift when the game runs longer is
+untested, and it is the most likely place a stale assumption is still costing
+points -- which is why this pipeline is kept.
 
 Usage:
     python -m src.placement.dataset --pairs 2000 --workers 8
@@ -36,15 +43,10 @@ import torch
 import torch.nn as nn
 
 from src.placement.dataset import flatten_pairs
-from src.placement.evaluate import diagnose, format_diagnosis
 from src.placement.features import feature_size
 from src.placement.model import BundleNet, PlacementNet
 
 FEATURE_SIZE = feature_size()
-
-# Held-out board seeds for the diagnostic. Fixed so the number means the same
-# thing across runs, and far away from the default data-generation seeds.
-DIAGNOSTIC_SEEDS = tuple(range(900_000, 900_040))
 
 
 def load_pairs(path):
@@ -77,16 +79,14 @@ def load_bundles(path):
     return blob["bundles"].astype(np.float32), blob["deltas"].astype(np.float32)
 
 
-def drop_road_features(bundles):
-    """Keep only the settlement half of each corner in a bundle array.
+def trim_to_settlements(bundles):
+    """Keep only the settlement columns of each corner in a bundle array.
 
-    Data generation records the opening road alongside the settlement, which is
-    right -- the road is a real decision and leaving it unrecorded was a bug.
-    But a bundle model *trained* on those 12 extra dimensions per corner scored
-    44.1% against the settlement-only one over 1200 games: the road features
-    swamped the complementarity signal that pair-scoring exists to capture. So
-    the shipped bundle model is fitted on this slice. Road features are appended
-    after the node features, so the leading columns are exactly the old format.
+    Back-compatibility with ``.npz`` files generated while the opening road was
+    also being featurised. That model scored 44.1% against the settlement-only
+    one over 1200 games and the road dimensions are no longer emitted, but old
+    data still carries them and they trail the node features, so the leading
+    columns are exactly the current format.
     """
     return np.ascontiguousarray(bundles[..., :FEATURE_SIZE])
 
@@ -209,10 +209,6 @@ def main():
     parser.add_argument("--target", choices=("corner", "bundle"), default="corner",
                         help="corner: score one settlement at a time (default). "
                              "bundle: score both corners of an opening jointly.")
-    parser.add_argument("--keep-road-features", action="store_true",
-                        help="Fit the bundle on the road dimensions too. Off by "
-                             "default: the roads model measured 44.1%% against "
-                             "the settlement-only one. See drop_road_features.")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -228,10 +224,10 @@ def main():
 
     if args.target == "bundle":
         bundles, deltas = load_bundles(args.data)
-        if not args.keep_road_features and bundles.shape[-1] > FEATURE_SIZE:
-            print(f"dropping road features: {bundles.shape[-1]} -> {FEATURE_SIZE} "
-                  f"per corner")
-            bundles = drop_road_features(bundles)
+        if bundles.shape[-1] > FEATURE_SIZE:
+            print(f"trimming legacy road columns: {bundles.shape[-1]} -> "
+                  f"{FEATURE_SIZE} per corner")
+            bundles = trim_to_settlements(bundles)
         fit = lambda: train_bundle(bundles, deltas, **kwargs)  # noqa: E731
         unit = f"{len(bundles)} pairs -> {2 * len(bundles)} openings"
     else:
@@ -245,10 +241,7 @@ def main():
     net, _ = fit()
     path = net.save(args.out)
     print(f"saved -> {path}")
-    # The rank/rho diagnostic ranks single corners, so it has nothing to say
-    # about a bundle scorer. Games are the metric there.
-    if args.target == "corner":
-        print(format_diagnosis(diagnose(net, DIAGNOSTIC_SEEDS)))
+    print("validate this with src.eval.benchmark, not with the loss above")
 
 
 if __name__ == "__main__":

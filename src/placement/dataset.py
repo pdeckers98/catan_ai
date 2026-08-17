@@ -66,13 +66,10 @@ from catanatron.players.weighted_random import WeightedRandomPlayer
 from src.env.catan_env import MAX_TURNS, make_1v1_game
 from src.env.dice import fixed_dice
 from src.placement.features import (
-    corner_feature_size,
     encode_candidates,
     feature_size,
-    legal_road_edges,
     node_features,
     open_nodes,
-    road_features,
 )
 
 # Corners per pair: the first seat's two, then the second seat's two.
@@ -143,15 +140,15 @@ class ExplorerPlayer(Player):
         # explored uniformly at random: under these rules a road buys only
         # expansion, and leaving it to the rollout bot would put an uncontrolled
         # variable inside a comparison built to control everything but the
-        # opening.
+        # opening. The roads are *not* modelled -- see the note on the bundle
+        # below -- but they are recorded so the duplicate replay can reproduce
+        # them, which is what keeps the pair a controlled comparison.
         self.roads = []
         # Partner corners encoded at the *first* pick's board state, keyed by
         # node. Captured there because that is the only moment a first-pick
         # decision can be asked "what is the best second corner this opens up?"
         # -- by the real second pick the answer is already spent.
         self._partners = {}
-        self._partner_roads = {}   # (node, edge) -> road features
-        self._own_roads = {}       # edge -> road features, off the first pick
 
     def decide(self, game, playable_actions):
         settlements = [
@@ -188,29 +185,16 @@ class ExplorerPlayer(Player):
         return next(a for a in settlements if a.value == chosen)
 
     def _cache_openings(self, game, chosen):
-        """Encode every corner+road this first pick could still be paired with.
+        """Encode every corner this first pick could still be paired with.
 
         Done here and nowhere else: the first pick is the only moment at which
         "what does this open up?" is still an open question, so it is the state
         the opening model has to be trained on.
         """
-        self._own_roads = {
-            tuple(edge): road_features(game, self.color, chosen, edge)
-            for edge in legal_road_edges(chosen)
-        }
         for node in open_nodes(game):
             self._partners[node] = node_features(
                 game, self.color, node, assume_owned=(chosen,)
             )
-            for edge in legal_road_edges(node):
-                # No assume_owned here, deliberately: the chooser computes
-                # partner road reach once at the base board rather than per
-                # candidate first corner, and the two must agree. The corners
-                # are non-adjacent, so the expansion rings they block for each
-                # other rarely overlap.
-                self._partner_roads[(node, tuple(edge))] = road_features(
-                    game, self.color, node, edge
-                )
 
     def _decide_road(self, roads):
         if self.forced_roads:
@@ -227,24 +211,26 @@ class ExplorerPlayer(Player):
         return action
 
     def bundle(self):
-        """(2, F): this seat's two corners, settlement and road, at the first pick.
+        """(2, F): this seat's two settlements, encoded at the first pick.
 
         The second corner carries ``assume_owned=(first,)``, so the vector says
         what it is worth *given* the first -- which is the pairing a per-corner
         scorer never sees. Returns None if the seat did not open fully.
+
+        **Roads are excluded on purpose.** A bundle over (settlement, road) x 2
+        was tried and scored 44.1% over 1200 games against this one: the 24 road
+        dimensions swamped the complementarity signal and the settlement choice
+        collapsed back toward greedy. The roads still get *replayed* on the swap
+        -- see ``self.roads`` -- because controlling them is right even though
+        modelling them is not.
         """
         if len(self.picks) != 2 or len(self.roads) != 2:
             return None
         (_, first_features), (second, _) = self.picks
-        first_road = self._own_roads.get(self.roads[0])
         partner = self._partners.get(second)
-        partner_road = self._partner_roads.get((second, self.roads[1]))
-        if first_road is None or partner is None or partner_road is None:
+        if partner is None:
             return None
-        return np.stack([
-            np.concatenate([first_features, first_road]),
-            np.concatenate([partner, partner_road]),
-        ])
+        return np.stack([first_features, partner])
 
 
 def _outcome(game, color) -> float:
@@ -313,7 +299,7 @@ def _empty_pair():
     return (
         np.zeros((0, PAIR_NODES, feature_size()), np.float32),
         np.zeros(0, np.float32),
-        np.zeros((0, 2, 2, corner_feature_size()), np.float32),
+        np.zeros((0, 2, 2, feature_size()), np.float32),
     )
 
 

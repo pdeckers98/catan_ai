@@ -27,8 +27,14 @@ a loss, which depresses its Q until the real value arrives. This changes search
 results for a given seed, so it is off by default -- ``batch_size=1`` reproduces
 the serial search exactly.
 
-The search operates on a real ``Game`` and copies it as it descends. That copy is
-the dominant cost per *simulation*; see ``src.eval.bench_mcts`` for the budget.
+The search operates on a real ``Game`` and copies it as it descends. Measured on
+the dev box, the evaluator's forward pass dominates that copy roughly 20:1
+(~604 us against ~32 us), which is why batching leaves is the lever and shrinking
+the net is not.
+
+**Search saturates by ~50 simulations** against a PPO critic: 50 sims is worth
++9.8 points in a mirror match and 100 sims only 60.8%. The ceiling is the value
+estimate, not the budget -- see :class:`~src.agent.evaluator.PPOEvaluator`.
 """
 
 import math
