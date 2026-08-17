@@ -80,6 +80,23 @@ upstream's `apply_action` for `DISCARD` and never logged the action, so **every 
 was silently missing its discards**. Replay desynced on the first 7 where a hand went over the
 limit. Fixed, with a regression test in `tests/test_rules.py`.
 
+## What the wire looks like (from the first capture, login + lobby only)
+
+- **Socket:** `wss://socket.svr.colonist.io/?version=2`. Ignore everything else the browser
+  opens — a Discord login gateway and a dozen `127.0.0.1` RPC ports were most of the first
+  recording.
+- **Encoding: msgpack, not JSON**, in both directions.
+- **Server → client:** bare msgpack. Two envelope shapes so far — `{"type": "Connected",
+  "userSessionId": ...}` / `{"type": "SessionEstablished"}`, and `{"id": "139", "data": {"type":
+  1, "payload": {...}}}` where `id` looks like a subscription and `type` a message code.
+- **Client → server:** a routing header first — `0x02 <id> <len> <room-name>` — then msgpack
+  `{"action": <int>, "payload": ...}`. `room-name` was `"lobby"`; in a game it is presumably the
+  game id. The second header byte varies (`02`, `07`, `0b`) while the room does not, and one
+  capture does not say what it counts.
+- So the action sender is likely **frames, not clicks**, if the server accepts them — which would
+  remove the entire coordinate-translation problem below. Not yet established; a game capture
+  showing our own moves is what settles it.
+
 ## Components still to build
 
 1. **Protocol translator** — turn colonist.io's WebSocket JSON into a `BoardSpec` and a stream of
