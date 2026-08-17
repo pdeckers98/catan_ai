@@ -22,3 +22,6 @@ wandb
 # WebSocket frames over CDP, so it is the whole transport, not just the clicker.
 # After installing: playwright install chromium
 playwright
+# colonist.io's binary frames are not JSON; msgpack is the first thing to try on
+# them (src/bridge/capture.py falls back gracefully if it is missing).
+msgpack

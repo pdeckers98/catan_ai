@@ -55,6 +55,20 @@ protocol translator ──► BoardSpec + observed Actions ──► GameReplay 
   `DesyncError` immediately, because silent drift is the failure mode that looks like a weak agent.
   It also **forces the seating order**: `State.__init__` shuffles the players, and in 1v1 the first
   seat settles first.
+- **`capture.py`** — the read half of the transport, run standalone and by hand. It opens a real
+  browser (persistent profile under `data/bridge/profile`, so you log in once), you play or
+  spectate, and every WebSocket frame in both directions lands in a JSONL file. It automates
+  nothing and never clicks. Frames are decoded best-effort — socket.io's integer prefix is
+  unwrapped, binary frames are tried as msgpack then JSON — and anything that resists is kept as
+  base64 rather than dropped, because an unparsed frame is evidence too.
+  `--summarize` reads a capture back as a histogram of message types with one example each, which
+  is the form a protocol is actually readable in; a full game is megabytes.
+
+  ```bash
+  python -m src.bridge.capture --label game1
+  python -m src.bridge.capture --summarize data/bridge/game1-<stamp>.jsonl
+  python -m src.bridge.capture --summarize <file> --only sent --chars 2000   # drill in
+  ```
 - **`player.py`** — `build_bridge_player`, which refuses to build anything less than all three
   artifacts. Every other entry point makes search and the placement models optional flags, which is
   right for benchmarking and wrong for live play.
@@ -109,12 +123,18 @@ limit. Fixed, with a regression test in `tests/test_rules.py`.
 
 ## What is blocked on captured traffic
 
-The protocol is undocumented, so nothing colonist-specific can be written without recordings:
+The protocol is undocumented, so nothing colonist-specific can be written without recordings.
+`capture.py` collects them; what is still needed is the *playing*:
 
 - **2–4 complete 1v1 games** as raw WebSocket frames, both directions, ideally covering a 7 with a
   discard, a dev card bought and later played, a port trade, and a robber steal each way.
-- **The lobby settings**, to check against the seven patches.
+- **The lobby settings**, to check against the seven patches. Capture the lobby screen too — the
+  settings are sent over the same socket when a game is created.
 - **A DOM dump of a live board**, for the click layer.
+
+Frames the agent's own moves generate are as valuable as the ones it receives: the `sent`
+direction is the entire specification of the action sender, and it can only be learned by
+playing the moves by hand and reading what the page emitted.
 
 ## Deps
 

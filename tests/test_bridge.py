@@ -7,6 +7,8 @@ the original. A silent mismatch there looks like a weak agent, not like a bug,
 so it is pinned before any protocol work starts.
 """
 
+import base64
+
 import numpy as np
 import pytest
 
@@ -18,6 +20,7 @@ from catanatron.players.weighted_random import WeightedRandomPlayer
 
 from src.agent.encoding import encode_observation
 from src.bridge.board import BoardSpec, build_map_from_spec, spec_from_map
+from src.bridge.capture import decode_payload, message_type, shape
 from src.bridge.player import build_bridge_player
 from src.bridge.replay import DesyncError, GameReplay, blank_outcome
 from src.env.catan_env import make_1v1_game
@@ -156,6 +159,44 @@ def test_replay_raises_on_an_action_the_reconstructed_game_does_not_allow():
     # An end-of-turn before anyone has finished settling is never legal.
     with pytest.raises(DesyncError):
         replay.apply(Action(seating[0], ActionType.END_TURN, None))
+
+
+# --------------------------------------------------------------------------
+# Capture decoding
+# --------------------------------------------------------------------------
+def test_text_frame_unwraps_the_socket_io_prefix():
+    """``42[...]`` is engine.io bookkeeping around the JSON we actually want."""
+    decoded = decode_payload('42["game",{"n":1}]', opcode=1)
+
+    assert decoded["encoding"] == "json"
+    assert decoded["payload"] == ["game", {"n": 1}]
+    assert decoded["socketio_prefix"] == "42"
+
+
+def test_binary_frame_decodes_as_msgpack():
+    msgpack = pytest.importorskip("msgpack")
+    payload = base64.b64encode(msgpack.packb({"type": 7})).decode()
+
+    assert decode_payload(payload, opcode=2) == {"encoding": "msgpack", "payload": {"type": 7}}
+
+
+def test_an_undecodable_frame_is_kept_rather_than_dropped():
+    """A frame nobody can parse is still evidence about the protocol."""
+    decoded = decode_payload("not json at all", opcode=1)
+
+    assert decoded == {"encoding": "text", "payload": "not json at all"}
+
+
+def test_message_type_descends_into_a_nested_envelope():
+    """The label has to be a scalar, or every message becomes its own group."""
+    label = message_type({"action": {"type": 2, "payload": {"anything": [1, 2, 3]}}})
+
+    assert label == "action.type=2"
+
+
+def test_shape_keeps_both_halves_of_a_socket_io_frame():
+    """Collapsing a 2-list to "first element x2" would hide the whole payload."""
+    assert shape(["game_event", {"type": 8}]) == ["str", {"type": "int"}]
 
 
 # --------------------------------------------------------------------------
