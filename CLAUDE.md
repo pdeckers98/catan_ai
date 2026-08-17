@@ -40,7 +40,7 @@ the agent and, later, the web integration.
   see `checkpoints/archive/` below. Raise `--max-turns` to 1500 at 15 VP; the default 1000
   is already binding there, and a truncated episode pays 0, so capped games teach nothing.
 - **Custom rules**: `src/env/rules.py` monkeypatches Catanatron at import time. Applied
-  automatically via `src/env/catan_env.py`. Seven patches:
+  automatically via `src/env/catan_env.py`. Eight patches:
   1. discard on a 7 only above **9** cards (`discard_limit=9`, vs. stock 7)
   2. per-resource, one-card-at-a-time discard the policy actually chooses
      (expands the action space 290 → **294**)
@@ -51,6 +51,9 @@ the agent and, later, the web integration.
   6. a dev card **cannot be played the turn it was bought** (one-per-turn is already
      enforced upstream)
   7. `_discard_remaining` survives `State.copy()` — required for MCTS
+  8. **Road Building playable while broke** — upstream gates the card behind
+     affording a road, though its two roads are free. Found via the colonist
+     bridge; **every agent trained before this could not play it when short**
 - **Opening placement**: a separate self-trained specialist (`src/placement/`). Initial settlement
   choice gets ~2 of ~300 gradient samples per episode, so the main policy learned "settle where
   three tiles meet" but never learned that an 8 beats a 3. The specialist trains on random

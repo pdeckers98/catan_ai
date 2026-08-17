@@ -84,9 +84,28 @@ upstream's `apply_action` for `DISCARD` and never logged the action, so **every 
 was silently missing its discards**. Replay desynced on the first 7 where a hand went over the
 limit. Fixed, with a regression test in `tests/test_rules.py`.
 
-## The protocol (decoded from one complete 1v1 game, `game1`, 2026-08-17)
+## The protocol (decoded from two complete 1v1 games, 2026-08-17)
 
-A full ranked-style 1v1 (87 turns, 2459 frames) was captured and read back. What it settles:
+Two full 1v1 games (87 and 94 turns) were captured and read back — one won, one lost. **Every
+action in both replays legally through `GameReplay`**, which is the strongest offline statement
+the bridge can make. What they settle:
+
+The second game was recorded as a held-out test and earned its keep immediately:
+
+- **Dev card 14 is Road Building**, played twice and each time followed by two free roads. It had
+  been left unmapped rather than inferred; now it is observed.
+- Two new log entries, both consequences rather than decisions: **68** an achievement changing
+  hands, **139** a player-count notice.
+- **An upstream catanatron bug**: `road_building_possibilities` gates `PLAY_ROAD_BUILDING` behind
+  being able to *afford* a road, though the card's two roads are free. The opponent played it with
+  an empty hand, won longest road and won the game; the reconstruction refused the move. Fixed as
+  patch 8 in `src/env/rules.py` — and note it means **every agent trained before this could not
+  play Road Building when short of resources**, which is when it is worth the most.
+
+What still does not reconstruct exactly: the opponent's **unplayed** dev cards. Game 2's opponent
+bought twenty and played sixteen; the four never revealed are drawn at random by the engine, so the
+final tally came out at 14 VP instead of 15. Legality is unaffected — this is the residual hidden
+information, not a decoding error.
 
 **The lobby matches our house rules.** The settings frame carries `victoryPointsToWin: 15`,
 `cardDiscardLimit: 9`, `maxPlayers: 2`, `friendlyRobber: true` — the VP target, the discard limit

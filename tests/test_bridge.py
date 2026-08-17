@@ -379,6 +379,7 @@ def test_a_played_card_reveals_the_purchase_that_bought_it():
     actions = [
         Action(Color.RED, ActionType.BUY_DEVELOPMENT_CARD, None),
         Action(Color.RED, ActionType.BUY_DEVELOPMENT_CARD, None),
+        Action(Color.RED, ActionType.END_TURN, None),
         Action(Color.RED, ActionType.PLAY_KNIGHT_CARD, None),
     ]
 
@@ -386,6 +387,21 @@ def test_a_played_card_reveals_the_purchase_that_bought_it():
 
     assert revealed[0].value == "KNIGHT"
     assert revealed[1].value is None  # never revealed, so still unknown
+
+
+def test_a_card_played_the_turn_it_was_bought_reveals_nothing():
+    """Neither ruleset allows it, so such a purchase cannot be the source.
+
+    Attributing it anyway builds a hand the engine refuses to play from, which
+    is how this surfaced: an opponent who bought twenty cards and played sixteen
+    desynced on a road building it demonstrably held.
+    """
+    actions = [
+        Action(Color.RED, ActionType.BUY_DEVELOPMENT_CARD, None),
+        Action(Color.RED, ActionType.PLAY_KNIGHT_CARD, None),
+    ]
+
+    assert protocol.reveal_purchases(actions)[0].value is None
 
 
 @pytest.mark.skipif(not CAPTURES, reason="no colonist capture recorded locally")

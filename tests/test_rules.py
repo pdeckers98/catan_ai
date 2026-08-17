@@ -8,6 +8,7 @@ import numpy as np
 
 from catanatron import Color
 from catanatron.models.enums import Action, ActionType
+import catanatron.state as catanatron_state
 from catanatron.state_functions import player_key
 
 from src.agent.encoding import action_size
@@ -410,3 +411,62 @@ def test_bought_this_turn_counter_survives_state_copy():
     copied = state.copy()
     field = f"{key}_{card}_BOUGHT_THIS_TURN"
     assert copied.player_state[field] == state.player_state[field] == 1
+
+
+def _broke_player_holding_road_building(seed=3):
+    """Past the opening, holding Road Building and nothing else."""
+    game = make_1v1_game(seed=seed)
+    state = game.state
+    while state.is_initial_build_phase:
+        game.execute(state.playable_actions[0], validate_action=False)
+
+    color = state.current_color()
+    key = player_key(state, color)
+    state.player_state[f"{key}_HAS_ROLLED"] = True
+    for resource in ("WOOD", "BRICK", "SHEEP", "WHEAT", "ORE"):
+        state.player_state[f"{key}_{resource}_IN_HAND"] = 0
+    state.player_state[f"{key}_ROAD_BUILDING_IN_HAND"] = 1
+    # Looked up on the module, not imported by name: the rule patches rebind the
+    # attribute, and this test file imports catanatron before src.env applies them.
+    state.playable_actions = catanatron_state.generate_playable_actions(state)
+    return game, state, color
+
+
+def test_road_building_can_be_played_without_the_money_for_a_road():
+    """The card gives *free* roads, so affording one cannot be the price of entry.
+
+    Upstream gates ``PLAY_ROAD_BUILDING`` behind the same affordability check it
+    uses to offer ordinary paid road builds, which locks the card away exactly
+    when it is worth most. A colonist opponent played it with an empty hand and
+    won on longest road; the reconstruction refused the move.
+    """
+    _, state, color = _broke_player_holding_road_building()
+
+    assert Action(color, ActionType.PLAY_ROAD_BUILDING, None) in state.playable_actions
+
+
+def test_road_building_places_both_roads_while_still_broke():
+    """Getting in is not enough; the two free roads have to be placeable too."""
+    game, state, color = _broke_player_holding_road_building()
+    game.execute(Action(color, ActionType.PLAY_ROAD_BUILDING, None),
+                 validate_action=False)
+
+    roads = 0
+    while state.is_road_building and state.free_roads_available > 0:
+        road = next(a for a in state.playable_actions
+                    if a.action_type == ActionType.BUILD_ROAD)
+        game.execute(road, validate_action=False)
+        roads += 1
+
+    assert roads == 2
+    key = player_key(state, color)
+    assert state.player_state[f"{key}_WOOD_IN_HAND"] == 0  # and still free
+    assert state.player_state[f"{key}_BRICK_IN_HAND"] == 0
+
+
+def test_paid_road_building_still_requires_the_resources():
+    """The affordability test is correct in its third use, so it must survive."""
+    _, state, color = _broke_player_holding_road_building()
+
+    assert not [a for a in state.playable_actions
+                if a.action_type == ActionType.BUILD_ROAD]

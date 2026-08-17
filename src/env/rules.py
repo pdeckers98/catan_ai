@@ -4,7 +4,7 @@ We keep these as monkeypatches (not edits to the installed package) so the chang
 lives in version control and is reapplied automatically in every process -- including
 the fresh interpreters that ``SubprocVecEnv`` spawns for parallel training.
 
-Seven things happen here:
+Eight things happen here:
 
 1. **Discard threshold raised to 9.** Stock Catanatron makes you discard on a 7
    when you hold *more than 7* cards (``discard_limit=7``). The gym env builds
@@ -59,6 +59,14 @@ Seven things happen here:
    it. That is harmless when copies are only taken by accumulators, but MCTS
    copies mid-game constantly -- a search descending through a 7 would re-derive
    the quota from an already-partly-discarded hand and discard too many cards.
+
+8. **Road Building works when you cannot afford a road.** Not a house rule: an
+   upstream bug. ``road_building_possibilities`` serves three purposes, and its
+   affordability check is right for only one of them, so a player with no wood
+   and brick could not play the card that hands out two *free* roads. Found by
+   the colonist.io bridge, where an opponent did exactly that and won on longest
+   road. Note the consequence for everything trained before this landed: those
+   agents never had the card available when it mattered most.
 """
 
 import gymnasium.spaces as _spaces
@@ -104,6 +112,7 @@ def apply_rule_patches(discard_limit: int = DISCARD_LIMIT,
     if not longest_road_vp:
         _patch_no_longest_road()
     _patch_dev_card_summoning_sickness()
+    _patch_free_road_building()
     _patch_gym_action_space()
     setattr(_game_mod, _PATCH_FLAG, True)
 
@@ -382,6 +391,69 @@ def _patch_dev_card_summoning_sickness() -> None:
         module.buy_dev_card = patched_buy
         module.player_clean_turn = patched_clean
         module.player_can_play_dev = patched_can_play
+
+
+# --------------------------------------------------------------------------
+# Road Building gives free roads, so it must not require road money
+# --------------------------------------------------------------------------
+def _patch_free_road_building() -> None:
+    """Let a player play Road Building, and place its roads, while broke.
+
+    Upstream ``road_building_possibilities`` asks whether the player can *afford*
+    a road, and that one function serves three different jobs: offering ordinary
+    paid road builds (correct), gating ``PLAY_ROAD_BUILDING`` (wrong), and
+    generating the two free roads once the card is played (wrong). So a player
+    without wood and brick could neither play the card nor finish placing its
+    roads -- even though ``apply_action`` builds them free, passing
+    ``build_road(..., True)``.
+
+    Found by the colonist.io bridge: an opponent played Road Building with an
+    empty hand, won longest road with it and won the game, and the reconstruction
+    refused the move. This is upstream being wrong rather than colonist being
+    different, which is why it is fixed rather than reconciled.
+
+    It follows that **every agent trained here has been unable to play Road
+    Building while short of a road's resources** -- exactly when the card is
+    worth the most.
+
+    Two changes, because the money test is right in one of the three uses:
+
+    - during road building the roads are free, so the affordability test is
+      skipped there;
+    - the ``PLAY_ROAD_BUILDING`` gate is re-derived after the fact, since it is
+      inline in ``generate_playable_actions`` and cannot be patched in place.
+    """
+    orig_possibilities = _actions_mod.road_building_possibilities
+    orig_generate = _actions_mod.generate_playable_actions
+
+    def patched_possibilities(state, color):
+        if getattr(state, "is_road_building", False) and state.free_roads_available > 0:
+            key = player_key(state, color)
+            if state.player_state[f"{key}_ROADS_AVAILABLE"] <= 0:
+                return []
+            return [Action(color, ActionType.BUILD_ROAD, edge)
+                    for edge in state.board.buildable_edges(color)]
+        return orig_possibilities(state, color)
+
+    def patched_generate(state):
+        actions = orig_generate(state)
+        if state.current_prompt != ActionPrompt.PLAY_TURN or state.is_road_building:
+            return actions
+        color = state.current_color()
+        already = any(a.action_type == ActionType.PLAY_ROAD_BUILDING for a in actions)
+        rolled = _state_functions_mod.player_has_rolled(state, color)
+        if already or not rolled:
+            return actions
+        key = player_key(state, color)
+        can_place = (state.player_state[f"{key}_ROADS_AVAILABLE"] > 0
+                     and len(state.board.buildable_edges(color)) > 0)
+        if can_place and _actions_mod.player_can_play_dev(state, color, "ROAD_BUILDING"):
+            actions.append(Action(color, ActionType.PLAY_ROAD_BUILDING, None))
+        return actions
+
+    for module in (_actions_mod, _state_mod):
+        module.road_building_possibilities = patched_possibilities
+        module.generate_playable_actions = patched_generate
 
 
 # --------------------------------------------------------------------------

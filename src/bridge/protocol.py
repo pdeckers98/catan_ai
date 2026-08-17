@@ -65,16 +65,16 @@ HIDDEN_CARD = 0  # what the opponent's hand looks like to us
 # enum plus one.
 PORT_GENERIC = 1
 
-# Development cards. 11, 13 and 15 were each played in the captured game and
-# identified by what followed them. 12 was only ever held, but the end-of-game
-# deck statistics show it drawn three times, and the deck holds just two each of
+# Development cards, each identified by what followed it being played: 11 moves
+# the robber, 13 takes every card of one resource, 15 draws two, and 14 is
+# followed by two free roads. 12 was only ever held, but the end-of-game deck
+# statistics show it drawn three times, and the deck holds just two each of
 # monopoly, year of plenty and road building -- so 12 is a knight or a victory
-# point, and 11 is already the knight. 14 was never seen at all and is left out
-# on purpose: by elimination it is road building, but eliminating is not
-# observing, and a wrong guess here would misplay a card rather than crash.
+# point, and 11 is already the knight.
 DEV_KNIGHT = 11
 DEV_VICTORY_POINT = 12
 DEV_MONOPOLY = 13
+DEV_ROAD_BUILDING = 14
 DEV_YEAR_OF_PLENTY = 15
 DEV_HIDDEN = 10
 
@@ -104,9 +104,11 @@ LOG_MONOPOLY = 86
 LOG_BANK_TRADE = 116
 
 # Log entries that describe consequences rather than decisions. The engine
-# derives all of these itself, so they produce no action.
+# derives all of these itself, so they produce no action: resource payouts,
+# achievements being won (66) and changing hands (68), a blocked tile, the win,
+# and a player-count notice (139) that has nothing to do with the position.
 LOG_IGNORED = frozenset({
-    2, 22, 45, 47, 49, 60, 66, 74,
+    2, 22, 45, 47, 49, 60, 66, 68, 74, 139,
 })
 
 
@@ -548,11 +550,20 @@ class _ActionDecoder:
             self.actions.append(Action(color, ActionType.MARITIME_TRADE, value))
 
     def _played_dev_card(self, text: dict, diff: dict) -> None:
-        """A knight resolves here; monopoly and year of plenty need their result."""
+        """A knight or road building resolves here; the others need their result.
+
+        Knight and road building are complete decisions on their own -- what
+        follows (the robber move, the two free roads) arrives as its own log
+        entry and becomes its own action, which is exactly how the engine
+        prompts for them. Monopoly and year of plenty carry their choice in a
+        later entry, so they wait.
+        """
         card = text.get("cardEnum")
         color = self._color(text["playerColor"])
-        if card == DEV_KNIGHT:
-            self.actions.append(Action(color, ActionType.PLAY_KNIGHT_CARD, None))
+        if card in (DEV_KNIGHT, DEV_ROAD_BUILDING):
+            action_type = (ActionType.PLAY_KNIGHT_CARD if card == DEV_KNIGHT
+                           else ActionType.PLAY_ROAD_BUILDING)
+            self.actions.append(Action(color, action_type, None))
             self.pending_dev_card = None
             return
         if card in (DEV_MONOPOLY, DEV_YEAR_OF_PLENTY):
@@ -597,6 +608,7 @@ _CATANATRON_DEV_CARD = {
     DEV_KNIGHT: "KNIGHT",
     DEV_VICTORY_POINT: "VICTORY_POINT",
     DEV_MONOPOLY: "MONOPOLY",
+    DEV_ROAD_BUILDING: "ROAD_BUILDING",
     DEV_YEAR_OF_PLENTY: "YEAR_OF_PLENTY",
 }
 
@@ -618,29 +630,40 @@ def reveal_purchases(actions: List[Action]) -> List[Action]:
     did not give them.
 
     In a *finished* capture the answer is already on the tape: a card that was
-    played was bought earlier -- neither colonist nor our rules allow playing one
-    the turn it was bought -- so each revealed card can be attributed to that
-    player's earliest still-unexplained purchase. Purchases never revealed stay
-    ``None``, which is honest: they were victory points, or they were never used.
+    played was bought earlier, so each revealed card can be attributed to one of
+    that player's still-unexplained purchases. Purchases never revealed stay
+    ``None``, which is honest: they were victory points, or were never used.
+
+    "Earlier" has to mean *on an earlier turn*, not merely earlier in the
+    sequence. Neither colonist nor `src/env/rules.py` lets a card be played the
+    turn it was bought, so attributing a card to a purchase from the same turn
+    produces a hand the engine will refuse to play from -- which is precisely
+    how this was found, on a player who bought twenty cards and played sixteen.
 
     **This is for replaying recorded games, not for live play.** Live, the card
     stays unknown until it is played, and that is a determinization problem, not
     a decoding one.
     """
     revealed = list(actions)
-    pending: Dict[Color, List[int]] = {}
+    pending: Dict[Color, List[Tuple[int, int]]] = {}  # color -> [(turn, index)]
+    turn = 0
     for index, action in enumerate(revealed):
+        if action.action_type == ActionType.END_TURN:
+            turn += 1
+            continue
         if (action.action_type == ActionType.BUY_DEVELOPMENT_CARD
                 and action.value is None):
-            pending.setdefault(action.color, []).append(index)
+            pending.setdefault(action.color, []).append((turn, index))
             continue
         card = _PLAYED_DEV_CARD.get(action.action_type)
         if card is None:
             continue
-        bought = pending.get(action.color)
-        if not bought:
-            continue
-        revealed[bought.pop(0)] = Action(
+        bought = pending.get(action.color, [])
+        playable = next((entry for entry in bought if entry[0] < turn), None)
+        if playable is None:
+            continue  # nothing it could have come from; leave the replay to complain
+        bought.remove(playable)
+        revealed[playable[1]] = Action(
             action.color, ActionType.BUY_DEVELOPMENT_CARD, card)
     return revealed
 
