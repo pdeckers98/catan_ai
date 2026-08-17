@@ -80,6 +80,56 @@ upstream's `apply_action` for `DISCARD` and never logged the action, so **every 
 was silently missing its discards**. Replay desynced on the first 7 where a hand went over the
 limit. Fixed, with a regression test in `tests/test_rules.py`.
 
+## The protocol (decoded from one complete 1v1 game, `game1`, 2026-08-17)
+
+A full ranked-style 1v1 (87 turns, 2459 frames) was captured and read back. What it settles:
+
+**The lobby matches our house rules.** The settings frame carries `victoryPointsToWin: 15`,
+`cardDiscardLimit: 9`, `maxPlayers: 2`, `friendlyRobber: true` — the VP target, the discard limit
+and the robber restriction the agent was trained under, confirmed rather than assumed. Also
+present and not yet checked against anything: `diceSetting: 1`, `eloType`, `gameSpeed`.
+
+**The server sends one full state, then diffs.** Message `type: 4` is the entire initial
+`gameState` (~8 KB): `tileHexStates` (19 hexes, `{x, y, type, diceNumber}`; type 0 is the desert),
+`tileCornerStates` (54), `tileEdgeStates` (72), `portEdgeStates` (9, with a `type` per port),
+`bankState`, `playerStates`, and per-mechanic blocks for settlements/cities/roads/dev
+cards/longest road/largest army/robber. `playerColor` is us; `playOrder` is the seating the
+bridge must force. 54/72/9 are exactly catanatron's counts, and each corner and edge carries an
+`{x, y, z}` coordinate — so the id mapping is a geometry problem with a deterministic answer, not
+a guess.
+
+Thereafter `type: 91` carries a `diff` of that same tree plus `gameLogState` entries, which is the
+action stream in readable form. Log entry types seen: 10 roll (`firstDice`, `secondDice`),
+47 resource distribution, 44 turn marker, 4 free/initial placement and 5 built-or-bought (both
+with `pieceEnum`: 0 road, 2 settlement, 3 city, 5 robber), 11 robber moved, 116 bank trade,
+20 dev card played, 86 monopoly, 21 year of plenty, 55 **discard** (`cardEnums`, so the opponent's
+discards are visible after all), 14/15 card gained/lost with `specificRecipients`, 66 achievement,
+45 game won.
+
+**The client sends actions as frames, not clicks.** Every move is
+`{"action": <int>, "payload": ..., "sequence": <int>}` behind the routing header, with the room
+name being the game id (`045804`). Correlating each sent frame against the log entry it produced
+gives the table:
+
+| action | meaning | payload |
+| --- | --- | --- |
+| 2 | roll dice | `true` |
+| 6 | end turn | `true` |
+| 15 / 11 | initial settlement / initial road | corner id / edge id |
+| 16 / 19 / 12 | build settlement / city / road | corner id / corner id / edge id |
+| 3 | move robber | tile index |
+| 49 | trade | `{creator, isBankTrade, offeredResources, wantedResources, ...}` |
+| 48 | play dev card | card enum |
+| 7 / 8 | resolve a played card (monopoly's resource) | `[resource]` |
+
+`sequence` increments per action. Codes 47, 53, 64, 66 produced no log entry and look like UI
+chatter (66 mostly carries a null payload); they are not needed to play.
+
+**This removes the hard part.** `docs/` previously scoped pixel/coordinate translation as its own
+mini-project. If the server accepts a synthesized frame — and the client is doing nothing more
+than emitting these — the action sender is a msgpack write, and Playwright's role shrinks to
+hosting the authenticated session. Unproven until we send one.
+
 ## What the wire looks like (from the first capture, login + lobby only)
 
 - **Socket:** `wss://socket.svr.colonist.io/?version=2`. Ignore everything else the browser
