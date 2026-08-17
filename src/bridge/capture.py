@@ -60,6 +60,41 @@ _SOCKET_IO_PREFIX = re.compile(r"^(\d+)(?=[\[{])")
 # --------------------------------------------------------------------------
 
 
+def _framed_msgpack(raw: bytes) -> dict:
+    """Decode a colonist frame that carries a routing header before its body.
+
+    Observed on every frame the *client* sends: ``0x02 <id> <len> <name>``
+    followed by msgpack, where ``name`` is the room ("lobby", and presumably the
+    game id in play). Frames the server sends have been bare msgpack so far.
+
+    Rather than hardcode a three-byte header from a handful of samples, the body
+    is found by scanning for the first offset that msgpack accepts *exactly* --
+    msgpack is self-delimiting, so a decode with no trailing bytes is strong
+    evidence of the right offset. The skipped bytes are kept verbatim, because
+    the header's meaning is still unknown: the second byte varies while the room
+    name does not, and only more captures will say what it counts.
+    """
+    if msgpack is None:
+        return {}
+    for offset in range(1, 24):
+        if offset >= len(raw):
+            break
+        try:
+            body = msgpack.unpackb(raw[offset:], raw=False, strict_map_key=False)
+        except Exception:
+            continue
+        header = raw[:offset]
+        record = {"encoding": "msgpack+header", "payload": body,
+                  "header": header.hex(), "raw": base64.b64encode(raw).decode()}
+        # ``<len> <name>`` at the tail of the header, if that is what it is.
+        length = header[2] if len(header) > 2 else -1
+        name = header[3:]
+        if length == len(name) and name.isascii() and name.decode().isprintable():
+            record["channel"] = name.decode()
+        return record
+    return {}
+
+
 def decode_payload(payload: str, opcode: int) -> dict:
     """Best-effort decode of one CDP frame payload.
 
@@ -82,6 +117,9 @@ def decode_payload(payload: str, opcode: int) -> dict:
                         "payload": msgpack.unpackb(raw, raw=False, strict_map_key=False)}
             except Exception:
                 pass
+        framed = _framed_msgpack(raw)
+        if framed:
+            return framed
         try:
             return {"encoding": "json", "payload": json.loads(raw.decode("utf-8"))}
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -269,11 +307,12 @@ def shape(value, depth: int = 0, max_depth: int = 3):
     return type(value).__name__
 
 
-def summarize(path: Path, limit: int, chars: int, only: str) -> None:
+def summarize(path: Path, limit: int, chars: int, only: str, socket: str) -> None:
     sockets = {}
     groups = OrderedDict()
     counts = Counter()
     encodings = Counter()
+    skipped = Counter()
 
     with path.open(encoding="utf-8") as handle:
         for line in handle:
@@ -283,10 +322,23 @@ def summarize(path: Path, limit: int, chars: int, only: str) -> None:
                 continue
             if record.get("kind") != "frame":
                 continue
+            # A browser has other sockets open -- Discord's login gateway and a
+            # dozen localhost RPC ports showed up in the first capture. Keep
+            # them on disk, filter them out of the reading.
+            url = sockets.get(record.get("id"), "")
+            if socket and socket.lower() not in url.lower():
+                skipped[url or "?"] += 1
+                continue
+            # Frames recorded before the decoder understood a given framing are
+            # re-decoded here, so an old capture improves without being replayed.
+            if record.get("encoding") == "base64":
+                record = {**record, **decode_payload(record["payload"], 2)}
             counts[record["dir"]] += 1
             encodings[record.get("encoding", "?")] += 1
             payload = record.get("payload")
-            label = f"{record['dir']} {message_type(payload)}"
+            channel = record.get("channel")
+            label = f"{record['dir']} {'[' + channel + '] ' if channel else ''}" \
+                    f"{message_type(payload)}"
             if only and only.lower() not in label.lower():
                 continue
             entry = groups.setdefault(label, {"n": 0, "example": payload, "t": record.get("t")})
@@ -296,7 +348,11 @@ def summarize(path: Path, limit: int, chars: int, only: str) -> None:
     print(f"frames: {counts['recv']} received, {counts['sent']} sent")
     print(f"encodings: {dict(encodings)}")
     for socket_id, url in sockets.items():
-        print(f"socket {socket_id}: {url}")
+        if not socket or socket.lower() in url.lower():
+            print(f"socket {socket_id}: {url}")
+    if skipped:
+        print(f"skipped {sum(skipped.values())} frames on other sockets "
+              f"({len(skipped)} of them); pass --socket '' to include them")
     print(f"\n{len(groups)} distinct message types "
           f"(showing the {min(limit, len(groups))} most frequent)\n")
 
@@ -328,10 +384,13 @@ def main() -> int:
                         help="summarize: characters per example")
     parser.add_argument("--only", default="",
                         help="summarize: keep only message types containing this text")
+    parser.add_argument("--socket", default="colonist",
+                        help="summarize: only frames on sockets whose URL contains this; "
+                             "pass an empty string for every socket the browser opened")
     args = parser.parse_args()
 
     if args.summarize:
-        summarize(Path(args.summarize), args.limit, args.chars, args.only)
+        summarize(Path(args.summarize), args.limit, args.chars, args.only, args.socket)
         return 0
 
     capture(args.url, args.label, args.channel, args.out_dir)

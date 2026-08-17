@@ -180,6 +180,24 @@ def test_binary_frame_decodes_as_msgpack():
     assert decode_payload(payload, opcode=2) == {"encoding": "msgpack", "payload": {"type": 7}}
 
 
+def test_a_framed_client_message_is_split_from_its_routing_header():
+    """Every frame colonist's client sends is msgpack behind ``02 <id> <len><room>``.
+
+    The offset is found by scanning rather than hardcoded: msgpack is
+    self-delimiting, so the first offset that consumes the rest exactly is the
+    body. The header is kept because its second byte is still unexplained.
+    """
+    msgpack = pytest.importorskip("msgpack")
+    raw = b"\x02\x07\x05lobby" + msgpack.packb({"action": 1, "payload": {}})
+
+    decoded = decode_payload(base64.b64encode(raw).decode(), opcode=2)
+
+    assert decoded["encoding"] == "msgpack+header"
+    assert decoded["payload"] == {"action": 1, "payload": {}}
+    assert decoded["channel"] == "lobby"
+    assert decoded["header"] == b"\x02\x07\x05lobby".hex()
+
+
 def test_an_undecodable_frame_is_kept_rather_than_dropped():
     """A frame nobody can parse is still evidence about the protocol."""
     decoded = decode_payload("not json at all", opcode=1)
