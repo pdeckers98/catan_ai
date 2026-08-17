@@ -109,6 +109,7 @@ src/
 │   └── play.py          # human vs AI (matplotlib)
 └── bridge/              # (Phase 3) colonist.io bridge, one Playwright session for read+click
     ├── capture.py       # hand-driven browser; records WS frames + --summarize
+    ├── protocol.py      # colonist messages -> BoardSpec + catanatron Actions
     ├── board.py         # exact board reconstruction (BoardSpec -> CatanMap)
     ├── replay.py        # GameReplay: a Game advanced by observed actions; DesyncError
     └── player.py        # the deployed agent, all three artifacts or nothing

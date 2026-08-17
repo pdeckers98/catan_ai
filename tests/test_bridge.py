@@ -8,6 +8,7 @@ so it is pinned before any protocol work starts.
 """
 
 import base64
+import pathlib
 
 import numpy as np
 import pytest
@@ -15,17 +16,26 @@ import pytest
 from catanatron import Color
 from catanatron.models.actions import Action
 from catanatron.models.enums import ActionType
-from catanatron.models.map import build_map
+from catanatron.models.map import (
+    PORT_DIRECTION_TO_NODEREFS,
+    LandTile,
+    Port,
+    build_map,
+)
 from catanatron.players.weighted_random import WeightedRandomPlayer
 
 from src.agent.encoding import encode_observation
 from src.bridge.board import BoardSpec, build_map_from_spec, spec_from_map
+from src.bridge import protocol
 from src.bridge.capture import decode_payload, message_type, shape
 from src.bridge.player import build_bridge_player
 from src.bridge.replay import DesyncError, GameReplay, blank_outcome
 from src.env.catan_env import make_1v1_game
 
 COLORS = (Color.BLUE, Color.RED)
+# Captures are personal browser sessions, so none is committed; the test that
+# replays real traffic runs only where one has been recorded.
+CAPTURES = sorted(pathlib.Path("data/bridge").glob("*.jsonl"))
 
 
 def play_reference_game(seed: int):
@@ -231,3 +241,177 @@ def test_bridge_player_refuses_to_ship_a_partial_agent(missing):
 
     with pytest.raises(ValueError, match=missing):
         build_bridge_player(Color.BLUE, **paths)
+
+
+# --------------------------------------------------------------------------
+# Protocol translation
+# --------------------------------------------------------------------------
+def colonist_state_from_map(catan_map):
+    """A colonist-shaped ``mapState`` describing a catanatron board.
+
+    Built from catanatron's geometry rather than from `protocol`'s tables, so
+    the round-trip below exercises the translation instead of agreeing with
+    itself. Colonist's axial hex coordinate is catanatron's ``(x, z)``; a hex
+    owns its north and south corners and its three western edges, and corners on
+    the sea ring belong to hexes off the island -- hence the search over a wider
+    range of coordinates than the nineteen land tiles.
+    """
+    land = {c: t for c, t in catan_map.tiles.items() if isinstance(t, LandTile)}
+    span = range(-3, 4)
+    centers = {(x, y): protocol._hex_center(x, y) for x in span for y in span}
+
+    def owner(point, refs, offsets, doubled):
+        for (x, y), (cx, cy) in centers.items():
+            for z, ref in refs.items():
+                dx, dy = offsets[ref]
+                base = (2 * cx, 2 * cy) if doubled else (cx, cy)
+                if (base[0] + dx, base[1] + dy) == point:
+                    return {"x": x, "y": y, "z": z}
+        raise AssertionError(f"no hex owns {point}")
+
+    card_of = {resource: card for card, resource in protocol.RESOURCE_BY_CARD.items()}
+    hexes, position_of = {}, {}
+    for coordinate, tile in land.items():
+        cx, cy = protocol._hex_center(coordinate[0], coordinate[2])
+        hexes[str(tile.id)] = {"x": coordinate[0], "y": coordinate[2],
+                               "type": card_of.get(tile.resource, 0),
+                               "diceNumber": tile.number or 0}
+        for ref, node_id in tile.nodes.items():
+            dx, dy = protocol._NODE_OFFSET[ref]
+            position_of[node_id] = (cx + dx, cy + dy)
+
+    def midpoint(edge):
+        first, second = position_of[edge[0]], position_of[edge[1]]
+        return (first[0] + second[0], first[1] + second[1])
+
+    corners = {str(node): owner(point, protocol.CORNER_REFS,
+                                protocol._NODE_OFFSET, doubled=False)
+               for node, point in position_of.items()}
+
+    edges, seen = {}, set()
+    for tile in land.values():
+        for edge in tile.edges.values():
+            key = tuple(sorted(edge))
+            if key not in seen:
+                seen.add(key)
+                edges[str(len(edges))] = owner(midpoint(key), protocol.EDGE_REFS,
+                                               protocol._EDGE_OFFSET, doubled=True)
+
+    ports = {}
+    for tile in catan_map.tiles.values():
+        if not isinstance(tile, Port):
+            continue
+        nodes = [tile.nodes[ref] for ref in PORT_DIRECTION_TO_NODEREFS[tile.direction]]
+        spec = owner(midpoint(tuple(nodes)), protocol.EDGE_REFS,
+                     protocol._EDGE_OFFSET, doubled=True)
+        spec["type"] = (protocol.PORT_GENERIC if tile.resource is None
+                        else card_of[tile.resource] + 1)
+        ports[str(tile.id)] = spec
+
+    return {"tileHexStates": hexes, "tileCornerStates": corners,
+            "tileEdgeStates": edges, "portEdgeStates": ports}
+
+
+def make_decoder():
+    coords = protocol.build_coordinate_map(colonist_state_from_map(build_map("BASE")))
+    return protocol._ActionDecoder(coords, {1: Color.BLUE, 2: Color.RED},
+                                   our_color=Color.BLUE)
+
+
+def test_a_colonist_board_translates_back_to_the_board_it_describes():
+    """Tiles *and* ports, in catanatron's own ordering.
+
+    Getting that ordering wrong is the failure that would not announce itself:
+    the spec still validates as a BASE board, and the agent simply plays a
+    different one than colonist dealt.
+    """
+    original = build_map("BASE")
+    state = colonist_state_from_map(original)
+
+    coords = protocol.build_coordinate_map(state)
+    spec = protocol.board_spec_from_state(state, coords)
+
+    assert spec == spec_from_map(original)
+    assert spec_from_map(build_map_from_spec(spec)) == spec_from_map(original)
+
+
+def test_a_board_whose_corners_collide_is_rejected():
+    """Bijectivity is the property under test; matching counts is not enough."""
+    state = colonist_state_from_map(build_map("BASE"))
+    for corner in state["tileCornerStates"].values():
+        corner["z"] = 0
+
+    with pytest.raises(protocol.ProtocolError, match="corner"):
+        protocol.build_coordinate_map(state)
+
+
+def test_one_log_entry_can_hold_several_bank_trades():
+    """Colonist merges a player's consecutive trades; the engine wants them apart."""
+    decoder = make_decoder()
+    decoder.feed({"gameLogState": {"0": {"text": {
+        "type": protocol.LOG_BANK_TRADE, "playerColor": 1,
+        "givenCardEnums": [2, 2, 2, 1, 1, 1], "receivedCardEnums": [4, 4]}}}})
+
+    assert [a.value for a in decoder.actions] == [
+        ("BRICK", "BRICK", "BRICK", None, "WHEAT"),
+        ("WOOD", "WOOD", "WOOD", None, "WHEAT"),
+    ]
+
+
+def test_a_steal_against_us_names_us_as_the_victim():
+    """``playerColor`` is always the *other* player, so the sides swap by entry."""
+    decoder = make_decoder()
+    decoder.feed({"mechanicRobberState": {"locationTileIndex": 0},
+                  "gameLogState": {"0": {"text": {
+                      "type": protocol.LOG_ROBBER_MOVED, "playerColor": 2,
+                      "pieceEnum": protocol.PIECE_ROBBER}}}})
+    decoder.feed({"gameLogState": {"0": {"text": {
+        "type": protocol.LOG_ROBBED_BY_THEM, "playerColor": 2, "cardEnums": [3]}}}})
+
+    action = decoder.actions[-1]
+    assert action.color == Color.RED         # the thief moved the robber
+    assert action.value[1] == Color.BLUE     # and robbed us
+    assert action.value[2] == "SHEEP"
+
+
+def test_a_played_card_reveals_the_purchase_that_bought_it():
+    """Offline only: live, an opponent's card is unknown until it is played."""
+    actions = [
+        Action(Color.RED, ActionType.BUY_DEVELOPMENT_CARD, None),
+        Action(Color.RED, ActionType.BUY_DEVELOPMENT_CARD, None),
+        Action(Color.RED, ActionType.PLAY_KNIGHT_CARD, None),
+    ]
+
+    revealed = protocol.reveal_purchases(actions)
+
+    assert revealed[0].value == "KNIGHT"
+    assert revealed[1].value is None  # never revealed, so still unknown
+
+
+@pytest.mark.skipif(not CAPTURES, reason="no colonist capture recorded locally")
+def test_a_captured_game_replays_move_for_move():
+    """Rung 0 of the verification ladder, on real traffic instead of self-play.
+
+    Captures are personal browser sessions and live under the git-ignored
+    ``data/``, so this runs only where one has been recorded. It is the
+    strongest statement the bridge can make offline: every move colonist
+    reported was legal in the reconstruction, at the moment it was made.
+    """
+    decoded = None
+    for path in CAPTURES:
+        try:
+            decoded = protocol.decode_capture(path)
+            break
+        except protocol.ProtocolError:
+            continue  # a capture of the lobby only, with no game in it
+    if decoded is None:
+        pytest.skip("recorded captures contain no complete game")
+
+    replay = GameReplay(decoded.board, colors=decoded.seating, vps_to_win=15)
+
+    replay.apply_many(decoded.actions)  # DesyncError if any move was mistranslated
+
+    assert decoded.our_color in decoded.seating
+    assert replay.state.num_turns > 20
+    assert encode_observation(replay.game, decoded.our_color,
+                              lookahead=True).shape == (642,)

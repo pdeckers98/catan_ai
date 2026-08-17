@@ -69,6 +69,10 @@ protocol translator ──► BoardSpec + observed Actions ──► GameReplay 
   python -m src.bridge.capture --summarize data/bridge/game1-<stamp>.jsonl
   python -m src.bridge.capture --summarize <file> --only sent --chars 2000   # drill in
   ```
+- **`protocol.py`** — colonist's wire messages to catanatron `Action`s: the enums, the coordinate
+  solution, the board rebuild, and a decoder that walks the server's state diffs. `decode_capture`
+  turns a recording into `(board, seating, our colour, actions)`. It says nothing about *sending* a
+  move, on purpose — see component 2 below.
 - **`player.py`** — `build_bridge_player`, which refuses to build anything less than all three
   artifacts. Every other entry point makes search and the placement models optional flags, which is
   right for benchmarking and wrong for live play.
@@ -147,28 +151,33 @@ hosting the authenticated session. Unproven until we send one.
   remove the entire coordinate-translation problem below. Not yet established; a game capture
   showing our own moves is what settles it.
 
-## Components still to build
+## Components
 
-1. **Protocol translator** — turn colonist.io's WebSocket JSON into a `BoardSpec` and a stream of
-   fully-specified catanatron `Action`s. Blocked on captured traffic; the protocol is undocumented.
-   Prior art:
+1. **Protocol translator** — ✅ `src/bridge/protocol.py`. Colonist's messages in, a `BoardSpec` and
+   fully-specified catanatron `Action`s out. Every one of the 278 actions in the captured game
+   replays legally through `GameReplay`, and under the lobby's ruleset the reconstruction ends on
+   the same winner at 15 VP. Unknown messages raise `ProtocolError` rather than being skipped.
+   Prior art, no longer needed but worth keeping:
    [robottler](https://github.com/meesg/robottler),
    [this writeup](https://medium.com/@alberttheblacksheep/abusing-my-computer-science-knowledge-to-cheat-at-catan-a0f72fa30309).
-2. **Action sender** — map the agent's chosen Catanatron action (one of the 294) to a colonist.io
-   UI click sequence via Playwright.
-3. **The hard part — coordinate translation.** colonist.io's tile/node/edge IDs and pixel
-   coordinates must be mapped to Catanatron's node/edge/tile indexing (and back). Scope this as its
-   own mini-project; it is the main source of risk and effort here.
-4. **Hidden information.** "Public information only" holds for the *observation*, and the
-   constraint was worth keeping — but search is the tighter requirement: `MCTSPlayer` rolls a real
-   `Game` forward, so it needs the opponent's **actual hand**, not just its size. In 1v1 nearly all
-   of that is publicly derivable: roll payouts are deterministic from the board, bank and port
-   trades are public, monopoly and year-of-plenty resolve in the open, and both directions of a
-   robber steal involve us, so we always see the card. Exactly two leaks remain — **the opponent's
-   discards on a 7** and **its dev cards before they are played**. So the belief state stays exact
-   until the first opponent discard, after which the bridge needs a small determinization
-   (sample a hand consistent with the counts and the deck; resample per search). Contained, but
-   design it rather than discover it live.
+2. **Action sender** — the one real unknown left. The client's own frames are legible and could in
+   principle be synthesized, but the server may well require a genuine click, with whatever else the
+   page attaches to it. **Assume nothing here until a frame has actually been sent and accepted.**
+   `protocol.py` deliberately says nothing about sending, so either strategy can be built on it: a
+   msgpack write, or a Playwright click sequence driven by the same corner/edge ids.
+3. **Coordinate translation** — ✅ solved, and it was never the pixel problem this doc feared.
+   Colonist addresses corners and edges as `(hex, z)`; a hex owns its north and south corners and
+   its three western edges. Laying both boards on one integer grid and matching positions gives the
+   bijection, which is then *validated* per board rather than trusted.
+4. **Hidden information.** "Public information only" holds for the *observation*, and the constraint
+   was worth keeping — but search is the tighter requirement: `MCTSPlayer` rolls a real `Game`
+   forward, so it needs the opponent's **actual hand**, not just its size. In 1v1 nearly all of that
+   is publicly derivable. The capture shrank this further than expected: **discards are broadcast**
+   (log entry 55 carries the card enums), and both directions of a robber steal are reported to us
+   with the card. So exactly **one** leak remains — **dev cards between being bought and being
+   played** — and the bridge needs a determinization only for those: sample a deck-consistent
+   assignment, resample per search. `protocol.reveal_purchases` handles the *recorded* case by
+   back-filling from what was later played; live, that information does not exist yet.
 5. **Rule reconciliation.** The agent trained under house rules that are *not* stock Catan:
    discard above 9 cards rather than 7, per-resource discard, no dev card the turn it was bought,
    and the 15 VP / Longest Road target. **Decision: assume the lobby matches those patches**, and
