@@ -386,6 +386,12 @@ class _ActionDecoder:
         self.rolled_this_turn = False
         self.pending_dev_card: Optional[int] = None
         self.our_dev_cards: List[int] = []
+        #: Per player, per card enum, how many cards the bank asks for. Colonist
+        #: keeps this on the wire (``bankTradeRatiosState``) and it starts at 4
+        #: everywhere; ports lower it. Tracked because a trade's log entry gives
+        #: only the cards, and without the ratio six bricks out could be three
+        #: 2:1 trades or two 3:1 ones.
+        self.ratios: Dict[int, Dict[int, int]] = {}
 
     # -- helpers ------------------------------------------------------------
     def _color(self, colonist_color: int) -> Color:
@@ -411,10 +417,25 @@ class _ActionDecoder:
     def feed(self, diff: dict) -> Optional[int]:
         """Decode one diff. Returns the lowest index it rewrote, or ``None``."""
         self.revised_from = None
+        self.absorb_ratios(diff.get("playerStates"))
         entries = sorted((diff.get("gameLogState") or {}).items(), key=lambda kv: int(kv[0]))
         for _, entry in entries:
             self._entry((entry or {}).get("text") or {}, diff)
         return self.revised_from
+
+    def absorb_ratios(self, player_states) -> None:
+        """Merge ``bankTradeRatiosState`` out of a full state or a diff.
+
+        Diffs carry only the entries that changed -- a single new port arrives as
+        ``{'2': 2}`` -- so this merges rather than replaces.
+        """
+        for pid, state in (player_states or {}).items():
+            ratios = (state or {}).get("bankTradeRatiosState")
+            if not ratios:
+                continue
+            into = self.ratios.setdefault(int(pid), {})
+            for card, ratio in ratios.items():
+                into[int(card)] = int(ratio)
 
     def _revise(self, index: int, action: Action) -> None:
         """Rewrite an already-emitted action, recording that it happened."""
@@ -554,27 +575,41 @@ class _ActionDecoder:
 
         Colonist reports a player's consecutive bank trades as a single entry --
         six cards out, two in, being two separate 3:1 trades. The engine wants
-        them one at a time, and the split is unambiguous because each trade
-        gives up one resource: consecutive runs of the same card are the trades,
-        in step with the cards received.
+        them one at a time. Each trade gives up one resource, so consecutive
+        runs of the same card bound the split; how many trades a run holds
+        depends on that player's rate for that resource, which is why
+        :attr:`ratios` is tracked. Six bricks is two trades at a 3:1 port and
+        three at a 2:1 one, and the log entry alone cannot tell them apart.
         """
-        color = self._color(text["playerColor"])
-        given = self._resources(text["givenCardEnums"])
+        colonist_color = text["playerColor"]
+        color = self._color(colonist_color)
+        given = list(text["givenCardEnums"] or ())
         received = self._resources(text["receivedCardEnums"])
+        rates = self.ratios.get(colonist_color, {})
 
-        runs: List[List[str]] = []
-        for resource in given:
-            if runs and runs[-1][0] == resource:
-                runs[-1].append(resource)
+        runs: List[List[int]] = []
+        for card in given:
+            if runs and runs[-1][0] == card:
+                runs[-1].append(card)
             else:
-                runs.append([resource])
-        if len(runs) != len(received) or any(len(run) not in (2, 3, 4) for run in runs):
+                runs.append([card])
+
+        trades: List[Tuple[str, ...]] = []
+        for run in runs:
+            ratio = rates.get(run[0], 4)
+            if ratio < 2 or len(run) % ratio:
+                raise ProtocolError(
+                    f"{len(run)} cards do not divide into {ratio}:1 trades: {text}")
+            resource = self._resources(run[:1])[0]
+            # catanatron pads the give side to four slots with None.
+            give = tuple([resource] * ratio + [None] * (4 - ratio))
+            trades.extend([give] * (len(run) // ratio))
+
+        if len(trades) != len(received):
             raise ProtocolError(f"unexpected bank trade shape: {text}")
 
-        for run, got in zip(runs, received):
-            # catanatron pads the give side to four slots with None.
-            value = tuple(run + [None] * (4 - len(run)) + [got])
-            self.actions.append(Action(color, ActionType.MARITIME_TRADE, value))
+        for give, got in zip(trades, received):
+            self.actions.append(Action(color, ActionType.MARITIME_TRADE, give + (got,)))
 
     def _played_dev_card(self, text: dict, diff: dict) -> None:
         """A knight or road building resolves here; the others need their result.
@@ -780,6 +815,7 @@ class MessageDecoder:
         self.seating = tuple(by_colonist[c] for c in order)
         self.our_color = by_colonist[payload["playerColor"]]
         self._decoder = _ActionDecoder(self.coords, by_colonist, self.our_color)
+        self._decoder.absorb_ratios(state.get("playerStates"))
         self.game_id += 1
 
     def decoded(self, reveal: bool = False) -> "DecodedGame":

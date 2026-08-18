@@ -358,14 +358,63 @@ def test_a_board_whose_corners_collide_is_rejected():
 def test_one_log_entry_can_hold_several_bank_trades():
     """Colonist merges a player's consecutive trades; the engine wants them apart."""
     decoder = make_decoder()
-    decoder.feed({"gameLogState": {"0": {"text": {
-        "type": protocol.LOG_BANK_TRADE, "playerColor": 1,
-        "givenCardEnums": [2, 2, 2, 1, 1, 1], "receivedCardEnums": [4, 4]}}}})
+    three_to_one = {str(card): 3 for card in range(1, 6)}
+    decoder.feed({
+        "playerStates": {"1": {"bankTradeRatiosState": three_to_one}},
+        "gameLogState": {"0": {"text": {
+            "type": protocol.LOG_BANK_TRADE, "playerColor": 1,
+            "givenCardEnums": [2, 2, 2, 1, 1, 1], "receivedCardEnums": [4, 4]}}}})
 
     assert [a.value for a in decoder.actions] == [
         ("BRICK", "BRICK", "BRICK", None, "WHEAT"),
         ("WOOD", "WOOD", "WOOD", None, "WHEAT"),
     ]
+
+
+def test_a_port_ratio_decides_how_many_trades_a_run_of_cards_is():
+    """Six bricks is two 3:1 trades or three 2:1 ones; only the ratio says which.
+
+    This is the bug the first live game died of. The decoder assumed one
+    received card per run of given cards, which cannot express a 2:1 port at
+    all, and the resulting hand was wrong for the remaining 177 actions.
+    """
+    decoder = make_decoder()
+    decoder.feed({"playerStates": {"1": {"bankTradeRatiosState": {"2": 2}}},
+                  "gameLogState": {"0": {"text": {
+                      "type": protocol.LOG_BANK_TRADE, "playerColor": 1,
+                      "givenCardEnums": [2] * 6, "receivedCardEnums": [4, 4, 5]}}}})
+
+    assert [a.value for a in decoder.actions] == [
+        ("BRICK", "BRICK", None, None, "WHEAT"),
+        ("BRICK", "BRICK", None, None, "WHEAT"),
+        ("BRICK", "BRICK", None, None, "ORE"),
+    ]
+
+
+def test_a_ratio_diff_only_names_the_resource_that_changed():
+    """A new port arrives as ``{'2': 2}``; the other four rates must survive."""
+    decoder = make_decoder()
+    three_to_one = {str(card): 3 for card in range(1, 6)}
+    decoder.feed({"playerStates": {"1": {"bankTradeRatiosState": three_to_one}}})
+    decoder.feed({"playerStates": {"1": {"bankTradeRatiosState": {"2": 2}}},
+                  "gameLogState": {"0": {"text": {
+                      "type": protocol.LOG_BANK_TRADE, "playerColor": 1,
+                      "givenCardEnums": [2, 2, 1, 1, 1], "receivedCardEnums": [4, 5]}}}})
+
+    assert [a.value for a in decoder.actions] == [
+        ("BRICK", "BRICK", None, None, "WHEAT"),
+        ("WOOD", "WOOD", "WOOD", None, "ORE"),
+    ]
+
+
+def test_a_trade_that_does_not_divide_by_the_ratio_is_refused():
+    """Five cards at 3:1 is not a shape the log can mean; better loud than guessed."""
+    decoder = make_decoder()
+    with pytest.raises(protocol.ProtocolError):
+        decoder.feed({"playerStates": {"1": {"bankTradeRatiosState": {"2": 3}}},
+                      "gameLogState": {"0": {"text": {
+                          "type": protocol.LOG_BANK_TRADE, "playerColor": 1,
+                          "givenCardEnums": [2] * 5, "receivedCardEnums": [4]}}}})
 
 
 def test_a_steal_against_us_names_us_as_the_victim():
@@ -563,6 +612,31 @@ def test_the_worst_possible_guess_still_replays_the_whole_game():
     live = feed_capture(Poisoned(vps_to_win=15, seed=0, check_lobby=False), path)
 
     assert live.replay.state.num_turns > 20
+
+
+@pytest.mark.skipif(not CAPTURES, reason="no colonist capture recorded locally")
+def test_a_desync_that_guessing_cannot_explain_is_not_repaired():
+    """Only a dev-card play can be illegal because of a wrong guess.
+
+    The first live game desynced 177 times on a mistranslated port trade and
+    answered each one by redrawing the deck eight times: 1416 rebuilds, none of
+    which could have helped, all of which hid the real bug. A desync on
+    anything but a dev-card play now raises the first time it happens.
+    """
+    path, _ = first_capture_with_a_game()
+
+    class Broken(LiveGame):
+        """Refuses every action, as a mistranslation eventually would."""
+
+        def _apply_pending(self):
+            if self._applied < len(self._filled):
+                raise DesyncError("pretend the translation is wrong")
+
+    live = Broken(vps_to_win=15, seed=0, check_lobby=False)
+    with pytest.raises(DesyncError):
+        feed_capture(live, path)
+
+    assert live.repairs == 0
 
 
 def test_a_lobby_that_is_not_our_ruleset_is_refused():

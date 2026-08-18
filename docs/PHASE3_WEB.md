@@ -3,9 +3,10 @@
 **Goal:** bridge the trained agent so it can read and play real 1v1 games on colonist.io.
 **Status:** 🚧 started 2026-08-17. The whole read side is built and tested: board
 reconstruction, replay, the protocol translator, and a live session that follows a game in real
-time and says what the agent would play. **Rung 1 of the ladder below passes offline** -- run
-against both captures, the agent produced a legal move on all 266 positions it was asked about.
-What is left is the action sender, which no amount of reading can settle. Opt-in.
+time and says what the agent would play. **Rung 1 of the ladder below has now been run live** --
+one full 1v1 game watched end to end. It found one real translation bug (2:1 ports), which is
+fixed; the captured game now reconstructs all 88 turns and the agent answered 141 positions
+legally. What is left is the action sender, which no amount of reading can settle. Opt-in.
 
 > ⚠️ **ToS / bans:** Automating play on colonist.io likely violates its Terms of Service and can
 > get accounts banned. Use a **throwaway account**, run supervised, and never automate ranked play
@@ -243,8 +244,13 @@ hosting the authenticated session. Unproven until we send one.
    captures, the live feed and the fully-revealed offline replay agree exactly on turn count,
    winner and public VP, and differ by at most one VP per never-revealed purchase.
 
-   A desync with **no** guesses outstanding is never repaired — nothing was being guessed, so the
-   reconstruction is simply wrong, which is the failure the module exists to make loud.
+   Which is why the repair loop is now **narrow**: it fires only when the action that failed is a
+   *dev-card play* by a player with an outstanding guess — the one move a wrong guess can make
+   illegal. The first live game showed what the wide version costs. A mistranslated port trade
+   corrupted the hand, 177 later actions desynced, and each one burned all 8 redraws rebuilding
+   the game from move one to re-guess dev cards that had nothing to do with it: **1416 rebuilds,
+   zero useful repairs, and the real bug buried under them.** Everything else raises the first
+   time, so a translation bug arrives as one clean error at the turn it happened.
 
    Still open: search resamples nothing. `MCTSPlayer` rolls forward from whatever the current
    determinization says, so it explores one sampled world rather than averaging over the
@@ -277,8 +283,21 @@ hosting the authenticated session. Unproven until we send one.
    clicks. ✅ **offline**, `python -m src.bridge.session --replay <capture>`: over both captures
    the agent was asked 266 times and answered legally every time, with the placement specialist
    taking the opening and 50-sim search taking the rest. Agreement with the move a human actually
-   played was 74.2% on `game2` and 65.2% on `game1`, by action type. ⬜ **live** — same command
-   without `--replay` — still to run, and it needs nothing new.
+   played was 74.2% on `game2` and 65.2% on `game1`, by action type. ✅ **live**, 2026-08-18, one
+   full 1v1 game on a throwaway account: the lobby check passed, we were BLUE, and after the fix
+   below all 88 turns reconstruct with 141 legal decisions at 67.4% agreement, 0 repairs, median
+   0.16s and worst case 0.39s per decision — comfortably inside a live turn timer.
+
+   **The live game found what two captures could not: a 2:1 port.** `_bank_trade` split a run of
+   identical given cards assuming one received card per run, which cannot express a 2:1 trade at
+   all (six bricks for three cards is *one* run). Colonist puts the answer on the wire —
+   `playerStates[pid].bankTradeRatiosState`, 4 everywhere at the start and lowered by ports — so
+   the decoder now tracks it and divides each run by that player's actual rate. Without it the
+   error was not even loud: the exception escaped mid-diff, the rest of that diff was lost, and
+   the agent went on answering confidently off a hand that was wrong for the next 177 actions.
+   Hence the second change: **a decode error now stops the session deciding** (`DryRun.broken`)
+   while the capture keeps being written, so the game can be finished by hand and diagnosed
+   afterwards. "Loud but not fatal" turned out to be neither.
 
    Two things that run measured out of it. Search is doing real work but not uniformly: between
    1 and 200 simulations, 9 of 128 decisions changed on `game2` and **0 of 138 on `game1`**. And
@@ -296,6 +315,9 @@ The protocol is undocumented, so nothing colonist-specific can be written withou
 - ✅ **2–4 complete 1v1 games** — two captured, both decoded, both replaying move for move.
 - ✅ **The lobby settings** — they ride on the full-state message and are now checked
   automatically against `src/env/rules.py`.
+- ✅ **Our own client frames** — the live dry run records both directions, so
+  `data/bridge/dryrun-*.jsonl` contains 906 `sent` frames: the entire specification of the action
+  sender, which is the next piece of work.
 - ⬜ **A DOM dump of a live board**, for the click layer — only if frames turn out not to work.
 
 Frames the agent's own moves generate are as valuable as the ones it receives: the `sent`

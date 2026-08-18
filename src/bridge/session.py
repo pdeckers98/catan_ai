@@ -84,6 +84,12 @@ from src.env.rules import DISCARD_LIMIT
 #: spin here forever pretending to be bad luck.
 MAX_REPAIRS = 8
 
+#: The only moves a wrong guess about a hidden purchase can make illegal.
+DEV_CARD_PLAYS = frozenset({
+    ActionType.PLAY_KNIGHT_CARD, ActionType.PLAY_MONOPOLY,
+    ActionType.PLAY_YEAR_OF_PLENTY, ActionType.PLAY_ROAD_BUILDING,
+})
+
 
 def draw_card(remaining: Counter, rng: random.Random) -> str:
     """One card from what is left of the deck, weighted as the deck is.
@@ -300,6 +306,22 @@ class LiveGame:
                 "game costs points silently."
             )
 
+    def _repairable(self, failed: Optional[Action]) -> bool:
+        """Whether redrawing the hidden cards could plausibly explain this desync.
+
+        Exactly one thing in the reconstruction is a guess: which card an
+        unrevealed purchase was. That can make exactly one kind of move
+        illegal -- playing a dev card the guessed hand does not hold. Anything
+        else (a resource count, a placement, a rule) is a real bug, and
+        redrawing the deck only buries it under rebuilds. The first live game
+        did precisely that: 177 desyncs from one mistranslated 2:1 port trade
+        cost 1416 pointless rebuilds and not a single useful repair.
+        """
+        if failed is None or failed.action_type not in DEV_CARD_PLAYS:
+            return False
+        return any(self._filled[index].color == failed.color
+                   for index in self._guesses if index < len(self._filled))
+
     def _sync(self) -> None:
         """Fill in the hidden cards, then apply everything not yet applied."""
         filled = self._resolve()
@@ -314,7 +336,9 @@ class LiveGame:
                 self._apply_pending()
                 return
             except DesyncError:
-                if not self._guesses or attempt == MAX_REPAIRS:
+                failed = (self._filled[self._applied]
+                          if self._applied < len(self._filled) else None)
+                if attempt == MAX_REPAIRS or not self._repairable(failed):
                     raise
                 # Attribution has nothing left to offer; draw the opponent's
                 # unseen cards again and replay from move one.
@@ -364,6 +388,11 @@ class DryRun:
         self.comparable = 0
         self._pending: Optional[Action] = None  # our move, awaiting the real one
         self._asked_at = -1
+        #: The error that stopped the reconstruction, or ``None``. Once set, the
+        #: agent is never asked again: the position it would be reading is known
+        #: to be wrong, and a confident answer off a wrong board is the one
+        #: output worse than no answer.
+        self.broken: Optional[Exception] = None
 
     def _build_player(self, color):
         model_path, placement_path, bundle_path = self._artifacts
@@ -372,7 +401,13 @@ class DryRun:
 
     # -- driving ------------------------------------------------------------
     def feed_frame(self, record: dict) -> None:
-        progress = self.live.feed_frame(record)
+        if self.broken is not None:
+            return
+        try:
+            progress = self.live.feed_frame(record)
+        except (protocol.ProtocolError, DesyncError, LobbyMismatch) as exc:
+            self._break(exc)
+            return
         if progress is None:
             return
         if progress.started:
@@ -427,6 +462,23 @@ class DryRun:
                       "prompt": str(state.current_prompt), "action": str(action),
                       "legal": len(legal), "seconds": round(elapsed, 3)})
 
+    def _break(self, exc: Exception) -> None:
+        """Stop deciding; the caller keeps recording.
+
+        A decode error means the board we are holding no longer matches the one
+        on screen, and every later answer is off a fiction. Live, the browser
+        stays open and the capture keeps being written, so the game can be
+        finished by hand and the frames kept for diagnosis -- but the agent
+        says nothing more.
+        """
+        self.broken = exc
+        turn = self.live.game.state.num_turns if self.live.started else -1
+        print(f"\n!! {type(exc).__name__} at turn {turn}: {exc}\n"
+              "   the reconstruction is broken; no further decisions will be "
+              "made. Recording continues.\n", file=sys.stderr)
+        self._record({"kind": "broken", "turn": turn,
+                      "error": type(exc).__name__, "detail": str(exc)})
+
     def _record(self, entry: dict) -> None:
         if self.log is None:
             return
@@ -436,9 +488,11 @@ class DryRun:
     def summary(self) -> str:
         rate = (f"{100 * self.agreements / self.comparable:.1f}%"
                 if self.comparable else "n/a")
+        broken = ("" if self.broken is None
+                  else f", BROKEN by {type(self.broken).__name__}: {self.broken}")
         return (f"{self.decisions} decisions, {self.comparable} comparable to a move "
                 f"actually played, {rate} agreed on the action type, "
-                f"{self.live.repairs} repairs")
+                f"{self.live.repairs} repairs{broken}")
 
 
 # --------------------------------------------------------------------------
@@ -585,7 +639,7 @@ def main() -> int:
         run_live(dry, args.url, args.channel, record_to)
 
     print(dry.summary())
-    return 0
+    return 1 if dry.broken is not None else 0
 
 
 if __name__ == "__main__":
