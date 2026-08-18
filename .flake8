@@ -9,6 +9,7 @@ per-file-ignores =
     src/agent/train.py: E402
     src/eval/benchmark.py: E402
     src/eval/play.py: E402
+    src/bridge/session.py: E402
 exclude =
     .git,
     __pycache__,

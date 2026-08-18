@@ -115,6 +115,7 @@ src/
     ├── protocol.py      # colonist messages -> BoardSpec + catanatron Actions
     ├── board.py         # exact board reconstruction (BoardSpec -> CatanMap)
     ├── replay.py        # GameReplay: a Game advanced by observed actions; DesyncError
+    ├── session.py       # live read loop + dry run; hidden dev cards by sample-and-repair
     └── player.py        # the deployed agent, all three artifacts or nothing
 docs/          # Per-phase guides (see below)
 checkpoints/   # Saved models (git-ignored)
@@ -261,7 +262,17 @@ See `docs/` for per-phase guides:
 - **`PHASE1_SETUP.md`** — Catanatron install, 1v1 env wiring, smoke test
 - **`PHASE2_AI.md`** — the shipped agent: PPO training, PUCT search at inference, the opening
   specialist, benchmarking, and a list of measured dead ends so they are not re-run
-- **`PHASE3_WEB.md`** — colonist.io bridge (WebSocket read + Playwright clicks)
+- **`PHASE3_WEB.md`** — colonist.io bridge (WebSocket read + Playwright clicks). The read half
+  is done and rung 1 of its ladder passes offline; **the action sender is the only real unknown
+  left.** Watch a game without touching it, or replay a capture through the deployed agent:
+
+  ```bash
+  python -m src.bridge.session --replay data/bridge/<capture>.jsonl \
+      --vps-to-win 15 --longest-road --max-turns 1500 --simulations 50 \
+      --model checkpoints/archive/ppo-15vp-lr-step400000.zip \
+      --placement-model checkpoints/placement/scorer_ppo.pt \
+      --bundle-model    checkpoints/placement/bundle_noroads.pt
+  ```
 
 ## Caveats
 

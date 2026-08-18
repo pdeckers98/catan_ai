@@ -1,9 +1,11 @@
 # Phase 3 — Web integration (colonist.io)
 
 **Goal:** bridge the trained agent so it can read and play real 1v1 games on colonist.io.
-**Status:** 🚧 started 2026-08-17. The offline core (board reconstruction, replay, player
-assembly) is in `src/bridge/` and tested; everything colonist-specific is blocked on captured
-WebSocket traffic. Opt-in.
+**Status:** 🚧 started 2026-08-17. The whole read side is built and tested: board
+reconstruction, replay, the protocol translator, and a live session that follows a game in real
+time and says what the agent would play. **Rung 1 of the ladder below passes offline** -- run
+against both captures, the agent produced a legal move on all 266 positions it was asked about.
+What is left is the action sender, which no amount of reading can settle. Opt-in.
 
 > ⚠️ **ToS / bans:** Automating play on colonist.io likely violates its Terms of Service and can
 > get accounts banned. Use a **throwaway account**, run supervised, and never automate ranked play
@@ -73,6 +75,23 @@ protocol translator ──► BoardSpec + observed Actions ──► GameReplay 
   solution, the board rebuild, and a decoder that walks the server's state diffs. `decode_capture`
   turns a recording into `(board, seating, our colour, actions)`. It says nothing about *sending* a
   move, on purpose — see component 2 below.
+- **`session.py`** — the live read loop, and rung 1. `LiveGame` keeps a `GameReplay` in step
+  with the message stream one message at a time; `DryRun` puts the agent around it, logs the move
+  it *would* play, and clicks nothing. Two things make it worth more than a `decode_capture` in a
+  `while` loop:
+
+  - **`--replay` drives it off a recording**, so the whole live path runs with no browser, no
+    account and no ToS exposure. It is also the only setting where the agent's choice can be
+    scored against a *human's* on the same position -- live, you would have to make the move to
+    find out. On `game2` at 50 sims: 128 decisions, 74.2% agreeing with the move actually played.
+  - **It checks the lobby instead of trusting it.** `victoryPointsToWin`, `cardDiscardLimit`,
+    `maxPlayers` and `friendlyRobber` ride on the full-state message, and a mismatch against
+    `src/env/rules.py` raises `LobbyMismatch` before a single action is replayed. Item 5 below
+    asked for a human to eyeball this; there was no reason for that to be a human's job.
+
+  `protocol.py` was refactored to make it possible: the state machine that used to live inside
+  `decode_capture` is now `MessageDecoder`, fed a message at a time, and `decode_capture` is a
+  loop over it. So the offline tests exercise the live path.
 - **`player.py`** — `build_bridge_player`, which refuses to build anything less than all three
   artifacts. Every other entry point makes search and the placement models optional flags, which is
   right for benchmarking and wrong for live play.
@@ -106,6 +125,15 @@ What still does not reconstruct exactly: the opponent's **unplayed** dev cards. 
 bought twenty and played sixteen; the four never revealed are drawn at random by the engine, so the
 final tally came out at 14 VP instead of 15. Legality is unaffected — this is the residual hidden
 information, not a decoding error.
+
+**One signal is on the wire and still undecoded: `playerStates[pid].victoryPointsState`.**
+It arrives as a diff of `{source: count}` — keys 0..4, with 4 visibly changing hands the way
+longest road does. It would be the strongest desync check available, because it is the server's
+own scoreboard and would catch a wrong determinization *silently* corrupting the position, which
+legality checks cannot. But the obvious reading is wrong: summed over sources it disagrees with
+catanatron's public VP on 324/550 and 437/588 comparisons across the two captures. So it is left
+alone rather than half-understood — the same stance the rest of `protocol.py` takes. Cracking it
+is the cheapest remaining win in the read half.
 
 **The lobby matches our house rules.** The settings frame carries `victoryPointsToWin: 15`,
 `cardDiscardLimit: 9`, `maxPlayers: 2`, `friendlyRobber: true` — the VP target, the discard limit
@@ -194,25 +222,69 @@ hosting the authenticated session. Unproven until we send one.
    is publicly derivable. The capture shrank this further than expected: **discards are broadcast**
    (log entry 55 carries the card enums), and both directions of a robber steal are reported to us
    with the card. So exactly **one** leak remains — **dev cards between being bought and being
-   played** — and the bridge needs a determinization only for those: sample a deck-consistent
-   assignment, resample per search. `protocol.reveal_purchases` handles the *recorded* case by
-   back-filling from what was later played; live, that information does not exist yet.
+   played**.
+
+   ✅ **Sample-and-repair**, in `session.py`. A purchase nobody has revealed is drawn from what is
+   left of the deck, weighted as the deck is, and the replay carries on. It is repaired rather
+   than defended because the replay is a pure function of the action list: re-derive the
+   purchases, rebuild from move one. Two mechanisms, and the order between them is the finding:
+
+   - `reveal_purchases` run over the actions observed **so far**. The moment a card is played,
+     the purchase it came from stops being a guess. Mid-game this reads the past, not the future.
+   - failing that, a whole fresh determinization after a `DesyncError`, bounded at
+     `MAX_REPAIRS = 8`.
+
+   **The second mechanism never fires.** Not on either capture, and not even when the
+   determinizer is rigged to guess victory point every single time — the worst draw available.
+   Attribution always gets there first, because a card can only contradict a guess by being
+   played, which is exactly the event that reveals it. That is a stronger guarantee than expected
+   and it has a sharp edge: **a wrong guess is silent, not loud.** A sampled victory point hands
+   the opponent a VP they do not have and nothing about it is ever illegal. Measured on the two
+   captures, the live feed and the fully-revealed offline replay agree exactly on turn count,
+   winner and public VP, and differ by at most one VP per never-revealed purchase.
+
+   A desync with **no** guesses outstanding is never repaired — nothing was being guessed, so the
+   reconstruction is simply wrong, which is the failure the module exists to make loud.
+
+   Still open: search resamples nothing. `MCTSPlayer` rolls forward from whatever the current
+   determinization says, so it explores one sampled world rather than averaging over the
+   deck. That is the cheap version and it is what ships; per-rollout resampling is the correct
+   one.
 5. **Rule reconciliation.** The agent trained under house rules that are *not* stock Catan:
    discard above 9 cards rather than 7, per-resource discard, no dev card the turn it was bought,
    and the 15 VP / Longest Road target. **Decision: assume the lobby matches those patches**, and
    let `GameReplay.check_legal` fail loudly on the first divergent event rather than quietly
-   playing a different game than the policy was fitted to. Still worth eyeballing the seven patches
-   in `src/env/rules.py` against the lobby settings before the first live game — a rule that
-   differs without ever producing an illegal action (a different discard limit, say) will not trip
-   the assertion, it will just cost points.
+   playing a different game than the policy was fitted to. ✅ And the silent half is now checked
+   rather than eyeballed: `LiveGame._check_lobby` compares `victoryPointsToWin`,
+   `cardDiscardLimit`, `maxPlayers` and `friendlyRobber` against our patches on the full-state
+   message and raises `LobbyMismatch` before any action is replayed. A rule that differs without
+   ever producing an illegal action would not trip `check_legal`; it would just cost points.
 
 ## Verification ladder
 
 0. **Replay round-trip.** ✅ done offline in `tests/test_bridge.py`: a self-play game replayed
-   through a reconstructed board produces identical observations. Repeat it on *captured* traffic
-   once the translator exists — same assertion, real input.
-1. **Spectator dry-run:** read state only, log the move the agent *would* make each turn. No clicks.
-   Confirms the state translator and observation match the agent's training distribution.
+   through a reconstructed board produces identical observations, and both captures replay move
+   for move.
+
+   Building rung 1 found this rung had been quietly flaky since it was written — about one run
+   in six. `reveal_purchases` leaves never-revealed purchases as `None`, and the engine fills
+   those from a deck it shuffled independently; those draws can consume the very card a later
+   *revealed* purchase needs, and it dies inside catanatron's `draw_from_listdeck` with a deck
+   error that looks nothing like a translation bug. **`reveal_purchases` alone is not enough to
+   replay a game** — `session.determinize_purchases` accounts for the whole deck, and both
+   captures now replay soundly and reproducibly.
+1. **Spectator dry-run:** read state only, log the move the agent *would* make each turn. No
+   clicks. ✅ **offline**, `python -m src.bridge.session --replay <capture>`: over both captures
+   the agent was asked 266 times and answered legally every time, with the placement specialist
+   taking the opening and 50-sim search taking the rest. Agreement with the move a human actually
+   played was 74.2% on `game2` and 65.2% on `game1`, by action type. ⬜ **live** — same command
+   without `--replay` — still to run, and it needs nothing new.
+
+   Two things that run measured out of it. Search is doing real work but not uniformly: between
+   1 and 200 simulations, 9 of 128 decisions changed on `game2` and **0 of 138 on `game1`**. And
+   agreement with a human is a weak yardstick in the direction that flatters the agent — most
+   positions offer one sensible move, and the disagreements cluster exactly where they should
+   (whether to trade, whether to buy a dev card or end the turn).
 2. **Single supervised live game** on a throwaway account, human ready to intervene.
 3. Only then consider unattended runs.
 
@@ -221,11 +293,10 @@ hosting the authenticated session. Unproven until we send one.
 The protocol is undocumented, so nothing colonist-specific can be written without recordings.
 `capture.py` collects them; what is still needed is the *playing*:
 
-- **2–4 complete 1v1 games** as raw WebSocket frames, both directions, ideally covering a 7 with a
-  discard, a dev card bought and later played, a port trade, and a robber steal each way.
-- **The lobby settings**, to check against the seven patches. Capture the lobby screen too — the
-  settings are sent over the same socket when a game is created.
-- **A DOM dump of a live board**, for the click layer.
+- ✅ **2–4 complete 1v1 games** — two captured, both decoded, both replaying move for move.
+- ✅ **The lobby settings** — they ride on the full-state message and are now checked
+  automatically against `src/env/rules.py`.
+- ⬜ **A DOM dump of a live board**, for the click layer — only if frames turn out not to work.
 
 Frames the agent's own moves generate are as valuable as the ones it receives: the `sent`
 direction is the entire specification of the action sender, and it can only be learned by

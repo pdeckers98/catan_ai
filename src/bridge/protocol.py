@@ -323,15 +323,28 @@ def iter_colonist_frames(path: Path):
             yield record
 
 
-def _server_messages(path: Path):
-    """``(type, payload)`` for each game message the server sent."""
+def server_message(record: dict) -> Optional[Tuple[int, object]]:
+    """``(type, payload)`` for one decoded frame, or ``None`` if it holds no game message.
+
+    Split out from the file reader because the live session gets the same
+    records straight off CDP and must unwrap them identically. Client frames and
+    transport chatter both return ``None``.
+    """
+    payload = record.get("payload")
+    if record.get("dir") != "recv" or not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if isinstance(data, dict) and "type" in data:
+        return data["type"], data.get("payload")
+    return None
+
+
+def iter_server_messages(path: Path):
+    """``(type, payload)`` for each game message in a capture, in order."""
     for record in iter_colonist_frames(path):
-        payload = record.get("payload")
-        if record.get("dir") != "recv" or not isinstance(payload, dict):
-            continue
-        data = payload.get("data")
-        if isinstance(data, dict) and "type" in data:
-            yield data["type"], data.get("payload")
+        message = server_message(record)
+        if message is not None:
+            yield message
 
 
 # --------------------------------------------------------------------------
@@ -365,6 +378,11 @@ class _ActionDecoder:
         self.colors = colors
         self.our_color = our_color
         self.actions: List[Action] = []
+        #: Lowest index the last :meth:`feed` *rewrote* (as opposed to appended).
+        #: Only a steal does this, and only to the robber move before it -- but a
+        #: caller replaying incrementally has to know, because an action it has
+        #: already applied just changed underneath it.
+        self.revised_from: Optional[int] = None
         self.rolled_this_turn = False
         self.pending_dev_card: Optional[int] = None
         self.our_dev_cards: List[int] = []
@@ -390,10 +408,19 @@ class _ActionDecoder:
         return out
 
     # -- entry point --------------------------------------------------------
-    def feed(self, diff: dict) -> None:
+    def feed(self, diff: dict) -> Optional[int]:
+        """Decode one diff. Returns the lowest index it rewrote, or ``None``."""
+        self.revised_from = None
         entries = sorted((diff.get("gameLogState") or {}).items(), key=lambda kv: int(kv[0]))
         for _, entry in entries:
             self._entry((entry or {}).get("text") or {}, diff)
+        return self.revised_from
+
+    def _revise(self, index: int, action: Action) -> None:
+        """Rewrite an already-emitted action, recording that it happened."""
+        self.actions[index] = action
+        self.revised_from = (index if self.revised_from is None
+                             else min(self.revised_from, index))
 
     def _entry(self, text: dict, diff: dict) -> None:
         kind = text.get("type")
@@ -519,8 +546,8 @@ class _ActionDecoder:
         resources = self._resources(text.get("cardEnums"))
         if len(resources) != 1:
             raise ProtocolError(f"a steal moved {len(resources)} cards")
-        self.actions[-1] = Action(
-            move.color, ActionType.MOVE_ROBBER, (coordinate, victim, resources[0]))
+        self._revise(len(self.actions) - 1, Action(
+            move.color, ActionType.MOVE_ROBBER, (coordinate, victim, resources[0])))
 
     def _bank_trade(self, text: dict, diff: dict) -> None:
         """One log entry can hold several trades, so it is split back apart.
@@ -679,6 +706,99 @@ def _first_new(before: List[int], after: List[int]) -> Optional[int]:
     return None
 
 
+class MessageDecoder:
+    """The whole read side, driven one server message at a time.
+
+    :func:`decode_capture` used to hold this state machine inline, which made it
+    a file reader by construction. A live session needs the identical logic fed
+    off the wire, so it lives here and the file reader became a loop over it --
+    the same code path, so the offline tests still cover the live one.
+
+    Two things a caller replaying incrementally has to watch, because both mean
+    actions it already applied are no longer what the decoder says happened:
+
+    - :attr:`game_id` changes. A second full state is a reconnect or a new game;
+      the board itself is different, so nothing survives.
+    - :meth:`feed` returns an index. A steal rewrites the robber move emitted
+      just before it (that is where the victim and the stolen card arrive), so
+      an action can change after it has been handed out.
+
+    Both are reported rather than smoothed over: a replay that quietly drifts
+    looks exactly like a weak agent, which is the failure mode this whole module
+    is built to avoid.
+    """
+
+    def __init__(self, colors=(Color.BLUE, Color.RED)):
+        self.colors = colors
+        self.board: Optional[BoardSpec] = None
+        self.coords: Optional[CoordinateMap] = None
+        self.seating: Tuple[Color, ...] = ()
+        self.our_color: Optional[Color] = None
+        #: The lobby's own settings, as the full state reported them. This is how
+        #: the house rules stop being an assumption: ``victoryPointsToWin`` and
+        #: ``cardDiscardLimit`` are on the wire, so they can be checked against
+        #: the patches in :mod:`src.env.rules` instead of eyeballed.
+        self.settings: dict = {}
+        #: Bumped on every full state, so a caller can tell one game from the next.
+        self.game_id = 0
+        self._decoder: Optional[_ActionDecoder] = None
+
+    @property
+    def started(self) -> bool:
+        """Whether a full state has arrived and the board is known."""
+        return self._decoder is not None
+
+    @property
+    def actions(self) -> List[Action]:
+        """Every action decoded so far, oldest first. Live, so do not mutate it."""
+        return self._decoder.actions if self._decoder is not None else []
+
+    def feed(self, kind: int, payload) -> Optional[int]:
+        """Consume one server message.
+
+        Returns the lowest action index that is no longer valid -- ``0`` when a
+        full state resets the game, the rewritten index when a steal revises the
+        robber move, and ``None`` when the message only appended (the usual
+        case) or was not one we decode.
+        """
+        if kind == MSG_FULL_STATE and isinstance(payload, dict):
+            self._begin(payload)
+            return 0
+        if kind == MSG_DIFF and self._decoder is not None and isinstance(payload, dict):
+            diff = payload.get("diff")
+            if isinstance(diff, dict):
+                return self._decoder.feed(diff)
+        return None
+
+    def _begin(self, payload: dict) -> None:
+        state = payload["gameState"]
+        self.settings = payload.get("gameSettings") or {}
+        self.coords = build_coordinate_map(state["mapState"])
+        self.board = board_spec_from_state(state["mapState"], self.coords)
+        order = payload["playOrder"]
+        by_colonist = {c: self.colors[i] for i, c in enumerate(order)}
+        self.seating = tuple(by_colonist[c] for c in order)
+        self.our_color = by_colonist[payload["playerColor"]]
+        self._decoder = _ActionDecoder(self.coords, by_colonist, self.our_color)
+        self.game_id += 1
+
+    def decoded(self, reveal: bool = False) -> "DecodedGame":
+        """Everything decoded so far, as a :class:`DecodedGame`.
+
+        ``reveal`` back-fills the opponent's purchases from cards they later
+        played (:func:`reveal_purchases`). It defaults off here because the live
+        caller is the one that has to ask for it deliberately -- mid-game it
+        reads the past, not the future, but it is still a guess being made on
+        the caller's behalf.
+        """
+        if not self.started:
+            raise ProtocolError("no game: no full-state message has arrived")
+        actions = reveal_purchases(self.actions) if reveal else list(self.actions)
+        return DecodedGame(board=self.board, coords=self.coords,
+                           seating=self.seating, our_color=self.our_color,
+                           actions=actions)
+
+
 def decode_capture(path: Path, colors=(Color.BLUE, Color.RED),
                    reveal=True) -> DecodedGame:
     """Decode one captured game into a board and a stream of actions.
@@ -692,38 +812,20 @@ def decode_capture(path: Path, colors=(Color.BLUE, Color.RED),
             later played (see :func:`reveal_purchases`). Right for a recorded
             game, wrong for a live one.
     """
-    board = coords = None
-    seating: Tuple[Color, ...] = ()
-    our_color: Optional[Color] = None
-    decoder: Optional[_ActionDecoder] = None
+    decoder = MessageDecoder(colors)
+    for kind, payload in iter_server_messages(Path(path)):
+        if kind == MSG_FULL_STATE and decoder.started:
+            break  # a second game in one capture; stop at the first
+        decoder.feed(kind, payload)
 
-    for kind, payload in _server_messages(Path(path)):
-        if kind == MSG_FULL_STATE and isinstance(payload, dict):
-            if decoder is not None:
-                break  # a second game in one capture; stop at the first
-            state = payload["gameState"]
-            coords = build_coordinate_map(state["mapState"])
-            board = board_spec_from_state(state["mapState"], coords)
-            order = payload["playOrder"]
-            by_colonist = {c: colors[i] for i, c in enumerate(order)}
-            seating = tuple(by_colonist[c] for c in order)
-            our_color = by_colonist[payload["playerColor"]]
-            decoder = _ActionDecoder(coords, by_colonist, our_color)
-        elif kind == MSG_DIFF and decoder is not None and isinstance(payload, dict):
-            diff = payload.get("diff")
-            if isinstance(diff, dict):
-                decoder.feed(diff)
-
-    if decoder is None or board is None or coords is None or our_color is None:
+    if not decoder.started:
         raise ProtocolError(f"{path} contains no game: no full-state message was sent")
-
-    actions = reveal_purchases(decoder.actions) if reveal else decoder.actions
-    return DecodedGame(board=board, coords=coords, seating=seating,
-                       our_color=our_color, actions=actions)
+    return decoder.decoded(reveal=reveal)
 
 
 __all__ = [
-    "CoordinateMap", "DecodedGame", "ProtocolError",
+    "CoordinateMap", "DecodedGame", "MessageDecoder", "ProtocolError",
     "board_spec_from_state", "build_coordinate_map", "decode_capture",
-    "iter_colonist_frames", "reveal_purchases",
+    "iter_colonist_frames", "iter_server_messages", "reveal_purchases",
+    "server_message",
 ]

@@ -9,6 +9,7 @@ so it is pinned before any protocol work starts.
 
 import base64
 import pathlib
+import random
 
 import numpy as np
 import pytest
@@ -30,6 +31,7 @@ from src.bridge import protocol
 from src.bridge.capture import decode_payload, message_type, shape
 from src.bridge.player import build_bridge_player
 from src.bridge.replay import DesyncError, GameReplay, blank_outcome
+from src.bridge.session import LiveGame, LobbyMismatch, determinize_purchases
 from src.env.catan_env import make_1v1_game
 
 COLORS = (Color.BLUE, Color.RED)
@@ -51,6 +53,14 @@ def play_reference_game(seed: int):
         game.play_tick()
     return (spec_from_map(game.state.board.map), tuple(game.state.colors),
             list(game.state.actions), game)
+
+
+def public_vps(state):
+    """Victory points from buildings and awards -- everything that is on the board."""
+    return {
+        color: state.player_state[f"P{state.color_to_index[color]}_VICTORY_POINTS"]
+        for color in COLORS
+    }
 
 
 def vps(state):
@@ -374,6 +384,25 @@ def test_a_steal_against_us_names_us_as_the_victim():
     assert action.value[2] == "SHEEP"
 
 
+def test_a_steal_reports_that_it_rewrote_the_robber_move():
+    """The one place the decoder edits an action it already handed out.
+
+    Harmless when a whole capture is decoded at once and fatal when it is not:
+    a live replay has already *applied* that robber move, so unless the rewrite
+    is announced it plays on from a position where the wrong card changed hands.
+    """
+    decoder = make_decoder()
+    appended = decoder.feed({"mechanicRobberState": {"locationTileIndex": 0},
+                             "gameLogState": {"0": {"text": {
+                                 "type": protocol.LOG_ROBBER_MOVED, "playerColor": 2,
+                                 "pieceEnum": protocol.PIECE_ROBBER}}}})
+    revised = decoder.feed({"gameLogState": {"0": {"text": {
+        "type": protocol.LOG_ROBBED_BY_THEM, "playerColor": 2, "cardEnums": [3]}}}})
+
+    assert appended is None      # the robber move only appended
+    assert revised == 0          # the steal rewrote it in place
+
+
 def test_a_played_card_reveals_the_purchase_that_bought_it():
     """Offline only: live, an opponent's card is unknown until it is played."""
     actions = [
@@ -413,21 +442,138 @@ def test_a_captured_game_replays_move_for_move():
     strongest statement the bridge can make offline: every move colonist
     reported was legal in the reconstruction, at the moment it was made.
     """
-    decoded = None
-    for path in CAPTURES:
-        try:
-            decoded = protocol.decode_capture(path)
-            break
-        except protocol.ProtocolError:
-            continue  # a capture of the lobby only, with no game in it
-    if decoded is None:
-        pytest.skip("recorded captures contain no complete game")
-
+    _, decoded = first_capture_with_a_game()
     replay = GameReplay(decoded.board, colors=decoded.seating, vps_to_win=15)
 
-    replay.apply_many(decoded.actions)  # DesyncError if any move was mistranslated
+    # Determinized rather than fed raw: a purchase left as None is drawn by the
+    # engine from its own shuffled deck, and about one shuffle in six starves a
+    # later revealed card and dies inside draw_from_listdeck. That failure is
+    # the deck's luck, not a mistranslation, and this test is about the latter.
+    actions = determinize_purchases(decoded.actions, random.Random(0))
+
+    replay.apply_many(actions)  # DesyncError if any move was mistranslated
 
     assert decoded.our_color in decoded.seating
     assert replay.state.num_turns > 20
     assert encode_observation(replay.game, decoded.our_color,
                               lookahead=True).shape == (642,)
+
+
+# --------------------------------------------------------------------------
+# Live session -- rung 1's engine, driven offline
+# --------------------------------------------------------------------------
+def first_capture_with_a_game():
+    """The first recording that holds a complete game, or a skip."""
+    for path in CAPTURES:
+        try:
+            return path, protocol.decode_capture(path)
+        except protocol.ProtocolError:
+            continue  # a capture of the lobby only
+    pytest.skip("recorded captures contain no complete game")
+
+
+def feed_capture(live, path):
+    for record in protocol.iter_colonist_frames(path):
+        live.feed_frame(record)
+    return live
+
+
+def test_the_message_decoder_reads_a_capture_the_way_the_file_reader_does():
+    """The refactor's whole claim: one state machine, two ways of feeding it.
+
+    ``decode_capture`` is now a loop over ``MessageDecoder``, so this would be
+    trivially true -- except that it is what lets the offline tests stand in for
+    the live path, and that is worth stating rather than assuming.
+    """
+    path, expected = first_capture_with_a_game()
+
+    decoder = protocol.MessageDecoder()
+    for kind, payload in protocol.iter_server_messages(path):
+        if kind == protocol.MSG_FULL_STATE and decoder.started:
+            break
+        decoder.feed(kind, payload)
+
+    assert decoder.decoded(reveal=True) == expected
+    assert decoder.settings["maxPlayers"] == 2
+
+
+@pytest.mark.skipif(not CAPTURES, reason="no colonist capture recorded locally")
+def test_a_live_feed_reaches_the_state_a_whole_capture_replays_to():
+    """Rung 1's core claim: fed one message at a time, the game comes out the same.
+
+    The offline replay gets the whole tape and back-fills every dev card from
+    what was later played. The live feed gets the same messages in order and has
+    to guess the ones nobody has revealed yet.
+
+    They must agree on everything *public* -- turn count, winner, and the
+    victory points that come from buildings and awards. They are allowed to
+    disagree on the hidden ones, and do: a purchase nobody ever revealed is a
+    card both sides are guessing at, and the engine's own random draw is no
+    better a guess than ours. The gap is bounded by the number of such
+    purchases, which is the honest statement of what determinization costs.
+    """
+    path, expected = first_capture_with_a_game()
+    offline = GameReplay(expected.board, colors=expected.seating, vps_to_win=15)
+    offline.apply_many(determinize_purchases(expected.actions, random.Random(1)))
+
+    live = feed_capture(LiveGame(vps_to_win=15, seed=0, check_lobby=False), path)
+
+    assert live.replay.state.num_turns == offline.state.num_turns
+    assert live.replay.winning_color() == offline.winning_color()
+    assert public_vps(live.replay.state) == public_vps(offline.state)
+    assert live.repairs == 0  # attribution should get there first, every time
+
+    hidden = sum(abs(vps(live.replay.state)[c] - vps(offline.state)[c])
+                 for c in COLORS)
+    assert hidden <= len(live._guesses)
+
+
+@pytest.mark.skipif(not CAPTURES, reason="no colonist capture recorded locally")
+def test_every_purchase_is_given_a_card_even_when_nobody_revealed_it():
+    """The engine cannot advance on ``None``, so the guess is not optional."""
+    path, _ = first_capture_with_a_game()
+
+    live = feed_capture(LiveGame(vps_to_win=15, seed=0, check_lobby=False), path)
+
+    buys = [a for a in live._filled
+            if a.action_type == ActionType.BUY_DEVELOPMENT_CARD]
+    assert buys and all(a.value is not None for a in buys)
+    # And some of them really were guesses -- otherwise this proves nothing.
+    assert live._guesses
+    assert live.rebuilds > 1  # a revealed purchase invalidated an applied one
+
+
+@pytest.mark.skipif(not CAPTURES, reason="no colonist capture recorded locally")
+def test_the_worst_possible_guess_still_replays_the_whole_game():
+    """Every unknown card guessed as a victory point -- the least likely draw.
+
+    Not a curiosity: it is the bound on how badly the determinization can go
+    wrong. Attribution re-derives each purchase the moment it is played, so the
+    guessing never accumulates, and the replay survives a determinizer that is
+    wrong on purpose.
+    """
+    path, _ = first_capture_with_a_game()
+
+    class Poisoned(LiveGame):
+        def _draw(self, remaining):
+            if remaining.get("VICTORY_POINT", 0) > 0:
+                return "VICTORY_POINT"
+            return super()._draw(remaining)
+
+    live = feed_capture(Poisoned(vps_to_win=15, seed=0, check_lobby=False), path)
+
+    assert live.replay.state.num_turns > 20
+
+
+def test_a_lobby_that_is_not_our_ruleset_is_refused():
+    """The silent divergences are the dangerous ones, so they are checked.
+
+    A different victory target never makes a single move illegal; it just means
+    the policy is playing to the wrong finish line for the whole game.
+    """
+    live = LiveGame(vps_to_win=15)
+    live.decoder.settings = {"victoryPointsToWin": 10, "cardDiscardLimit": 9,
+                             "maxPlayers": 2, "friendlyRobber": True}
+
+    with pytest.raises(LobbyMismatch, match="victoryPointsToWin"):
+        live._check_lobby()
