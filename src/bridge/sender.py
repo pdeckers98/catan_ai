@@ -127,19 +127,43 @@ class FrameCodec:
     off the frames the client is already sending -- which the live session
     records anyway -- rather than assumed.
 
-    ``sequence`` is the sharp one. It increments per action, and the client has
-    no idea we consumed a number, so after we send, the client's next frame will
-    reuse it. Whether the server minds is exactly the kind of thing the first
-    live send is for; :attr:`sent` records what we spent so it can be read back
-    against what happened.
+    ``sequence`` is the sharp one, and sharper than it first looked: it is one
+    counter for the *connection*, not one per writer, and the server forces a
+    full resync on any gap. See :meth:`observe` -- the short version is that the
+    client owns the counter and we borrow it, so its value always wins even when
+    it is lower than ours.
     """
 
     header: Optional[RoutingHeader] = None
     last_sequence: Optional[int] = None
     sent: List[dict] = field(default_factory=list)
+    #: Times the client's counter came in below ours, i.e. the connection's
+    #: single counter had forked. Each one costs a forced resync; see
+    #: :meth:`observe`.
+    forks: int = 0
 
     def observe(self, entry: dict) -> None:
-        """Feed one recorded ``sent`` frame, as the capture writes it."""
+        """Feed one recorded ``sent`` frame, as the capture writes it.
+
+        **The client's number always wins, even when it is lower than ours.**
+        That looks wrong and is the whole fix: ``sequence`` is one counter per
+        connection, not per writer. Measured over a human-played game, 162
+        consecutive client frames stepped by exactly 1, without a single
+        exception, and the server forces a full resync the moment it sees a gap.
+
+        Two writers on one socket therefore fork it. We count our own sends, the
+        page counts its own, and the first time the human touches the board its
+        frame arrives with a much smaller number -- after which *every* frame of
+        ours is a gap and the server resyncs on each one. One live game took ten
+        forced resyncs in a row that way; before the first click it had sent
+        twenty-one frames with none.
+
+        Taking the client's value as authoritative cannot prevent a collision --
+        it may send its next frame before we send ours, and then we duplicate a
+        number -- but a duplicate is demonstrably tolerated (the first live
+        probe consumed 21, the client later sent 21, and the server took both)
+        while a gap is not.
+        """
         if entry.get("dir") != "sent" or "header" not in entry:
             return
         try:
@@ -151,9 +175,10 @@ class FrameCodec:
         self.header = header
         payload = entry.get("payload")
         if isinstance(payload, dict) and isinstance(payload.get("sequence"), int):
-            sequence = payload["sequence"]
-            if self.last_sequence is None or sequence > self.last_sequence:
-                self.last_sequence = sequence
+            observed = payload["sequence"]
+            if self.last_sequence is not None and observed < self.last_sequence:
+                self.forks += 1
+            self.last_sequence = observed
 
     def bootstrap(self, room: str) -> None:
         """Route by the room name the *server* announced, having heard no client.

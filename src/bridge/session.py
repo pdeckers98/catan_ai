@@ -897,7 +897,16 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
                 if direction != "recv":
                     # ...but our own half says how to speak, so the codec reads
                     # the routing header and sequence counter off the client.
+                    forks = codec.forks
                     codec.observe(entry)
+                    if codec.forks != forks:
+                        print(
+                            "\n!! the page just sent a move of its own.\n"
+                            "   colonist keeps ONE sequence counter per "
+                            "connection, so clicking while\n   the agent plays "
+                            "forks it and the server forces a resync on every\n"
+                            "   frame after. Ours is re-synced to the page's; "
+                            "avoid clicking.\n", file=sys.stderr)
                     return
                 if not codec.ready:
                     # A game the agent plays start to finish has no human

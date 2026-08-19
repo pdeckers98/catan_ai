@@ -747,6 +747,32 @@ def test_the_lobby_is_not_mistaken_for_a_game_room():
     assert not codec.ready
 
 
+def test_the_client_owns_the_sequence_counter_even_going_backwards():
+    """One counter per connection, not per writer, and the server checks it.
+
+    Measured over a human-played game: 162 consecutive client frames, every gap
+    exactly 1, no exceptions. Two writers therefore fork it -- and a live game
+    took ten forced resyncs in a row after the first click, having sent
+    twenty-one frames with none before it.
+
+    So a *lower* number from the client wins. Keeping the maximum, which is the
+    obvious thing, is what leaves every later frame of ours looking like a gap.
+    """
+    codec = sender.FrameCodec()
+    codec.bootstrap("045804")
+    for _ in range(21):
+        codec.build(sender.SEND_ROLL, True)
+    assert codec.last_sequence == 21
+
+    codec.observe({"dir": "sent", "header": bytes([3, 1, 6]).hex() + b"045804".hex(),
+                   "payload": {"action": 6, "payload": True, "sequence": 2}})
+
+    assert codec.last_sequence == 2
+    assert codec.forks == 1
+    assert codec.build(sender.SEND_END_TURN, True)
+    assert codec.last_sequence == 3
+
+
 def test_each_frame_takes_the_next_sequence_number():
     """The client has no idea we consumed one, which is worth being able to see."""
     codec = sender.FrameCodec()
