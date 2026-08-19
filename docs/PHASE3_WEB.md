@@ -12,10 +12,14 @@ and the server's turn marker came back at 662, followed by the opponent's roll. 
 frames the page's own client never authored, so the sender is a msgpack write and the
 coordinate/click project this doc once scoped is not needed.
 
-**Rung 2 has now been run ten times: the agent plays its own games.** `--auto-play` arms the live
-session, and on 2026-08-19 it played ten 1v1 casual matchmaking games start to finish, opening
-placement included, with no human input after the game began. **Every bug was found by playing,
-not by testing** — the offline round-trip regenerates a captured game's client frames exactly and
+**Rung 2 has now been run eleven times, and the eleventh game finished** — 94 turns, no bug, no
+intervention, a real result (a loss). The bridge work is essentially done; what that game exposed
+is an *agent* problem, and a big one: across 45 turns it never built a settlement. See rung 2.
+
+`--auto-play` arms the live session, and on 2026-08-19 it played eleven 1v1 casual matchmaking
+games start to finish, opening placement included, with no human input after the game began.
+**Every bug was found by playing, not by testing** — the offline round-trip regenerates a captured
+game's client frames exactly and
 missed all of them. They fall into four categories (mistranslation, timing and identity,
 narration, and a guess that ended a game), plus one that was not in the bridge at all: our
 **friendly-robber rule was wrong**, and had been through every game and every training run. See
@@ -550,8 +554,41 @@ hosting the authenticated session. Unproven until we send one.
    size. It cannot affect the bridge (live play replays the dice the server rolled); it would only
    mean training saw a slightly different distribution than colonist deals.
 
-   **Still unproven live:** the discard selection (`8`/`7`), which needs a 7 rolled against a hand
-   over 9 cards, and whether an auto-declined trade offer really reads as a decline.
+   **The eleventh game finished.** 94 turns, no bug, nothing left broken: 157 decisions, every one
+   legal and echoed back by the server, median 0.15s and worst case 0.74s per move. The
+   impossible-hand rejection fired twice in it, so the game before it would have frozen.
+
+   Two things it settled:
+
+   - **The discard mapping is proven live.** A 7 finally hit a hand over 9 cards, the agent chose
+     `WOOD WOOD WOOD SHEEP SHEEP` and it went out as five `8` frames and a `7`. That was the last
+     unproven code in the table.
+   - **`playerStates[pid].victoryPointsState` is decoded**, from the endgame breakdown: the keys
+     are sources and the values are *counts*, `0` settlements, `1` cities, `2` victory-point cards,
+     `3` Largest Army, `4` Longest Road. Points are the count times `(1, 2, 1, 2, 2)`, and both
+     players' totals reconcile exactly with the reconstruction. It has been on the open list since
+     rung 1.
+
+   **And it lost, in a way worth reading.** Final board — us 0 settlements and 2 cities, them 4
+   settlements and 4 cities:
+
+   | | settlements built | cities | roads | dev cards bought | knights played |
+   | --- | --- | --- | --- | --- | --- |
+   | agent | **0** (just the opening two) | 2 | 9 | 14 | 9 |
+   | opponent | 6 | 4 | 14 | 3 | 0 |
+
+   **Across 45 of its own turns the agent never placed a settlement.** It upgraded its two opening
+   settlements and spent the rest of the game on development cards. That is the dev-card
+   monoculture recorded against `ppo-8vp-scratch` long ago, still present in the shipped 15 VP
+   agent, and invisible in every benchmark to date because those are mirror matches — both sides
+   sit still, so sitting still costs nothing. A human who expands wins on tempo.
+
+   This is now the most interesting open question in the project, and it is an *agent* question
+   rather than a bridge one. The bridge did its job: it produced the first honest measurement of
+   the agent against an opponent that does not share its habits.
+
+   **Still unproven live:** whether an auto-declined trade offer really reads as a decline. No
+   opponent has made one since the handler was written.
 
    Playing a live game, which is what this rung is:
 
