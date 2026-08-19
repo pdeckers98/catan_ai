@@ -114,8 +114,15 @@ LOG_BANK_TRADE = 116
 # vote (message 51), logs 36 "a vote was called" and -- once both players
 # accept -- 26 and 33 alongside `karmaPenaltyRemoved`. It is a lobby feature
 # conducted in chat; nothing about it reaches the board.
+#
+# 112 is a **resignation**, which ends the game rather than changing it. The
+# engine has no such move, and there is nothing left to reconstruct: the entry
+# is followed only by the win (45) and the turn marker. Ignored so that a game
+# ending the way games often end is not reported as a decoding failure -- which
+# is what it did the first time it happened, after the position was already
+# finished.
 LOG_IGNORED = frozenset({
-    2, 22, 26, 33, 36, 45, 47, 49, 60, 66, 68, 74, 139,
+    2, 22, 26, 33, 36, 45, 47, 49, 60, 66, 68, 74, 112, 139,
 })
 
 

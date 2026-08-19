@@ -120,7 +120,8 @@ def discard_frames(resources: Sequence[str]) -> List[Frame]:
 
 
 def translate(action, coords, colonist_color: int,
-              prompt: Optional[str] = None) -> List[Frame]:
+              prompt: Optional[str] = None,
+              free_road: bool = False) -> List[Frame]:
     """The frames colonist's client would have sent for ``action``.
 
     Args:
@@ -132,6 +133,10 @@ def translate(action, coords, colonist_color: int,
         prompt: ``str(state.current_prompt)`` if known. Only the opening needs
             it: a settlement placed for free is action ``15`` and a bought one
             is ``16``, and the frame is the only difference.
+        free_road: whether this road is one of Road Building's two, i.e.
+            ``state.is_road_building``. The prompt cannot say so -- catanatron
+            stays in ``PLAY_TURN`` and tracks the card in a counter -- and the
+            code differs, so it has to be passed.
 
     Raises:
         TranslationError: for anything with no mapping.
@@ -153,7 +158,12 @@ def translate(action, coords, colonist_color: int,
     if kind == ActionType.BUILD_CITY:
         return [(SEND_CITY, _corner(coords, value))]
     if kind == ActionType.BUILD_ROAD:
-        code = SEND_INITIAL_ROAD if initial else SEND_ROAD
+        # Road Building's two roads are free, and colonist splits its codes by
+        # who pays rather than by when: they log as entry 4, "placed for free",
+        # exactly like an opening road, and never as entry 5, "built". Sending
+        # 12 for one is silently ignored -- it cost a live game, which is the
+        # only reason this distinction is here at all.
+        code = SEND_INITIAL_ROAD if (initial or free_road) else SEND_ROAD
         return [(code, _edge(coords, value))]
 
     if kind == ActionType.MOVE_ROBBER:

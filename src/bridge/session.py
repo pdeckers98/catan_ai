@@ -501,7 +501,8 @@ class DryRun:
                       "legal": len(legal), "seconds": round(elapsed, 3)})
         self._play(action, lambda: moves.translate(
             action, self.live.decoder.coords,
-            self.live.decoder.our_colonist_color, str(state.current_prompt)))
+            self.live.decoder.our_colonist_color, str(state.current_prompt),
+            free_road=getattr(state, "is_road_building", False)))
 
     def _decide_discard(self) -> None:
         """Choose a whole discard, then send it as the one frame colonist wants.

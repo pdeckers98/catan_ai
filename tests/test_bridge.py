@@ -835,8 +835,10 @@ def translated_frames(path):
             continue
         if mine:
             prompt = str(replay.state.current_prompt)
+            free = getattr(replay.state, "is_road_building", False)
             ours.extend(frame for frame in moves.translate(
-                action, decoded.coords, decoded.our_colonist_color, prompt)
+                action, decoded.coords, decoded.our_colonist_color, prompt,
+                free_road=free)
                 if frame[0] in TRANSLATED_CODES)
         replay.apply(action)
         index += 1
@@ -1034,3 +1036,30 @@ def test_no_capture_leaves_one_of_our_own_purchases_unattributed():
         assert [a for a in ours if a.value is None] == [], path.name
 
     assert checked, "no capture contained a purchase of ours"
+
+
+def test_road_building_places_its_roads_for_free():
+    """The second live game stalled here, and the log said which code to use.
+
+    Colonist splits its build codes by who pays, not by when: an opening road
+    and a Road Building road both log as entry 4, "placed for free", while every
+    road the player bought logs as entry 5. So the card's two roads go out as
+    ``11`` like the opening, not ``12`` -- and ``12`` is not refused, it is
+    ignored, which is why the game simply stopped.
+    """
+    coords = make_decoder().coords
+    edge = next(iter(coords.edge_by_catanatron))
+    road = Action(Color.RED, ActionType.BUILD_ROAD, edge)
+
+    paid = moves.translate(road, coords, 1, "ActionPrompt.PLAY_TURN")
+    free = moves.translate(road, coords, 1, "ActionPrompt.PLAY_TURN",
+                           free_road=True)
+
+    assert paid[0][0] == moves.SEND_ROAD
+    assert free[0][0] == moves.SEND_INITIAL_ROAD
+    assert paid[0][1] == free[0][1]  # the same edge, either way
+
+
+def test_a_resignation_is_not_a_decoding_failure():
+    """It ends the game rather than changing it, and games end that way often."""
+    assert 112 in protocol.LOG_IGNORED
