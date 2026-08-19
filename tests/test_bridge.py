@@ -11,6 +11,7 @@ import base64
 import json
 import pathlib
 import random
+import types
 
 import numpy as np
 import pytest
@@ -33,7 +34,7 @@ from src.bridge.capture import decode_payload, message_type, shape
 from src.bridge.player import build_bridge_player
 from src.bridge.replay import DesyncError, GameReplay, blank_outcome
 from src.bridge.session import (
-    LiveGame, LobbyMismatch, determinize_purchases, draw_card,
+    DryRun, LiveGame, LobbyMismatch, determinize_purchases, draw_card,
 )
 from src.env.catan_env import make_1v1_game
 
@@ -1323,3 +1324,111 @@ def test_an_unknown_entry_alone_in_a_moving_diff_is_still_fatal():
     with pytest.raises(protocol.ProtocolError, match="nothing else explains"):
         decoder.feed({"bankState": {"resourceCards": {"1": 17}},
                       "gameLogState": {"1": {"text": {"type": 999}}}})
+
+
+# --------------------------------------------------------------------------
+# A guess must not be able to end a game. The opponent's hidden hand is drawn,
+# and a draw heavy in victory-point cards can put their reconstructed score
+# past the target while the real game plays on. Live, that stopped the agent
+# deciding for the last four turns of a game it was still in -- no exception,
+# no frame, nothing to read.
+# --------------------------------------------------------------------------
+
+
+def test_the_server_is_what_says_a_game_is_over():
+    """Entry 45, and nothing we derive ourselves."""
+    decoder = make_decoder()
+    assert not decoder.game_over
+
+    decoder.feed({"gameLogState": {"1": {"text": {"type": 45, "playerColor": 1}}}})
+
+    assert decoder.game_over
+
+
+def test_the_server_can_end_a_game_our_reconstruction_has_not():
+    """Two authorities, and either one saying "over" is enough to stop.
+
+    They fail in opposite directions -- ours guesses the hidden hand, theirs
+    only speaks at the end -- so the guard asks both.
+    """
+    live = LiveGame(vps_to_win=15, check_lobby=False)
+    live.decoder.our_color = Color.RED
+    live.replay = types.SimpleNamespace(current_color=Color.RED,
+                                        winning_color=lambda: None)
+
+    assert live.our_turn()
+
+    live.decoder._decoder = types.SimpleNamespace(game_over=True)
+    assert not live.our_turn()
+
+
+def test_a_hand_that_has_already_won_is_impossible():
+    """The rejection is real conditioning, not a patch over a symptom.
+
+    "The game is still running" is evidence, and it rules the sample out: a
+    hand that wins is one the server would already have paid out on. Only a
+    guessed hand can produce it -- our own cards are on the wire, so a win of
+    ours the server has not announced is a real bug and is left to be found as
+    one rather than quietly redrawn.
+    """
+    live = LiveGame(vps_to_win=15, check_lobby=False)
+    live._filled = [
+        Action(Color.BLUE, ActionType.BUY_DEVELOPMENT_CARD, "VICTORY_POINT")]
+    live._guesses = {0: "VICTORY_POINT"}
+
+    live.replay = types.SimpleNamespace(winning_color=lambda: Color.BLUE)
+    assert live._phantom_win()
+
+    live.replay = types.SimpleNamespace(winning_color=lambda: Color.RED)
+    assert not live._phantom_win()
+
+    live.replay = types.SimpleNamespace(winning_color=lambda: None)
+    assert not live._phantom_win()
+
+
+def test_the_watchdog_notices_a_turn_nobody_is_playing():
+    """The failure with no other symptom, so this is the only way to see it."""
+    dry = DryRun(None, None, None, simulations=0)
+    dry.live = types.SimpleNamespace(
+        our_color=Color.RED,
+        started=True,
+        game=types.SimpleNamespace(state=types.SimpleNamespace(num_turns=87)),
+        replay=types.SimpleNamespace(current_color=Color.BLUE),
+        decoder=types.SimpleNamespace(server_turn_color=Color.RED, game_over=False),
+    )
+
+    dry._check_idle(seconds=30.0)          # starts the clock, says nothing
+    assert dry._idle_since is not None
+    dry._idle_since -= 31
+    dry._check_idle(seconds=30.0)
+    assert dry._idle_reported == 87
+
+    # And it stays quiet while the server is waiting on the opponent.
+    dry.live.decoder.server_turn_color = Color.BLUE
+    dry._check_idle(seconds=30.0)
+    assert dry._idle_since is None
+
+
+def test_a_guess_cannot_spend_a_card_a_later_reveal_needs():
+    """The deck is shared, and the reveals have first claim on it.
+
+    A guess is at liberty about *which* unknown card a purchase was, never
+    about how many of each the deck held. Draw greedily and the last victory
+    point can be guessed away early and then genuinely revealed later, at which
+    point catanatron's own deck raises from inside ``draw_from_listdeck`` with
+    an error that says nothing about what went wrong. Three seeds in forty on a
+    captured game did exactly that.
+    """
+    buys = [Action(Color.BLUE, ActionType.BUY_DEVELOPMENT_CARD, None)
+            for _ in range(5)]
+    buys.append(Action(Color.BLUE, ActionType.BUY_DEVELOPMENT_CARD, "VICTORY_POINT"))
+
+    filled = determinize_purchases(
+        buys, random.Random(0),
+        draw=lambda remaining: "VICTORY_POINT" if remaining["VICTORY_POINT"] > 0
+        else draw_card(remaining, random.Random(0)))
+
+    cards = [action.value for action in filled]
+    assert all(card is not None for card in cards)
+    assert cards.count("VICTORY_POINT") <= 5   # the deck holds five, not six
+    assert cards[-1] == "VICTORY_POINT"        # and the revealed one is still it

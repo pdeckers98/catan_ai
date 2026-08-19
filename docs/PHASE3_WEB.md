@@ -395,7 +395,7 @@ hosting the authenticated session. Unproven until we send one.
    positions offer one sensible move, and the disagreements cluster exactly where they should
    (whether to trade, whether to buy a dev card or end the turn).
 2. **Single supervised live game** on a throwaway account, human ready to intervene. 🚧 **Run
-   twice on 2026-08-19, both times through 1v1 casual matchmaking with no human input after the
+   nine times on 2026-08-19, all through 1v1 casual matchmaking with no human input after the
    game started.** Add `--auto-play` to the live command. The opening is the agent's too — the
    placement specialist places it, and the free-placement codes (`15`/`11`) are visibly different
    from the paid ones in the log.
@@ -429,17 +429,76 @@ hosting the authenticated session. Unproven until we send one.
    Both were invisible to three games of offline round-tripping, because a round-trip can only
    check the mappings a human's clicks happened to exercise.
 
-   Still to handle:
+   **Nine games in, the failures have changed category twice.** They are worth reading in that
+   order, because each category needed a different kind of fix and only the first was about the
+   translation table.
 
-   - **A session is not a game.** A capture holds *two* full-state messages with empty boards,
-     i.e. two games on one session, and `LiveGame` rebuilds from move one on a full state without
-     regard for which game it belongs to. Everything after the second one desyncs. Unattended play
-     means many games per session, so this is rung 2 work, not rung 3.
-   - **Year of Plenty and discard are still unproven live** (component 2).
+   *Mistranslations* — a mapping we got wrong. Road Building above; the 2:1 port before it.
+   Fixed by learning the code.
 
-   Fixed along the way: the **karma vote** (log entries 36/26/33 — a player types `/disablekarma`,
-   the server opens a vote, and those three narrate it) and a **resignation** (112), which ends a
-   game rather than changing it and was being reported as a decoding failure.
+   *Timing and identity* — the frames were right and arrived wrong.
+
+   - **`sequence` is one counter per connection, not one per writer.** Both the page's client and
+     ours were numbering their own frames, so every move we sent forked the count and the server
+     resynced. Over a human-played game 162 consecutive client frames step by exactly 1 with no
+     exceptions. `FrameCodec` now takes the client's value as authoritative *even when it goes
+     backwards*, since the client is the one the server will keep agreeing with. This also
+     retires "a session is not a game" as a separate problem: the second full state was never a
+     second game, it was the server resyncing a forked counter.
+     **Operationally: do not click while the agent is playing.**
+   - **A monopoly or a year of plenty is acknowledged by state, not by log.** The card play, the
+     selection and the confirm went out as one burst and the server dropped the tail, so the card
+     was played and its choice never was. Gating the tail on log entry 20 then *deadlocked* —
+     colonist does not log either card until the choice arrives, so it waits for something the
+     choice itself causes. The gate is `currentState.actionState` ∈ {32, 33}, which comes back
+     about 120ms after the bare card play. `split_after_card_play` holds the tail until then.
+   - **A mid-game resync is not a new game.** Every agent-played game provokes at least one, one
+     of them seven. Rebuilding on it fed an empty board a mid-game Year of Plenty. `_is_resync`
+     tells them apart, and since a resync is the server stating the whole position outright,
+     `LiveGame._audit` compares it against ours rather than discarding it. **All 8 resyncs across
+     three captures pass** — the reconstruction matched the server's own account of the board
+     exactly.
+
+   *Narration* — colonist talking about things that are not the game. Four games died this way
+   (karma vote 36/26/33, resignation 112, trade offer 118, opponent disconnect 24/130), so the
+   fifth was fixed by a stance rather than a fifth constant: an unknown log entry raises only when
+   the diff it rode in **moves something no entry we do decode accounts for**. Both conditions
+   matter — colonist announces "must discard" (64) in the same diff as the discard (55), which
+   moves cards but is fully explained. Unknowns that move nothing are counted and printed once.
+   Trade offers are also answered: an offer awaiting us gets a decline, because ignoring one
+   stalls the opponent's turn on our clock.
+
+   *A guess that ended a game* — the newest category, and the quietest.
+
+   - **The opponent's hidden hand is drawn, and a bad draw can win.** Late in a long game the
+     opponent has bought several dev cards nobody ever revealed. Draw enough of them as victory
+     points and their *reconstructed* score crosses the target: `replay.winning_color()` returns
+     a winner, `our_turn()` returned `False`, and the agent stopped deciding for the rest of a
+     game it was still in. No exception, no frame, no log line — the ninth game burned its last
+     four turns in silence and had to be finished by hand. On that capture **1 seed in 4** hits
+     it; two captures from 2026-08-17 carry it latently.
+
+     The fix is conditioning, not tolerance. "The game is still running" is evidence: a hand that
+     wins is one the server would already have paid out on, so the sample is *impossible* and is
+     rejected and redrawn (`_phantom_win`, up to `MAX_PHANTOM_REDRAWS`). This matters for strength
+     and not only for liveness — an agent that believes the game is already lost chooses
+     meaninglessly, and near-misses degrade its play the same way without freezing it.
+     Only a guessed hand can produce one: our own cards are on the wire, so a win of *ours* the
+     server has not announced is a real bug and is left alone to be found as one.
+   - **The watchdog that would have caught it in game one.** `DryRun._check_idle` compares the
+     server's own `currentTurnPlayerColor` against ours and says so, aloud, when the server has
+     been waiting on us for 30s and the agent has made no move. It does not retry — what to do
+     depends entirely on why — but the failure now has a symptom. Both halves of a stall are
+     covered: a move sent and lost, and a move never decided.
+   - **A guess must not spend a card a later reveal needs.** Found by the same sweep:
+     `determinize_purchases` drew guesses greedily against a deck it had not yet subtracted the
+     *revealed* purchases from, so the last victory point could be guessed away at move 30 and
+     then genuinely revealed at move 70 — dying inside catanatron's `draw_from_listdeck` with an
+     error that says nothing about what went wrong. Three seeds in forty on `game2`, and
+     pre-existing. Reveals now have first claim on the deck.
+
+   **Still unproven live:** the discard selection (`8`/`7`), which needs a 7 rolled against a hand
+   over 9 cards, and whether an auto-declined trade offer really reads as a decline.
 
    Playing a live game, which is what this rung is:
 

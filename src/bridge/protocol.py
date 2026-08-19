@@ -102,6 +102,11 @@ LOG_TURN_STARTED = 44
 LOG_DISCARDED = 55
 LOG_MONOPOLY = 86
 LOG_BANK_TRADE = 116
+# The server declaring the game finished. It produces no action -- the engine
+# derives the win itself -- but it is the *authority* on whether the game is
+# still being played, which is a different question from whether our
+# reconstruction thinks somebody has won. See ``LiveGame.our_turn``.
+LOG_WIN = 45
 
 # Log entries that describe consequences rather than decisions. The engine
 # derives all of these itself, so they produce no action: resource payouts,
@@ -477,6 +482,16 @@ class _ActionDecoder:
         self.narration: Dict[int, int] = {}
         #: Whether the diff being decoded contains an entry we understand.
         self._explained = False
+        #: Whether the *server* has declared the game finished. Not the same as
+        #: our reconstruction believing someone has won: the opponent's hidden
+        #: cards are a guess, and a guess must never be what stops us playing.
+        self.game_over = False
+        #: Whose turn the *server* says it is, in colonist's numbering. Read
+        #: only as a watchdog: everything the engine needs it derives itself,
+        #: but if the server is waiting on a seat our reconstruction is not
+        #: playing, somebody should be told rather than the game quietly
+        #: running out of clock.
+        self.turn_colonist_color: Optional[int] = None
         #: Per player, per card enum, how many cards the bank asks for. Colonist
         #: keeps this on the wire (``bankTradeRatiosState``) and it starts at 4
         #: everywhere; ports lower it. Tracked because a trade's log entry gives
@@ -512,6 +527,8 @@ class _ActionDecoder:
         current = diff.get("currentState") or {}
         if "actionState" in current:
             self.action_state = current["actionState"]
+        if "currentTurnPlayerColor" in current:
+            self.turn_colonist_color = current["currentTurnPlayerColor"]
         self.absorb_trades(diff.get("tradeState"))
         entries = sorted((diff.get("gameLogState") or {}).items(), key=lambda kv: int(kv[0]))
         # Whether anything in this diff is an entry we decode. An unknown entry
@@ -593,6 +610,8 @@ class _ActionDecoder:
 
     def _entry(self, text: dict, diff: dict) -> None:
         kind = text.get("type")
+        if kind == LOG_WIN:
+            self.game_over = True
         if kind in LOG_IGNORED or kind is None:
             return
 
@@ -995,6 +1014,30 @@ class MessageDecoder:
         return self.action_state in AWAITING_CARD_SELECTION
 
     @property
+    def server_turn_color(self) -> Optional[Color]:
+        """Whose turn the server says it is, or ``None`` before it has said.
+
+        The server's word, not ours. Comparing it against the reconstruction is
+        the only way to notice that the agent has stopped playing a game that
+        is still waiting on it -- a failure with no exception and no frame, and
+        therefore no other symptom at all.
+        """
+        if self._decoder is None:
+            return None
+        return self.color_by_colonist.get(self._decoder.turn_colonist_color)
+
+    @property
+    def game_over(self) -> bool:
+        """Whether the server has said the game is finished.
+
+        The only authority on the question. Our own reconstruction can reach a
+        winning score off a *guessed* opponent hand, and once did: it handed the
+        opponent enough victory-point cards to cross the target, decided the
+        game was over, and stopped playing four turns before it really was.
+        """
+        return self._decoder is not None and self._decoder.game_over
+
+    @property
     def actions(self) -> List[Action]:
         """Every action decoded so far, oldest first. Live, so do not mutate it."""
         return self._decoder.actions if self._decoder is not None else []
@@ -1069,6 +1112,8 @@ class MessageDecoder:
         self._decoder.absorb_ratios(state.get("playerStates"))
         self._decoder.absorb_dev_cards(
             state.get("mechanicDevelopmentCardsState"))
+        self._decoder.turn_colonist_color = (
+            (state.get("currentState") or {}).get("currentTurnPlayerColor"))
         self.game_id += 1
 
     def decoded(self, reveal: bool = False) -> "DecodedGame":

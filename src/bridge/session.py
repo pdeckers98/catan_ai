@@ -89,6 +89,14 @@ from src.env.rules import DISCARD_LIMIT
 #: spin here forever pretending to be bad luck.
 MAX_REPAIRS = 8
 
+#: How many times a determinization may be redrawn for having already won a game
+#: the server is still running. Larger than :data:`MAX_REPAIRS` and for the
+#: opposite reason: this one is not covering for a suspected bug, it is
+#: rejection sampling a sample we know to be impossible, and the only cost of
+#: another try is a replay. Late in a long game most draws are fine but a bad
+#: one is not rare -- one captured game needed eight.
+MAX_PHANTOM_REDRAWS = 32
+
 #: The only moves a wrong guess about a hidden purchase can make illegal.
 DEV_CARD_PLAYS = frozenset({
     ActionType.PLAY_KNIGHT_CARD, ActionType.PLAY_MONOPOLY,
@@ -140,6 +148,20 @@ def determinize_purchases(actions: List[Action], rng: random.Random,
     """
     revealed = protocol.reveal_purchases(actions)
     remaining = Counter(starting_devcard_bank())
+    # Every card somebody actually showed us is spoken for, whatever order the
+    # purchases came in. Subtracting them all before the first guess is drawn is
+    # what keeps a guess from spending a card a later reveal is going to need --
+    # the guess is at liberty about *which* unknown card it was, never about how
+    # many of each the deck held. Without this the last victory point could be
+    # guessed away at move 30 and then genuinely revealed at move 70, and the
+    # engine's own deck raises from inside ``draw_from_listdeck`` with an error
+    # that says nothing about what went wrong. Three seeds in forty on a
+    # captured game.
+    for action in revealed:
+        if (action.action_type == ActionType.BUY_DEVELOPMENT_CARD
+                and action.value is not None):
+            remaining[action.value] -= 1
+
     guesses = {} if guesses is None else guesses
     filled: List[Action] = []
     for index, action in enumerate(revealed):
@@ -152,9 +174,9 @@ def determinize_purchases(actions: List[Action], rng: random.Random,
             if card is None or remaining[card] <= 0:
                 card = draw(remaining)
             guesses[index] = card
+            remaining[card] -= 1  # revealed cards were subtracted above
         else:
             guesses.pop(index, None)  # revealed; no longer a guess
-        remaining[card] -= 1
         filled.append(Action(action.color, action.action_type, card))
     return filled
 
@@ -209,6 +231,9 @@ class LiveGame:
         #: Games replayed from move one because something already applied
         #: changed underneath. Routine -- a steal or a revealed purchase does it.
         self.rebuilds = 0
+        #: Determinizations rejected because they had somebody winning a game
+        #: the server was still running. See :meth:`_phantom_win`.
+        self.phantom_wins = 0
         #: Full states that re-described the game already in progress. Routine
         #: for an agent -- injected frames provoke them -- and each one is
         #: audited rather than acted on.
@@ -238,8 +263,22 @@ class LiveGame:
         return self.replay.game if self.replay is not None else None
 
     def our_turn(self) -> bool:
-        """Whether the live game is waiting on a decision from us."""
+        """Whether the live game is waiting on a decision from us.
+
+        Two authorities have to agree that there is still a game, because they
+        fail in opposite directions. The reconstruction knows the position but
+        guesses the opponent's hidden hand, and a draw heavy in victory-point
+        cards puts their score past the target while the real game plays on --
+        which is how the agent came to sit out the last four turns of a game it
+        was still in. The server knows, but only says so at the end.
+
+        So the phantom is removed at the source (:meth:`_phantom_win`) rather
+        than by trusting a finished-looking position, and the disagreement that
+        gets through is caught aloud by ``DryRun._check_idle`` instead of
+        silently ending our participation.
+        """
         return (self.replay is not None
+                and not self.decoder.game_over
                 and self.replay.winning_color() is None
                 and self.replay.current_color == self.decoder.our_color)
 
@@ -385,21 +424,54 @@ class LiveGame:
             self._rebuild()
         self._filled = filled
 
-        for attempt in range(MAX_REPAIRS + 1):
+        repairs = phantoms = 0
+        while True:
             try:
                 self._apply_pending()
-                return
             except DesyncError:
                 failed = (self._filled[self._applied]
                           if self._applied < len(self._filled) else None)
-                if attempt == MAX_REPAIRS or not self._repairable(failed):
+                if repairs == MAX_REPAIRS or not self._repairable(failed):
                     raise
                 # Attribution has nothing left to offer; draw the opponent's
                 # unseen cards again and replay from move one.
+                repairs += 1
                 self.repairs += 1
-                self._guesses.clear()
-                self._filled = self._resolve()
-                self._rebuild()
+                self._redraw()
+                continue
+            if self._phantom_win() and phantoms < MAX_PHANTOM_REDRAWS:
+                phantoms += 1
+                self.phantom_wins += 1
+                self._redraw()
+                continue
+            return
+
+    def _phantom_win(self) -> bool:
+        """Whether the reconstruction has won a game the server is still playing.
+
+        This is not a desync -- every move was legal, and nothing the server
+        said contradicts the board. It is the hidden hand being drawn badly: a
+        purchase we never saw becomes a victory-point card, and enough of those
+        put the opponent over the target. The position is then *impossible*,
+        and impossible is worth rejecting rather than merely surviving. The
+        agent reading it believes the game is already lost, which is the one
+        belief that makes every move it chooses meaningless.
+
+        Only a guessed hand can produce it. Our own cards are on the wire, so a
+        win of ours that the server has not announced is a real bug and is left
+        alone to be found as one.
+        """
+        winner = self.replay.winning_color()
+        if winner is None or self.decoder.game_over:
+            return False
+        return any(self._filled[index].color == winner
+                   for index in self._guesses if index < len(self._filled))
+
+    def _redraw(self) -> None:
+        """Throw the guessed cards away, draw again, and replay from move one."""
+        self._guesses.clear()
+        self._filled = self._resolve()
+        self._rebuild()
 
     def _apply_pending(self) -> None:
         while self._applied < len(self._filled):
@@ -478,6 +550,12 @@ class DryRun:
         #: Unknown-but-harmless log entries already reported, so each is named
         #: once rather than every diff.
         self._narrated: set = set()
+        #: Last reported value of ``live.phantom_wins``, so each rejection is
+        #: announced once.
+        self._phantoms = 0
+        #: When the server first started waiting on a move we have not made.
+        self._idle_since: Optional[float] = None
+        self._idle_reported = -1
 
     def arm(self, page_sender, delay: float = 0.0) -> None:
         """Let the agent play its decisions rather than only report them."""
@@ -509,6 +587,11 @@ class DryRun:
         if progress.repaired:
             print(f"  [repair] redrew the opponent's unseen cards "
                   f"{progress.repaired}x at turn {self.live.game.state.num_turns}")
+        if self.live.phantom_wins != self._phantoms:
+            print(f"  [repair] the opponent's guessed hand had already won a game "
+                  f"the server is still running; redrew it "
+                  f"{self.live.phantom_wins - self._phantoms}x")
+            self._phantoms = self.live.phantom_wins
         self._report_narration()
         for action in progress.observed:
             self._score(action)
@@ -711,6 +794,7 @@ class DryRun:
         place the search never evaluated. A human with the window open fixes
         either case in one click, so the useful thing is to be told.
         """
+        self._check_idle(seconds)
         if self._sent_at is None or self._stalled or self._pending is None:
             return
         waited = time.time() - self._sent_at
@@ -720,6 +804,44 @@ class DryRun:
         print(f"\n!! the move we sent {waited:.0f}s ago has not come back from "
               f"the server.\n   Nothing will be resent -- play it by hand in the "
               f"browser and the agent picks up again.\n", file=sys.stderr)
+
+    def _check_idle(self, seconds: float) -> None:
+        """Say so when the server is waiting on us and we have played nothing.
+
+        The other half of a stall, and the half that is invisible: a move we
+        sent and lost at least leaves a frame to point at, but an agent that
+        never decides leaves nothing -- no exception, no frame, no log line.
+        One live game ended that way, the last four turns of our own clock burnt
+        in silence while a bad guess at the opponent's hidden hand had the
+        reconstruction convinced the game was already over.
+
+        So the server's own view of whose turn it is gets compared against ours.
+        It is a watchdog and not a fix: nothing is retried, because what to do
+        depends entirely on why, and a human with the window open can see why.
+        """
+        if self.broken is not None or self._pending is not None:
+            return
+        ours = self.live.our_color
+        waiting_on_us = (ours is not None
+                         and self.live.decoder.server_turn_color == ours
+                         and not self.live.decoder.game_over)
+        if not waiting_on_us:
+            self._idle_since = None
+            return
+        now = time.time()
+        if self._idle_since is None:
+            self._idle_since = now
+            return
+        waited = now - self._idle_since
+        turn = self.live.game.state.num_turns if self.live.started else -1
+        if waited < seconds or self._idle_reported == turn:
+            return
+        self._idle_reported = turn
+        theirs = self.live.replay.current_color if self.live.replay else None
+        print(f"\n!! the server has been waiting {waited:.0f}s for our move and "
+              f"the agent has not made one.\n   At turn {turn} our reconstruction "
+              f"says it is {theirs}'s move.\n   Play it by hand in the browser; "
+              f"the agent picks up from whatever happens.\n", file=sys.stderr)
 
     def _break(self, exc: Exception) -> None:
         """Stop deciding; the caller keeps recording.
@@ -752,7 +874,8 @@ class DryRun:
         sent = f", {self.sent_moves} moves sent" if self.sender is not None else ""
         return (f"{self.decisions} decisions, {self.comparable} comparable to a move "
                 f"actually played, {rate} agreed on the action type, "
-                f"{self.live.repairs} repairs{sent}{broken}")
+                f"{self.live.repairs} repairs, "
+                f"{self.live.phantom_wins} impossible hands rejected{sent}{broken}")
 
 
 # --------------------------------------------------------------------------
