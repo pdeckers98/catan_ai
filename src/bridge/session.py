@@ -473,6 +473,8 @@ class DryRun:
         #: Frames held back until the server acknowledges the card they resolve.
         #: See :func:`~src.bridge.moves.split_after_card_play`.
         self._deferred: List[tuple] = []
+        #: Offers already answered, so a repeated diff does not answer twice.
+        self._declined: set = set()
 
     def arm(self, page_sender, delay: float = 0.0) -> None:
         """Let the agent play its decisions rather than only report them."""
@@ -507,6 +509,7 @@ class DryRun:
         for action in progress.observed:
             self._score(action)
         self._flush_deferred()
+        self._answer_offers()
         self._maybe_decide()
 
     def _score(self, observed: Action) -> None:
@@ -636,6 +639,28 @@ class DryRun:
             print(f"  -> sent action {code} {json.dumps(payload, default=str)} "
                   f"(seq {result.get('sequence')})")
         return True
+
+    def _answer_offers(self) -> None:
+        """Decline any trade the opponent has put to us.
+
+        The offer itself moves nothing, so the reconstruction ignores it -- but
+        the *game* does not: an unanswered offer holds the turn until it times
+        out, and a player who never answers one is conspicuous. Declining is
+        also the only honest answer, since the engine has no player-trade action
+        and the agent therefore cannot weigh the offer at all.
+
+        A real evaluation would mean modelling player trades end to end, in the
+        engine and in the action space. That is a Phase 2 question, not a bridge
+        one.
+        """
+        if self.sender is None:
+            return
+        for offer_id in self.live.decoder.offers_awaiting_us:
+            if offer_id in self._declined:
+                continue
+            self._declined.add(offer_id)
+            print(f"  declining trade offer {offer_id}")
+            self._send_frames([moves.decline_offer(offer_id)])
 
     def _flush_deferred(self) -> None:
         """Send a card's resolution, once the server says the card is down.

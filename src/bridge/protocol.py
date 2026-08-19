@@ -121,8 +121,12 @@ LOG_BANK_TRADE = 116
 # ending the way games often end is not reported as a decoding failure -- which
 # is what it did the first time it happened, after the position was already
 # finished.
+# 118 is a **player-to-player trade offer**, and it is ignored because an offer
+# moves nothing: the resources sit still until somebody accepts. A completed
+# player trade would be a different entry, has never been captured, and will
+# still raise -- which is what we want, since the engine has no action for one.
 LOG_IGNORED = frozenset({
-    2, 22, 26, 33, 36, 45, 47, 49, 60, 66, 68, 74, 112, 139,
+    2, 22, 26, 33, 36, 45, 47, 49, 60, 66, 68, 74, 112, 118, 139,
 })
 
 # ``currentState.actionState``: what the server is waiting for. Unlike a log
@@ -422,6 +426,10 @@ class _ActionDecoder:
         #: The server's ``currentState.actionState``, i.e. what it will accept
         #: next. Tracked for the write side; see AWAITING_CARD_SELECTION.
         self.action_state: int = ACTION_STATE_IDLE
+        #: Player-to-player trade offers still open, by id. Colonist keeps them
+        #: in ``tradeState.activeOffers`` and diffs them in place, so they are
+        #: merged rather than replaced.
+        self.open_offers: Dict[str, dict] = {}
         self.pending_dev_card: Optional[int] = None
         #: Our development hand as colonist last reported it. Kept in step with
         #: *every* diff rather than only with a purchase: playing a card removes
@@ -463,6 +471,7 @@ class _ActionDecoder:
         current = diff.get("currentState") or {}
         if "actionState" in current:
             self.action_state = current["actionState"]
+        self.absorb_trades(diff.get("tradeState"))
         entries = sorted((diff.get("gameLogState") or {}).items(), key=lambda kv: int(kv[0]))
         for _, entry in entries:
             self._entry((entry or {}).get("text") or {}, diff)
@@ -492,6 +501,26 @@ class _ActionDecoder:
                 .get(str(self.our_id)) or {}).get("developmentCards")
         if isinstance(hand, dict) and isinstance(hand.get("cards"), list):
             self.our_dev_cards = [c for c in hand["cards"] if c != DEV_HIDDEN]
+
+    def absorb_trades(self, trade_state) -> None:
+        """Track open trade offers, which colonist diffs in place.
+
+        A later diff carries only what changed -- an answered offer arrives as
+        ``{id: {playerResponses: {...}}}`` and a closed one as ``{id: None}`` --
+        so this merges, including one level down into the responses.
+        """
+        offers = (trade_state or {}).get("activeOffers")
+        if not isinstance(offers, dict):
+            return
+        for offer_id, offer in offers.items():
+            if offer is None:
+                self.open_offers.pop(offer_id, None)
+                continue
+            held = self.open_offers.setdefault(offer_id, {})
+            responses = dict(held.get("playerResponses") or {})
+            responses.update(offer.get("playerResponses") or {})
+            held.update(offer)
+            held["playerResponses"] = responses
 
     def absorb_ratios(self, player_states) -> None:
         """Merge ``bankTradeRatiosState`` out of a full state or a diff.
@@ -878,6 +907,20 @@ class MessageDecoder:
         """
         return (ACTION_STATE_IDLE if self._decoder is None
                 else self._decoder.action_state)
+
+    @property
+    def offers_awaiting_us(self) -> List[str]:
+        """Ids of trade offers the server is still waiting on us to answer.
+
+        ``playerResponses`` is keyed by colonist colour and starts at 0 for
+        everyone the offer was put to; the observed answer moved it to 2. So 0
+        means "not answered yet" and is the only value worth acting on.
+        """
+        if self._decoder is None or self.our_colonist_color is None:
+            return []
+        key = str(self.our_colonist_color)
+        return [offer_id for offer_id, offer in self._decoder.open_offers.items()
+                if (offer.get("playerResponses") or {}).get(key) == 0]
 
     @property
     def awaiting_card_selection(self) -> bool:

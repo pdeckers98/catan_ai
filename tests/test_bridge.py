@@ -1180,3 +1180,43 @@ def test_a_second_game_in_one_session_is_still_a_new_game():
     assert not decoder._is_resync(other_game)
     # same id and pieces on the board: the game we are already watching
     assert decoder._is_resync(resync_payload(same_game, {"1": 2}))
+
+
+def test_a_trade_offer_moves_nothing_and_is_not_a_decoding_failure():
+    """An offer is a question. The cards sit still until somebody answers it.
+
+    A *completed* player trade would be a different entry, has never been
+    captured, and still raises -- which is right, because the engine has no
+    action for one and a silent guess would be a hand we invented.
+    """
+    assert 118 in protocol.LOG_IGNORED
+
+
+def test_an_offer_put_to_us_is_tracked_until_it_is_answered():
+    """Colonist diffs offers in place, so they are merged rather than replaced."""
+    decoder = protocol.MessageDecoder()
+    decoder._decoder = make_decoder()
+    decoder.our_colonist_color = 1
+
+    decoder._decoder.feed({"tradeState": {"activeOffers": {"MQs4": {
+        "id": "MQs4", "creator": 2, "offeredResources": [5],
+        "wantedResources": [4], "playerResponses": {"1": 0}}}}})
+    assert decoder.offers_awaiting_us == ["MQs4"]
+
+    # answered: a partial diff carrying only the response
+    decoder._decoder.feed({"tradeState": {"activeOffers": {
+        "MQs4": {"playerResponses": {"1": 2}}}}})
+    assert decoder.offers_awaiting_us == []
+    assert decoder._decoder.open_offers["MQs4"]["wantedResources"] == [4]
+
+    # closed
+    decoder._decoder.feed({"tradeState": {"activeOffers": {"MQs4": None}}})
+    assert decoder._decoder.open_offers == {}
+
+
+def test_the_only_answer_to_an_offer_is_no():
+    """Accepting is a move the engine cannot represent, let alone evaluate."""
+    assert moves.decline_offer("MQs4") == (
+        moves.SEND_TRADE_RESPONSE,
+        {"id": "MQs4", "response": moves.TRADE_RESPONSE_DECLINE},
+    )

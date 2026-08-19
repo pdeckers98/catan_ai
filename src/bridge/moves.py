@@ -54,6 +54,15 @@ SEND_CITY = 19                # payload: corner id     -> log 5, built
 SEND_OPEN_PANEL = 47          # payload: true          no log of its own
 SEND_PLAY_DEV_CARD = 48       # payload: card enum     -> log 20, played
 SEND_TRADE = 49               # payload: trade object  -> log 116, bank trade
+SEND_TRADE_RESPONSE = 50      # payload: {id, response}   answer a player's offer
+
+#: Declining an offer. Observed: the page's own client sent ``response: 1``,
+#: the server moved ``playerResponses`` to 2, the offer closed and **no cards
+#: moved** -- which is what makes it a decline rather than an accept. Only this
+#: value is ever sent. The agent has no action for a player-to-player trade, so
+#: accepting one would be a move it cannot represent, let alone evaluate.
+TRADE_RESPONSE_DECLINE = 1
+
 
 #: Frames that are safe to send unprompted: they either succeed at a moment we
 #: chose or are refused, and neither outcome costs a position.
@@ -110,6 +119,18 @@ def _selection(cards: Sequence[int]) -> List[Frame]:
                            for i in range(len(cards))]
     frames.append((SEND_CONFIRM_CARDS, list(cards)))
     return frames
+
+
+def decline_offer(offer_id: str) -> Frame:
+    """Turn down a trade offer.
+
+    Not merely politeness. An unanswered offer holds the game in place until it
+    times out, and a player who never responds to anything is a conspicuous
+    thing to be. Declining is also the only honest answer available: the engine
+    has no player-trade action, so the agent cannot weigh one.
+    """
+    return (SEND_TRADE_RESPONSE, {"id": offer_id,
+                                  "response": TRADE_RESPONSE_DECLINE})
 
 
 def discard_frames(resources: Sequence[str]) -> List[Frame]:
