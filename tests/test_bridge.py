@@ -725,6 +725,18 @@ def test_the_codec_will_not_speak_before_it_has_listened():
         sender.FrameCodec().build(sender.SEND_ROLL, True)
 
 
+def test_the_karma_vote_is_read_as_the_chat_feature_it_is():
+    """36/26/33 broke a live game, and they are not about the board at all.
+
+    A player types `/disablekarma`, the server opens a vote, and these three
+    entries narrate it. They are ignored on the strength of that whole chain
+    being visible in the capture -- not because an unknown entry with no fields
+    looked harmless.
+    """
+    for entry_type in (26, 33, 36):
+        assert entry_type in protocol.LOG_IGNORED
+
+
 def test_the_lobby_is_not_mistaken_for_a_game_room():
     codec = sender.FrameCodec()
     codec.observe({"dir": "sent", "header": bytes(b"lobby").hex(),

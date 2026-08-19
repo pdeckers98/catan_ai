@@ -107,8 +107,15 @@ LOG_BANK_TRADE = 116
 # derives all of these itself, so they produce no action: resource payouts,
 # achievements being won (66) and changing hands (68), a blocked tile, the win,
 # and a player-count notice (139) that has nothing to do with the position.
+#
+# 26, 33 and 36 are the **karma vote**, and they are here because a capture
+# showed the whole causal chain rather than because they looked harmless: a
+# player types `/disablekarma` in chat (client action 0), the server opens a
+# vote (message 51), logs 36 "a vote was called" and -- once both players
+# accept -- 26 and 33 alongside `karmaPenaltyRemoved`. It is a lobby feature
+# conducted in chat; nothing about it reaches the board.
 LOG_IGNORED = frozenset({
-    2, 22, 45, 47, 49, 60, 66, 68, 74, 139,
+    2, 22, 26, 33, 36, 45, 47, 49, 60, 66, 68, 74, 139,
 })
 
 

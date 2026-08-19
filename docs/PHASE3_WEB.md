@@ -6,9 +6,11 @@ reconstruction, replay, the protocol translator, and a live session that follows
 time and says what the agent would play. **Rung 1 of the ladder below has now been run live** --
 one full 1v1 game watched end to end. It found one real translation bug (2:1 ports), which is
 fixed; the captured game now reconstructs all 88 turns and the agent answered 141 positions
-legally. The **action sender is now built** (`src/bridge/sender.py`): its encoder rebuilds all 188
-in-game client frames of that live game byte for byte, and it puts them on colonist's own socket
-from inside the page. What it has not done is send one. Opt-in.
+legally. **The action sender now works, and that was the last real unknown.** On 2026-08-19 a
+synthesized `end turn` frame was accepted by a live server: the frame went out at capture line 658
+and the server's turn marker came back at 662, followed by the opponent's roll. Colonist takes
+frames the page's own client never authored, so the sender is a msgpack write and the
+coordinate/click project this doc once scoped is not needed. Opt-in.
 
 > ⚠️ **ToS / bans:** Automating play on colonist.io likely violates its Terms of Service and can
 > get accounts banned. Use a **throwaway account**, run supervised, and never automate ranked play
@@ -233,20 +235,31 @@ hosting the authenticated session. Unproven until we send one.
    Prior art, no longer needed but worth keeping:
    [robottler](https://github.com/meesg/robottler),
    [this writeup](https://medium.com/@alberttheblacksheep/abusing-my-computer-science-knowledge-to-cheat-at-catan-a0f72fa30309).
-2. **Action sender** — 🚧 built, unproven. `src/bridge/sender.py`. The encoder is done and about as
-   verified as an encoder can be without a server: every in-game frame of the live capture rebuilds
-   byte for byte. The transport is JS injection — an init script wraps `window.WebSocket` before
-   colonist opens it, so a frame goes out on the page's own authenticated socket. That was chosen
-   over the two alternatives: Playwright clicks reintroduce the whole DOM/coordinate problem
-   component 3 was relieved to have avoided, and a second socket of our own would have to
-   re-authenticate, would look like a duplicate session, and is the version most likely to read as
-   a bot.
+2. **Action sender** — ✅ `src/bridge/sender.py`, and **proven against a live server on
+   2026-08-19**. The encoder rebuilds every in-game client frame of a real capture byte for byte;
+   the transport is JS injection, an init script wrapping `window.WebSocket` before colonist opens
+   it so the frame leaves on the page's own authenticated socket. That was chosen over Playwright
+   clicks (which reintroduce the DOM/coordinate problem component 3 was relieved to have avoided)
+   and over a second socket of our own (re-authenticates, looks like a duplicate session, and is
+   the version most likely to read as a bot).
 
-   **The remaining unknown is not the format, it is acceptance.** The server may require something
-   the click path attaches that we do not. So the first send is deliberately the smallest possible
-   question: `--allow-send` opens a console, the agent stays silent, and a human types one harmless
-   frame (`roll` or `end`) at a moment of their choosing. Until that has been answered, nothing here
-   claims to work, and the click layer stays the fallback rather than being written pre-emptively.
+   **What the live send settled.** A hand-triggered `end turn` on our own turn:
+
+   ```
+   line 658   SENT   action 6, sequence 21          <- ours; PageSender reported ok, 37 bytes
+   line 662   RECV   turn marker (log 44)           <- the server acted on it
+   line 663+  RECV   opponent rolled 6+2 and took resources
+   ```
+
+   So the click layer is not needed and stays unwritten. Two findings ride along:
+
+   - **The server does not enforce `sequence`.** Ours consumed 21; the client, which had no idea,
+     later sent its own `action 6, sequence 21` (line 824) and the server accepted that too (turn
+     marker at 842). The predicted collision is real and harmless, so there is no need to
+     shadow-correct the client's counter.
+   - **A synthesized frame is indistinguishable by construction**, which is a verification problem
+     as much as a feature: ours is identified in the capture by its timing and sequence, not its
+     bytes. `FrameCodec.sent` is the record of what we spent.
 3. **Coordinate translation** — ✅ solved, and it was never the pixel problem this doc feared.
    Colonist addresses corners and edges as `(hex, z)`; a hex owns its north and south corners and
    its three western edges. Laying both boards on one integer grid and matching positions gives the
@@ -338,20 +351,31 @@ hosting the authenticated session. Unproven until we send one.
    agreement with a human is a weak yardstick in the direction that flatters the agent — most
    positions offer one sensible move, and the disagreements cluster exactly where they should
    (whether to trade, whether to buy a dev card or end the turn).
-2. **Single supervised live game** on a throwaway account, human ready to intervene. 🚧 The sender
-   exists; its first question is one hand-typed frame:
+2. **Single supervised live game** on a throwaway account, human ready to intervene. 🚧 **The
+   channel is open** — one hand-triggered `end turn` was accepted live on 2026-08-19 (component 2
+   above). What remains is the agent's own action → catanatron-to-colonist translation, which was
+   deliberately not written until the channel was known to exist. Two things that game turned up
+   and that rung 2 has to handle first:
+
+   - **The karma vote.** Log entries 36/26/33 broke the session at turn 4. A player types
+     `/disablekarma` in chat, the server opens a vote (message 51), and those three narrate it.
+     Fixed — they are ignored, on the strength of the whole chain being visible in the capture.
+   - **A session is not a game.** The capture holds *two* full-state messages with empty boards,
+     i.e. two games on one session, and `LiveGame` rebuilds from move one on a full state without
+     regard for which game it belongs to. Everything after the second one desyncs. Unattended play
+     means many games per session, so this is rung 2 work, not rung 3.
+
+   The probe itself, for repeating it:
 
    ```bash
    python -m src.bridge.session --allow-send --vps-to-win 15 --longest-road --max-turns 1500        --simulations 50 --model checkpoints/archive/ppo-15vp-lr-step400000.zip        --placement-model checkpoints/placement/scorer_ppo.pt        --bundle-model    checkpoints/placement/bundle_noroads.pt
    ```
 
-   Join a 1v1, play normally, and on **your own turn** type `roll` (or `end`) instead of clicking.
-   Three outcomes worth telling apart, and the game log answers all three better than the console
-   does: the move happens (frames work, and the rest of rung 2 is translation); nothing happens
-   (silently dropped — probably `sequence`, or an origin check); or the server drops the
-   connection (it can tell, and the click layer is back on the table). What is *not* yet built, on
-   purpose, is the agent's own action → frame translation — there is no point writing it against a
-   channel that may not exist.
+   Join a 1v1, play normally, and on **your own turn** type `roll` or `end` instead of clicking —
+   or, when the session was started detached and stdin is not a keyboard,
+   `echo end >> data/bridge/send.txt`. Read the game log rather than the console: the console only
+   reports that the bytes left the page, and a synthesized frame is byte-identical to the client's
+   by design.
 3. Only then consider unattended runs.
 
 ## What is blocked on captured traffic

@@ -534,8 +534,33 @@ def _console_reader(queue: "Queue[str]") -> None:
     Playwright's sync API is not thread-safe, so this thread only *collects*;
     the browser loop drains the queue and does the sending itself.
     """
-    for line in sys.stdin:
-        queue.put(line.strip())
+    try:
+        for line in sys.stdin:
+            queue.put(line.strip())
+    except (OSError, ValueError):
+        pass  # no terminal attached; the file channel is the way in
+
+
+def _file_reader(path: Path, queue: "Queue[str]") -> None:
+    """Watch a file for commands, so the console survives having no terminal.
+
+    The live session is often started detached -- from a tool, or in the
+    background -- and then stdin is not the keyboard and typing `roll` is not
+    possible. Appending that line to a file is the same instruction given a
+    different way: still a human asking for one specific frame, which is the
+    property that matters here, not which fd it arrived on.
+    """
+    seen = 0
+    while True:
+        try:
+            if path.exists():
+                lines = path.read_text(encoding="utf-8").splitlines()
+                for line in lines[seen:]:
+                    queue.put(line.strip())
+                seen = len(lines)
+        except OSError:
+            pass  # being written to as we read; try again next tick
+        time.sleep(0.5)
 
 
 def _run_command(command: str, page_sender: "sender.PageSender") -> None:
@@ -561,7 +586,7 @@ def _run_command(command: str, page_sender: "sender.PageSender") -> None:
 
 
 def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
-             allow_send: bool = False) -> None:
+             allow_send: bool = False, send_file: Optional[Path] = None) -> None:
     """Attach to a browser you drive by hand and follow the game in real time.
 
     The same CDP plumbing :mod:`src.bridge.capture` uses, writing a capture in
@@ -575,10 +600,12 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
     :class:`~src.bridge.sender.FrameCodec` learns this room's routing header and
     sequence counter by watching the client use them.
 
-    ``allow_send`` adds a console on stdin and nothing else. **No move is ever
-    sent that you did not type**, because the open question at rung 2 is whether
-    the server accepts a synthesized frame at all, and the cheapest way to ask
-    is one harmless frame at a moment of your choosing.
+    ``allow_send`` adds a console and nothing else. **No move is ever sent that
+    you did not ask for**, because the open question at rung 2 is whether the
+    server accepts a synthesized frame at all, and the cheapest way to ask is
+    one harmless frame at a moment of your choosing. Commands arrive on stdin,
+    or -- when the session was started detached and stdin is not a keyboard --
+    by appending a line to ``send_file``.
     """
     from playwright.sync_api import sync_playwright
 
@@ -652,6 +679,12 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
         if page_sender is not None:
             threading.Thread(target=_console_reader, args=(commands,),
                              daemon=True).start()
+            if send_file is not None:
+                send_file.parent.mkdir(parents=True, exist_ok=True)
+                send_file.write_text("", encoding="utf-8")
+                threading.Thread(target=_file_reader, args=(send_file, commands),
+                                 daemon=True).start()
+                print(f"send channel: append a command to {send_file}")
             print(SEND_HELP)
         print("watching. play a game by hand; close the window when done.")
         try:
@@ -694,7 +727,10 @@ def main() -> int:
                         help="do not also write a capture of the live session")
     parser.add_argument("--allow-send", action="store_true",
                         help="open a console that can put frames on colonist's "
-                             "socket. Nothing is sent that you do not type.")
+                             "socket. Nothing is sent that you do not ask for.")
+    parser.add_argument("--send-file", type=Path,
+                        help="also read send commands from this file, one per "
+                             "line, for when stdin is not a keyboard")
     # Declared so --help lists them; they were already read at import time by
     # ruleset.apply_cli_overrides(), which has to run above the engine imports.
     parser.add_argument("--vps-to-win", type=int)
@@ -715,7 +751,8 @@ def main() -> int:
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
             record_to = CAPTURE_DIR / f"dryrun-{stamp}.jsonl"
             print(f"recording to {record_to}")
-        run_live(dry, args.url, args.channel, record_to, args.allow_send)
+        run_live(dry, args.url, args.channel, record_to, args.allow_send,
+                 args.send_file)
 
     print(dry.summary())
     return 1 if dry.broken is not None else 0
