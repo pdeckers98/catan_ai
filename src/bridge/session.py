@@ -421,6 +421,9 @@ class DryRun:
         self.sent_moves = 0
         self._sent_at: Optional[float] = None
         self._stalled = False
+        #: Frames held back until the server acknowledges the card they resolve.
+        #: See :func:`~src.bridge.moves.split_after_card_play`.
+        self._deferred: List[tuple] = []
 
     def arm(self, page_sender, delay: float = 0.0) -> None:
         """Let the agent play its decisions rather than only report them."""
@@ -454,6 +457,7 @@ class DryRun:
                   f"{progress.repaired}x at turn {self.live.game.state.num_turns}")
         for action in progress.observed:
             self._score(action)
+        self._flush_deferred()
         self._maybe_decide()
 
     def _score(self, observed: Action) -> None:
@@ -560,6 +564,18 @@ class DryRun:
             return
         if self.send_delay:
             time.sleep(self.send_delay)
+        lead, self._deferred = moves.split_after_card_play(frames)
+        if not self._send_frames(lead):
+            return
+        self.sent_moves += 1
+        self._sent_at = time.time()
+        self._stalled = False
+        self._record({"kind": "sent", "action": str(action),
+                      "frames": [code for code, _ in lead],
+                      "deferred": [code for code, _ in self._deferred]})
+
+    def _send_frames(self, frames) -> bool:
+        """Put frames on the wire in order. False if one could not go."""
         for code, payload in frames:
             try:
                 result = self.sender.send(code, payload)
@@ -567,14 +583,25 @@ class DryRun:
                 print(f"  !! could not send action {code}: {exc}", file=sys.stderr)
                 self._record({"kind": "send-failed", "action": code,
                               "detail": str(exc)})
-                return
+                return False
             print(f"  -> sent action {code} {json.dumps(payload, default=str)} "
                   f"(seq {result.get('sequence')})")
-        self.sent_moves += 1
-        self._sent_at = time.time()
-        self._stalled = False
-        self._record({"kind": "sent", "action": str(action),
-                      "frames": [code for code, _ in frames]})
+        return True
+
+    def _flush_deferred(self) -> None:
+        """Send a card's resolution, once the server says the card is down.
+
+        Colonist enters the state that asks "which resource?" only after it has
+        processed the card, and a choice that arrives first is discarded rather
+        than queued -- a live monopoly was lost exactly that way, the whole
+        ``48``/``8``/``7`` burst leaving before the server had acknowledged
+        anything. A human never trips it because clicking is slower than the
+        round trip.
+        """
+        if not self._deferred or self.live.decoder.awaiting_card_choice is None:
+            return
+        deferred, self._deferred = self._deferred, []
+        self._send_frames(deferred)
 
     def check_stall(self, seconds: float = 30.0) -> None:
         """Say so, once, when a sent move has gone unanswered.
@@ -752,9 +779,15 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
     codec = sender.FrameCodec()
     commands: "Queue[str]" = Queue()
 
+    started = time.time()
+
     def write(entry: dict) -> None:
         if handle is None:
             return
+        # Stamped like capture.py's, for a reason a live game supplied: the
+        # monopoly race could be *inferred* from frame order but never measured,
+        # because this writer was the one recording without a clock.
+        entry["t"] = round(time.time() - started, 3)
         handle.write(json.dumps(entry, default=str) + "\n")
         handle.flush()  # so the capture survives a crash and can be read mid-game
 

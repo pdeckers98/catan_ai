@@ -836,6 +836,18 @@ class MessageDecoder:
         return self._decoder is not None
 
     @property
+    def awaiting_card_choice(self) -> Optional[int]:
+        """The dev card the server has logged as played and not yet resolved.
+
+        Monopoly and year of plenty are two steps on colonist: the card goes
+        down, the server enters a state that asks which resource, and only then
+        does the choice mean anything. This is that gap, and the write side
+        waits on it -- a choice sent before the card is acknowledged is
+        discarded, not queued.
+        """
+        return None if self._decoder is None else self._decoder.pending_dev_card
+
+    @property
     def actions(self) -> List[Action]:
         """Every action decoded so far, oldest first. Live, so do not mutate it."""
         return self._decoder.actions if self._decoder is not None else []

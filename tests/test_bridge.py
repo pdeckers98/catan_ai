@@ -1063,3 +1063,41 @@ def test_road_building_places_its_roads_for_free():
 def test_a_resignation_is_not_a_decoding_failure():
     """It ends the game rather than changing it, and games end that way often."""
     assert 112 in protocol.LOG_IGNORED
+
+
+def test_a_card_s_resolution_waits_for_the_card_to_be_acknowledged():
+    """The live monopoly that was lost, as a unit test.
+
+    Colonist enters the "which resource?" state only after it has processed the
+    card, and a choice arriving before that is discarded rather than queued. We
+    sent ``48``/``8``/``7`` in one burst, faster than the round trip, and the
+    server logged the card and then waited for a choice it had thrown away. A
+    human never trips it because clicking is slower than the network.
+    """
+    coords = make_decoder().coords
+    action = Action(Color.RED, ActionType.PLAY_MONOPOLY, "ORE")
+
+    frames = moves.translate(action, coords, 1, "ActionPrompt.PLAY_TURN")
+    lead, deferred = moves.split_after_card_play(frames)
+
+    assert lead == [(moves.SEND_PLAY_DEV_CARD, protocol.DEV_MONOPOLY)]
+    assert deferred == [(moves.SEND_SELECT_CARDS, [5]),
+                        (moves.SEND_CONFIRM_CARDS, [5])]
+
+
+def test_an_ordinary_move_defers_nothing():
+    """Only a card with a choice attached has anything to wait for."""
+    coords = make_decoder().coords
+    roll = Action(Color.RED, ActionType.ROLL, None)
+    knight = Action(Color.RED, ActionType.PLAY_KNIGHT_CARD, None)
+
+    for action in (roll, knight):
+        frames = moves.translate(action, coords, 1, "ActionPrompt.PLAY_TURN")
+        lead, deferred = moves.split_after_card_play(frames)
+        assert (lead, deferred) == (frames, [])
+
+
+def test_the_gate_is_the_server_saying_the_card_is_down():
+    """`awaiting_card_choice` is the acknowledgement, not a delay."""
+    decoder = protocol.MessageDecoder()
+    assert decoder.awaiting_card_choice is None  # no game yet

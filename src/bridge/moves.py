@@ -207,6 +207,30 @@ def translate(action, coords, colonist_color: int,
     raise TranslationError(f"no colonist frame is known for {action}")
 
 
+def split_after_card_play(frames: List[Frame]):
+    """Split a translation into what can be sent now and what must wait.
+
+    Colonist resolves a monopoly or a year of plenty in a state it only enters
+    *after* it has processed the card, and a selection that arrives before then
+    is discarded rather than queued. The client never notices because a human
+    cannot click faster than the round trip; we can, and did -- a live monopoly
+    went out as ``48``/``8``/``7`` in one burst, the server logged the card and
+    then sat waiting for a choice that had already been thrown away.
+
+    So the follow-up frames are held until the server says the card is down.
+    A delay would usually work and would be a race we merely tend to win; the
+    acknowledgement is the actual precondition, so that is what is waited for.
+
+    Returns ``(lead, deferred)``. ``deferred`` is empty for everything else,
+    which is most moves -- a knight or road building needs no resolution here,
+    because what follows is its own decision and the engine prompts for it.
+    """
+    for index, (code, _) in enumerate(frames):
+        if code == SEND_PLAY_DEV_CARD:
+            return frames[:index + 1], frames[index + 1:]
+    return list(frames), []
+
+
 def _corner(coords, node_id: int) -> int:
     try:
         return coords.corner_by_node[node_id]
