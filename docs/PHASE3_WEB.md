@@ -106,7 +106,8 @@ protocol translator ──► BoardSpec + observed Actions ──► GameReplay 
     scored against a *human's* on the same position -- live, you would have to make the move to
     find out. On `game2` at 50 sims: 128 decisions, 74.2% agreeing with the move actually played.
   - **It checks the lobby instead of trusting it.** `victoryPointsToWin`, `cardDiscardLimit`,
-    `maxPlayers` and `friendlyRobber` ride on the full-state message, and a mismatch against
+    `maxPlayers`, `friendlyRobber`, `extensionSetting`, `scenarioSetting` and `mapSetting` ride
+    on the full-state message, and a mismatch against
     `src/env/rules.py` raises `LobbyMismatch` before a single action is replayed. Item 5 below
     asked for a human to eyeball this; there was no reason for that to be a human's job.
 
@@ -528,6 +529,26 @@ hosting the authenticated session. Unproven until we send one.
      288 entries, 0..299, not just the ones since we dropped — so the missed moves are right there
      to be replayed. What stops it today is that `GameReplay` is fed moves, not positions, and the
      log handlers read the diff their entry arrived in.
+
+   **The rest of the house rules were then audited against the same captures**, rather than
+   assumed to be fine because one of them turned out not to be:
+
+   | rule | evidence | verdict |
+   | --- | --- | --- |
+   | discard above 9 | `cardDiscardLimit: 9` on the wire; and one 7 where a player on 10 discarded 5 while their opponent on 9 discarded nothing | ✅ |
+   | discard is chosen, one card at a time | every observed discard is exactly `floor(n/2)` named cards (`cardEnums`) | ✅ |
+   | friendly robber | 68 legal-tile lists, decomposed by tile owner | ✅ **fixed** |
+   | Longest Road award | 5 awards, every one at road length exactly 5 | ✅ matches stock |
+   | Largest Army award | 6 awards, every one at exactly 3 knights played | ✅ matches stock |
+   | no dev card the turn it was bought | colonist tracks `developmentCardsBoughtThisTurn` per player and clears it at turn end — the same bookkeeping our patch does | ✅ |
+   | Road Building while broke | proven live | ✅ |
+   | 2 players, base map | `maxPlayers`, `extensionSetting`, `scenarioSetting`, `mapSetting` all now checked against the lobby | ✅ |
+
+   The one loose end is **`diceSetting: 1`**, which is undecoded. 607 captured rolls give
+   χ² = 4.1 on 10 df against a fair pair — *lower* than the ≈10 fair dice would average, which is
+   what a smoothed or "balanced" die would look like, but nowhere near significant at this sample
+   size. It cannot affect the bridge (live play replays the dice the server rolled); it would only
+   mean training saw a slightly different distribution than colonist deals.
 
    **Still unproven live:** the discard selection (`8`/`7`), which needs a 7 rolled against a hand
    over 9 cards, and whether an auto-declined trade offer really reads as a decline.

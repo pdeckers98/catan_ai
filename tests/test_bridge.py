@@ -1461,3 +1461,19 @@ def test_a_gap_and_a_drift_are_reported_differently():
     # Drift: we hold a road nobody else thinks is there.
     with pytest.raises(DesyncError, match="not the one we"):
         live._audit(payload({"8": {"owner": 1}}, {"4": {"owner": 1}}))
+
+
+def test_a_lobby_playing_a_scenario_is_refused():
+    """A scenario can leave the board alone and change the rules under it.
+
+    `board.py` catches a map that is not BASE, so the settings that matter here
+    are the ones that survive a normal-looking board.
+    """
+    live = LiveGame(vps_to_win=15)
+    live.decoder.settings = {"victoryPointsToWin": 15, "cardDiscardLimit": 9,
+                             "maxPlayers": 2, "friendlyRobber": True,
+                             "extensionSetting": 0, "mapSetting": 0,
+                             "scenarioSetting": 3}
+
+    with pytest.raises(LobbyMismatch, match="scenarioSetting"):
+        live._check_lobby()

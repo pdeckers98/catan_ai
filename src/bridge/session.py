@@ -405,6 +405,15 @@ class LiveGame:
             "cardDiscardLimit": DISCARD_LIMIT,
             "maxPlayers": 2,
             "friendlyRobber": True,
+            # Every observed 1v1 casual lobby sends 0 for all three, and a
+            # non-zero one is a game the agent has never seen: an expansion, a
+            # scenario, or a map that is not BASE. `board.py` would refuse a
+            # non-BASE map outright, but a scenario or an expansion can leave
+            # the board intact and change the rules underneath it, which is the
+            # kind of divergence that costs points without ever raising.
+            "extensionSetting": 0,
+            "scenarioSetting": 0,
+            "mapSetting": 0,
         }
         wrong = {key: (settings[key], want) for key, want in expected.items()
                  if key in settings and settings[key] != want}
