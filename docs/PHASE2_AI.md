@@ -349,6 +349,28 @@ which is why the whole dataset/train pipeline is kept.
   generation was neutral and is kept, because controlling a variable is right even when modelling it
   is not. Roads remain unsolved and worth solving, with a separate model conditioned on the chosen
   pair.
+- **Refitting the placement scorer under the 15 VP ruleset.** The most-suspected stale assumption
+  in the project, measured on 2026-08-19 and **refuted**. Regenerating the labels under 15 VP +
+  Longest Road (8000 pairs, rolled out with `ppo-15vp-lr-step400000`, 85.4% informative) does change
+  what the model reaches for, exactly as predicted: brick goes from 1.63 to 4.15 mean pips and
+  brickless openings from 57% to 22% of boards, paid for out of sheep. And the openings are worse.
+
+  | comparison, 1600 games each, seats alternating | score | 95% CI |
+  | --- | --- | --- |
+  | same pipeline refit on the **old** data vs the shipped models — the control | 49.9% | [47.5, 52.4] |
+  | **15 VP** models vs shipped, weighted-random both sides | 45.7% | [43.3, 48.2] |
+  | **15 VP** models vs shipped, `ppo-15vp-lr-step400000` both sides | 47.4% | [44.9, 49.9] |
+
+  The control is what makes this readable: retraining on the old file reproduces the shipped models
+  to within noise, so the pipeline is sound and the deficit belongs to the new labels. And it shows
+  up under weighted-random, which is fitted to neither opening, so it is not "our policy cannot use
+  brick" — the brick-rich openings are simply worse.
+
+  **What the same runs show instead:** in every configuration above, both agents build about **2.2
+  settlements** — the opening two, plus a fraction. Handing the policy a brick-rich opening did not
+  make it expand. The refusal to expand is a property of the policy, not of the board it is handed,
+  which is why placement was never the lever. `data/placement/samples_15vp.npz` is kept as evidence,
+  and `dataset.py` now stamps its ruleset into every file it writes.
 - **A Bradley-Terry ranking loss** on placement pairs: 45.3% over 400 games. Probable cause is the
   additive assumption `s(X) = s(n1) + s(n4)` — the first corner is featurised before the second
   exists. See `git show 5a3e2eb`.

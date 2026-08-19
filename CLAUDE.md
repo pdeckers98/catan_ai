@@ -296,20 +296,16 @@ Measured over 200 games each: 100.0% -> 88.2% vs weighted-random, and head-to-he
 than the older agent that at least learned placement badly. This applies to the Phase 3
 colonist.io bridge too: the scorer has to be part of the deployed agent, not an eval-time extra.
 
-**The placement specialist was fitted under the old rules, and 2026-08-19 measured what that
-costs.** Over 40 boards its openings average **1.55 brick pips and produce zero brick 60% of the
-time** (zero wood 35%; never zero wheat or ore) — a pure ore-wheat city-and-dev-card opening. That
-was right for the game it was fitted on (8 VP, no Longest Road, ~170 turns, `samples.npz` dated
-2026-08-12), where two cities plus dev cards wins and roads score nothing. At 15 VP it is fatal:
-buildings cap at 9 VP so expansion is compulsory, and expansion is brick.
+**The placement specialist was fitted under the old rules. Refitting it was tried on 2026-08-19
+and it is worse** — 45.7% over 1600 games with weighted-random on both sides, against a control
+where the same pipeline refit on the *old* data reproduces the shipped models at 49.9%. The refit
+does what it was meant to (brick 1.63 -> 4.15 mean pips, brickless openings 57% -> 22%); those
+openings just lose. See the dead-ends list in `PHASE2_AI.md`. **Keep `scorer_ppo.pt` and
+`bundle_noroads.pt`.**
 
-Two live colonist games confirm it end to end: opening with no brick, mean brick in hand **0.14**,
-`BUILD_SETTLEMENT` legal at **2 of ~310 decisions** (both of them the opening), roughly a third of
-total income spent buying brick at 4:1, and **zero settlements built in 45 turns**. Both lost.
-
-**Refitting is now the clearest open work, and it needs new data** — regenerate with
-`src.placement.dataset` under `CATAN_VPS_TO_WIN=15 CATAN_LONGEST_ROAD=1 CATAN_MAX_TURNS=1500`,
-rolling out with `ppo-15vp-lr-step400000.zip`; retraining on the existing `samples.npz` changes
-nothing, because the labels are the problem. Note the policy trained *through* these same models,
-so it has only ever played ore-wheat openings and may need a run of its own afterwards. The
-rank/rho diagnostic is gone, so validate with 800+ benchmark games, not with the loss.
+**What that ruled in:** across every one of those benchmarks, both sides build about **2.2
+settlements** — the opening two and a fraction — whatever opening they are handed. Two live
+colonist games lost the same way, with `BUILD_SETTLEMENT` legal at 2 of ~310 decisions. Giving the
+policy brick did not make it expand, so **the refusal to expand is the policy's**, and the policy
+is the thing to change. `dataset.py` now stamps its ruleset into every file it writes, so this
+class of doubt is answerable from the file rather than from memory.

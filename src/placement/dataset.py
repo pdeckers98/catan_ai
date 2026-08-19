@@ -51,10 +51,19 @@ the flattened per-settlement view, kept for the per-corner scorer.
 
 import argparse
 import contextlib
+import json
 import os
 import random
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+
+# Before any engine import: src.env.rules decides at import time whether Longest
+# Road pays its VP, so the ruleset has to be selected first. See src/env/ruleset.py.
+# This file went without it for a while and that is exactly what went wrong -- the
+# labels shipped in `samples.npz` were 8 VP labels, and nothing on disk said so.
+from src.env.ruleset import apply_cli_overrides
+
+apply_cli_overrides()
 
 import numpy as np
 
@@ -63,6 +72,7 @@ from catanatron.models.enums import ActionType
 from catanatron.models.player import Player, RandomPlayer
 from catanatron.players.weighted_random import WeightedRandomPlayer
 
+from src.env import ruleset
 from src.env.catan_env import MAX_TURNS, make_1v1_game
 from src.env.dice import fixed_dice
 from src.placement.features import (
@@ -467,7 +477,30 @@ def main():
                         help="leave the dice on the global RNG instead of giving "
                              "each pair a shared roll sequence")
     parser.add_argument("--out", default="data/placement/samples.npz")
+    # Declared so --help and validation behave; the values were already read off
+    # sys.argv by apply_cli_overrides, above the engine imports.
+    parser.add_argument("--vps-to-win", type=int, default=ruleset.VPS_TO_WIN,
+                        help="Victory points to win. Labels only mean anything "
+                             "under the rules that produced them.")
+    parser.add_argument("--longest-road", action=argparse.BooleanOptionalAction,
+                        default=ruleset.LONGEST_ROAD_VP,
+                        help="Award Longest Road its +2 VP.")
+    parser.add_argument("--max-turns", type=int, default=ruleset.MAX_TURNS,
+                        help="Turn cap before a game is scored as a draw.")
     args = parser.parse_args()
+
+    if (args.vps_to_win, args.longest_road, args.max_turns) != (
+            ruleset.VPS_TO_WIN, ruleset.LONGEST_ROAD_VP, ruleset.MAX_TURNS):
+        raise SystemExit(
+            f"argparse says {args.vps_to_win} VP / longest-road "
+            f"{args.longest_road} / cap {args.max_turns}, but the engine "
+            f"imported under {ruleset.describe()}. Generating labels under the "
+            "wrong rules is the failure this whole refit exists to undo."
+        )
+
+    # The ruleset is already installed (apply_cli_overrides ran above the engine
+    # imports); this only reports it, so a run cannot be misread afterwards.
+    print(f"ruleset: {ruleset.describe()}")
 
     pairs, deltas, bundles = generate(
         args.pairs, seed=args.seed, rollout_kind=args.rollout,
@@ -479,8 +512,15 @@ def main():
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    # Stamp the ruleset into the file. Labels are only meaningful under the rules
+    # that produced them -- an 8 VP opening and a 15 VP opening are different
+    # questions -- and a dataset that does not say which it answers is one
+    # refactor away from being trained on by mistake. That is not hypothetical:
+    # it is what `samples.npz` did for a week.
     np.savez_compressed(out, pairs=pairs, deltas=deltas, bundles=bundles,
-                        features=features, labels=labels)
+                        features=features, labels=labels,
+                        ruleset=np.array(json.dumps(ruleset.as_config())),
+                        rollout=np.array(args.rollout_model or args.rollout))
 
     informative = int(np.count_nonzero(deltas))
     print(f"{len(pairs)} pairs ({len(labels)} corners) -> {out}")
