@@ -22,15 +22,16 @@ Eight things happen here:
    transition now, the buggy upstream re-check (``state.py:489`` hardcoded ``> 7``)
    never runs; we sequence discarders off ``state.discard_limit``.
 
-4. **Colonist.io 1v1 robber restrictions.** Two constraints on MOVE_ROBBER:
-   - You may only place the robber on a tile that has an opponent building if the
-     opponent has placed ≥3 settlements on the board OR built ≥1 city. This prevents
-     camping the robber immediately after the initial setup.
-   - You may only place the robber on a tile where YOU have a building if you
-     yourself have >2 settlements on the board OR ≥1 city. Once you have expanded
-     beyond the initial 2 settlements, self-robbing is a legal strategic choice.
-   If all tiles are excluded by both rules (degenerate edge case), the filter is
-   lifted so the engine always has at least one legal action.
+4. **Colonist.io's "friendly robber".** A player on ≤2 *visible* victory points
+   cannot be robbed — by anyone, themselves included — so every tile carrying
+   one of their buildings is off limits for MOVE_ROBBER. Visible means
+   settlements, cities, Largest Army and Longest Road, never the hidden VP
+   cards. If that would exclude every tile the filter is lifted, so the engine
+   always has a legal action.
+
+   This was a settlement-count proxy until 2026-08-19. The proxy reproduced all
+   68 legal-tile lists colonist ever sent us and was still wrong — see the patch
+   for how the ninth live game found the difference.
 
 5. **Longest Road awards no victory points -- optionally.** Stock Catanatron
    grants +2 VP to the holder of the longest road. In a short 8-VP 1v1 game that
@@ -79,12 +80,17 @@ import catanatron_gym.envs.catanatron_env as _gym_env
 from catanatron.models.enums import Action, ActionType, ActionPrompt, RESOURCES
 from catanatron.models.decks import freqdeck_add
 from catanatron.state_functions import (
-    player_key, player_num_resource_cards, player_deck_subtract,
+    get_visible_victory_points, player_key, player_num_resource_cards,
+    player_deck_subtract,
 )
 
 from src.env.ruleset import LONGEST_ROAD_VP
 
 DISCARD_LIMIT = 9
+
+#: Colonist's "friendly robber" threshold: a player on this many visible victory
+#: points or fewer cannot be robbed, by anyone, including themselves.
+FRIENDLY_ROBBER_VP = 2
 
 _PATCH_FLAG = "_catan_rules_patched"
 
@@ -262,44 +268,53 @@ def _largest_stack(state, color):
 # Colonist.io 1v1 robber placement restrictions
 # --------------------------------------------------------------------------
 def _patch_robber_placement() -> None:
-    """Filter MOVE_ROBBER actions to enforce Colonist.io 1v1 robber rules."""
+    """Colonist's "friendly robber": nobody on ≤2 visible VP may be hit.
+
+    One rule, not two. The protection belongs to the *player*, not to whoever
+    is moving, so it covers your own tiles exactly as it covers your
+    opponent's — a player on 2 points is simply off the board for the robber.
+    Visible means settlements, cities, Largest Army and Longest Road; the
+    victory-point cards are hidden, and a rule keyed on them would leak the one
+    thing colonist keeps secret.
+
+    Read off ``type 33``: whenever it is our turn to move the robber the server
+    sends the tiles it will accept. 68 such lists across the local captures, and
+    what they show is that the exclusions track each player's visible points and
+    nothing else — an opponent stops being protected on reaching 3, and so do
+    you.
+
+    **The clause this replaced was a proxy for that**: "fewer than 3 settlements
+    and no city". It reproduces every one of the 68 lists, because the two agree
+    right up until somebody's third point comes from an award instead of a
+    building. That never happened in a list the server sent *us* — and the
+    server only ever states the legal set for the player it is asking, so eight
+    games of perfect agreement said nothing about the opponent's half of the
+    rule. The ninth ended on it: the opponent robbed a settlement of ours that
+    our rule called untouchable, because we held Largest Army on two
+    settlements.
+
+    One known offset, and it is ours rather than a rule: colonist sends the
+    tile list *before* the diff that awards Largest Army, so for that one
+    message our set is a move ahead of theirs. It costs nothing, since a
+    decision is only ever made after the diff lands.
+    """
     orig_robber = _actions_mod.robber_possibilities
 
     def patched_robber(state, color):
         actions = orig_robber(state, color)
 
-        # Identify the single opponent (1v1 only).
-        opponent = next(c for c in state.colors if c != color)
+        protected = {c for c in state.colors
+                     if get_visible_victory_points(state, c) <= FRIENDLY_ROBBER_VP}
+        if not protected:
+            return actions
 
-        my_key = player_key(state, color)
-        opp_key = player_key(state, opponent)
-
-        # Settlements on the board = pieces placed out (cities return the piece).
-        my_settlements = 5 - state.player_state[f"{my_key}_SETTLEMENTS_AVAILABLE"]
-        my_cities = 4 - state.player_state[f"{my_key}_CITIES_AVAILABLE"]
-        opp_settlements = 5 - state.player_state[f"{opp_key}_SETTLEMENTS_AVAILABLE"]
-        opp_cities = 4 - state.player_state[f"{opp_key}_CITIES_AVAILABLE"]
-
-        # Self-robbing is only legal once you've expanded beyond initial setup.
-        self_rob_allowed = my_settlements > 2 or my_cities >= 1
-        opp_can_be_robbed = opp_settlements >= 3 or opp_cities >= 1
-
-        # Build a set of tile coordinates that are off-limits.
         excluded = set()
         for coord, tile in state.board.map.land_tiles.items():
-            has_own = False
-            has_opp = False
             for node_id in tile.nodes.values():
                 building = state.board.buildings.get(node_id)
-                if building is not None:
-                    if building[0] == color:
-                        has_own = True
-                    else:
-                        has_opp = True
-            if has_own and not self_rob_allowed:
-                excluded.add(coord)
-            elif has_opp and not opp_can_be_robbed:
-                excluded.add(coord)
+                if building is not None and building[0] in protected:
+                    excluded.add(coord)
+                    break
 
         filtered = [a for a in actions if a.value[0] not in excluded]
         # Fallback: never leave the engine with zero legal robber moves.

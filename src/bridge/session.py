@@ -356,13 +356,34 @@ class LiveGame:
         ours_nodes = {node: colour for node, (colour, _) in board.buildings.items()}
         ours_edges = {tuple(sorted(edge)): colour for edge, colour in board.roads.items()}
 
-        if ours_nodes != theirs_nodes or ours_edges != theirs_edges:
+        if ours_nodes == theirs_nodes and ours_edges == theirs_edges:
+            return
+
+        # A gap and a drift are different failures and deserve different words.
+        # If everything we have they also have, we did not get anything wrong --
+        # we simply were not listening, which is what a dropped socket looks
+        # like from here. Saying "the position is not the one we reconstructed"
+        # about a game we missed 50 seconds of sends the reader hunting for a
+        # decoding bug that is not there.
+        behind = (all(theirs_nodes.get(n) == c for n, c in ours_nodes.items())
+                  and all(theirs_edges.get(e) == c for e, c in ours_edges.items()))
+        missed = ((len(theirs_nodes) - len(ours_nodes))
+                  + (len(theirs_edges) - len(ours_edges)))
+        if behind:
             raise DesyncError(
-                "the server re-sent the position and it is not the one we "
-                f"reconstructed: {len(ours_nodes)} buildings and "
-                f"{len(ours_edges)} roads here against "
-                f"{len(theirs_nodes)} and {len(theirs_edges)} there"
+                f"we missed {missed} pieces going down -- the server's position "
+                "contains everything ours does and more, so this is traffic we "
+                "never received rather than anything decoded wrong. The replay "
+                "cannot be resumed from a board (the engine wants the moves), "
+                "so finish this game by hand. The whole game log rides on the "
+                "resync, so recovering from one is possible and not yet built."
             )
+        raise DesyncError(
+            "the server re-sent the position and it is not the one we "
+            f"reconstructed: {len(ours_nodes)} buildings and "
+            f"{len(ours_edges)} roads here against "
+            f"{len(theirs_nodes)} and {len(theirs_edges)} there"
+        )
 
     def _rebuild(self) -> None:
         self.rebuilds += 1

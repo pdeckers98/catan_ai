@@ -273,6 +273,61 @@ def test_robber_cannot_camp_opponent_before_third_settlement():
         assert not (set(tile.nodes.values()) & opponent_nodes)
 
 
+def test_the_third_point_lifts_the_protection_however_it_was_earned():
+    """Points, not buildings — the distinction that cost a live game.
+
+    An opponent still on their two opening settlements is protected right up
+    until something gives them a third *visible* point, and Largest Army does
+    that as surely as a settlement would. Reading the rule as a settlement count
+    agrees everywhere colonist ever showed us its legal tiles and is still
+    wrong: it protects a player colonist would let you rob.
+    """
+    from catanatron.models.actions import robber_possibilities
+    from catanatron.state_functions import player_key
+
+    game = make_1v1_game(seed=9)
+    state = game.state
+    while state.is_initial_build_phase:
+        game.execute(state.playable_actions[0], validate_action=False)
+
+    color = state.current_color()
+    opponent = next(c for c in state.colors if c != color)
+    opponent_nodes = {node for node, building in state.board.buildings.items()
+                      if building[0] == opponent}
+
+    # Largest Army, on the same two settlements they started with.
+    state.player_state[f"{player_key(state, opponent)}_VICTORY_POINTS"] = 4
+
+    reachable = [a for a in robber_possibilities(state, color)
+                 if set(state.board.map.land_tiles[a.value[0]].nodes.values())
+                 & opponent_nodes]
+    assert reachable, "a four-point opponent is not protected"
+
+
+def test_your_own_tiles_are_protected_on_the_same_terms():
+    """The protection is the player's, not the mover's, so it covers you too."""
+    from catanatron.models.actions import robber_possibilities
+    from catanatron.state_functions import player_key
+
+    game = make_1v1_game(seed=9)
+    state = game.state
+    while state.is_initial_build_phase:
+        game.execute(state.playable_actions[0], validate_action=False)
+
+    color = state.current_color()
+    own_nodes = {node for node, building in state.board.buildings.items()
+                 if building[0] == color}
+
+    def can_reach_own():
+        return [a for a in robber_possibilities(state, color)
+                if set(state.board.map.land_tiles[a.value[0]].nodes.values())
+                & own_nodes]
+
+    assert not can_reach_own()  # two points, so off limits even to ourselves
+    state.player_state[f"{player_key(state, color)}_VICTORY_POINTS"] = 3
+    assert can_reach_own()
+
+
 def test_observation_and_mask_shapes_agree():
     from src.agent.encoding import (
         encode_observation, legal_action_mask, obs_size,

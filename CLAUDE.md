@@ -45,7 +45,10 @@ the agent and, later, the web integration.
   2. per-resource, one-card-at-a-time discard the policy actually chooses
      (expands the action space 290 → **294**)
   3. correct multi-discarder sequencing (fixes an upstream `> 7` hardcode)
-  4. Colonist.io 1v1 robber placement restrictions
+  4. Colonist.io **friendly robber**: a player on ≤2 *visible* VP cannot be robbed,
+     by anyone including themselves. Was a settlement count until 2026-08-19 and
+     **every archived checkpoint trained under the wrong version**; it differs only
+     when a third point comes from an award rather than a building
   5. **Longest Road awards no VP** by default (length still tracked, `HAS_ROAD` never
      set); `--longest-road` restores stock scoring
   6. a dev card **cannot be played the turn it was bought** (one-per-turn is already

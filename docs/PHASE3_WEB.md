@@ -12,12 +12,14 @@ and the server's turn marker came back at 662, followed by the opponent's roll. 
 frames the page's own client never authored, so the sender is a msgpack write and the
 coordinate/click project this doc once scoped is not needed.
 
-**Rung 2 has now been run twice: the agent plays its own games.** `--auto-play` arms the live
-session, and on 2026-08-19 it played two 1v1 casual matchmaking games start to finish, opening
-placement included, with no human input after the game began. 59 moves sent in the first, 0
-determinization repairs in either. Both ended on a bug rather than a result, and **both bugs were
-found by playing, not by testing** — the offline round-trip agreed with three captured games and
-still missed them. See rung 2 below. Opt-in.
+**Rung 2 has now been run ten times: the agent plays its own games.** `--auto-play` arms the live
+session, and on 2026-08-19 it played ten 1v1 casual matchmaking games start to finish, opening
+placement included, with no human input after the game began. **Every bug was found by playing,
+not by testing** — the offline round-trip regenerates a captured game's client frames exactly and
+missed all of them. They fall into four categories (mistranslation, timing and identity,
+narration, and a guess that ended a game), plus one that was not in the bridge at all: our
+**friendly-robber rule was wrong**, and had been through every game and every training run. See
+rung 2 below. Opt-in.
 
 > ⚠️ **ToS / bans:** Automating play on colonist.io likely violates its Terms of Service and can
 > get accounts banned. Use a **throwaway account**, run supervised, and never automate ranked play
@@ -395,7 +397,7 @@ hosting the authenticated session. Unproven until we send one.
    positions offer one sensible move, and the disagreements cluster exactly where they should
    (whether to trade, whether to buy a dev card or end the turn).
 2. **Single supervised live game** on a throwaway account, human ready to intervene. 🚧 **Run
-   nine times on 2026-08-19, all through 1v1 casual matchmaking with no human input after the
+   ten times on 2026-08-19, all through 1v1 casual matchmaking with no human input after the
    game started.** Add `--auto-play` to the live command. The opening is the agent's too — the
    placement specialist places it, and the free-placement codes (`15`/`11`) are visibly different
    from the paid ones in the log.
@@ -496,6 +498,36 @@ hosting the authenticated session. Unproven until we send one.
      then genuinely revealed at move 70 — dying inside catanatron's `draw_from_listdeck` with an
      error that says nothing about what went wrong. Three seeds in forty on `game2`, and
      pre-existing. Reveals now have first claim on the deck.
+
+   *A house rule that was wrong* — the tenth game, and the first failure in `src/env/rules.py`
+   rather than in the bridge.
+
+   - **Friendly robber is about points, not buildings.** The opponent robbed a settlement of ours
+     that our rule called untouchable, the replay refused the move, and the agent stopped. Our
+     rule read "an opponent with fewer than 3 settlements and no city cannot be robbed"; colonist's
+     is "a player on ≤2 **visible** victory points cannot be robbed", and we held Largest Army on
+     two settlements. The protection is the player's own and covers their tiles against everyone,
+     themselves included — there is no separate self-robbing clause.
+
+     What makes this worth writing down is why eight games missed it. **Colonist states the legal
+     robber tiles outright** (`type 33`, 68 of them across the local captures), and the old rule
+     reproduces every single one — because the server only ever states the set for the player it
+     is *asking*, which is always us. The opponent's half of the same rule was never on the wire.
+     A perfect score against an oracle that only tests half the rule is not evidence about the
+     other half.
+
+     One known offset remains, and it is ours: colonist sends the tile list *before* the diff that
+     awards Largest Army, so for that one message our set is a move ahead. It costs nothing — a
+     decision is only made after the diff lands.
+   - **A gap is not a drift.** The same game then lost its socket for 56 seconds. The resync audit
+     caught it, correctly, but reported it as a position "not the one we reconstructed", which
+     reads like a decoding bug. It now checks whether the server's position *contains* ours: if
+     everything we have they have and more, we simply were not listening, and it says so.
+
+     **Recovering from that is possible and not built.** A resync carries the entire game log —
+     288 entries, 0..299, not just the ones since we dropped — so the missed moves are right there
+     to be replayed. What stops it today is that `GameReplay` is fed moves, not positions, and the
+     log handlers read the diff their entry arrived in.
 
    **Still unproven live:** the discard selection (`8`/`7`), which needs a 7 rolled against a hand
    over 9 cards, and whether an auto-declined trade offer really reads as a decline.

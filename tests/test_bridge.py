@@ -1432,3 +1432,32 @@ def test_a_guess_cannot_spend_a_card_a_later_reveal_needs():
     assert all(card is not None for card in cards)
     assert cards.count("VICTORY_POINT") <= 5   # the deck holds five, not six
     assert cards[-1] == "VICTORY_POINT"        # and the revealed one is still it
+
+
+def test_a_gap_and_a_drift_are_reported_differently():
+    """A dropped socket is not a decoding bug and should not read like one.
+
+    If the server's position contains everything ours does and more, we were
+    not wrong, we were not listening. Naming that sends the reader to the
+    network rather than into the decoder.
+    """
+    live = LiveGame(vps_to_win=15, check_lobby=False)
+    live.replay = types.SimpleNamespace(
+        state=types.SimpleNamespace(board=types.SimpleNamespace(
+            buildings={0: (Color.RED, "SETTLEMENT")}, roads={(0, 1): Color.RED})))
+    live.decoder.coords = types.SimpleNamespace(
+        node_by_corner={7: 0, 8: 2}, edge_by_edge={3: (0, 1), 4: (2, 3)})
+    live.decoder.color_by_colonist = {1: Color.RED}
+
+    def payload(corners, edges):
+        return {"gameState": {"mapState": {
+            "tileCornerStates": corners, "tileEdgeStates": edges}}}
+
+    # Behind: they have our two pieces and one more road.
+    with pytest.raises(DesyncError, match="never received"):
+        live._audit(payload({"7": {"owner": 1}},
+                            {"3": {"owner": 1}, "4": {"owner": 1}}))
+
+    # Drift: we hold a road nobody else thinks is there.
+    with pytest.raises(DesyncError, match="not the one we"):
+        live._audit(payload({"8": {"owner": 1}}, {"4": {"owner": 1}}))
