@@ -583,9 +583,33 @@ hosting the authenticated session. Unproven until we send one.
    agent, and invisible in every benchmark to date because those are mirror matches — both sides
    sit still, so sitting still costs nothing. A human who expands wins on tempo.
 
-   This is now the most interesting open question in the project, and it is an *agent* question
-   rather than a bridge one. The bridge did its job: it produced the first honest measurement of
-   the agent against an opponent that does not share its habits.
+   **The twelfth game repeated it almost exactly** — 96 turns, clean again, lost 7–15, and again
+   zero settlements built.
+
+   **And the cause is not the policy declining to expand.** Across ~310 decisions in the two
+   completed games, `BUILD_SETTLEMENT` was legal exactly **twice** — the two opening placements —
+   and the agent took it both times. Splitting why it was never legal again:
+
+   | | game 11 | game 12 |
+   | --- | --- | --- |
+   | decisions after the opening | 157 | 146 |
+   | had a legal node to settle on | 49 (31%) | 93 (64%) |
+   | could afford a settlement | **1** | **2** |
+   | both at once | 0 | 0 |
+   | mean brick in hand | **0.14** | **0.14** |
+
+   There was somewhere to build. There was never the brick to build it. Both openings produced
+   **zero brick**, and the agent spent most of its 4:1 trades buying brick back — 5 and 8 of them,
+   at four cards each, roughly a third of its entire income.
+
+   Offline, over 40 boards, the shipped placement models pick openings averaging **1.55 brick pips
+   and producing no brick at all 60% of the time** (no wood 35%; never zero wheat or ore). They
+   have learned a pure ore-wheat opening — correct for the 8 VP no-Longest-Road game their labels
+   came from, fatal at 15 VP where buildings cap at 9 and expansion is compulsory.
+
+   So the bridge did its job: it produced the first honest measurement of the agent against an
+   opponent that does not share its habits, and the answer points at
+   `checkpoints/placement/`, not at `src/bridge/`.
 
    **Still unproven live:** whether an auto-declined trade offer really reads as a decline. No
    opponent has made one since the handler was written.
