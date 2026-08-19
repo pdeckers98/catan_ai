@@ -70,10 +70,30 @@ the agent and, later, the web integration.
   removed, so **games are now the only check on a refit** — budget 800+ of them.
   Opening *roads* are deliberately unmodelled: a bundle over (settlement, road) × 2 scored 44.1%
   over 1200 games and was cut. The road replay in data generation stays; it is a correct control.
-- **Reward shaping**: none, and the machinery is gone rather than merely
-  switched off. `EpisodeStatsWrapper` keeps the end-of-episode telemetry the old
-  `RewardShapingWrapper` also carried (VPs, settlements, cities, roads) without touching
-  the reward.
+- **Reward shaping**: off by default — every archived checkpoint trained on the bare
+  win/loss outcome. The old `RewardShapingWrapper` (one-time bonuses for crossing VP
+  milestones) is gone for good; `EpisodeStatsWrapper` keeps its telemetry without touching
+  the reward. What exists now is a different object: `--shaping-weight` installs
+  `PotentialShapingWrapper`, `F = γΦ(s′) − Φ(s)` with `Φ = w·(my actual VP − their visible
+  VP)`. That form telescopes to `−Φ(s₀)`, so it **cannot move the optimal policy** — verified
+  on real games, four policies on one board seed all add exactly the same constant. Milestone
+  bonuses did not telescope, which is the whole difference. **Untested in a run.**
+- **The agent burns its hand.** Measured 2026-08-19 over 30 self-play games at 15 VP
+  (`python -m src.eval.waste`): it trades on **36%** of its turns, **68%** of those while it
+  could already afford something, **42%** give away a resource it acquired the same turn, and
+  **136 cards a game** go to the bank. `VictoryPointPlayer` does those at 20/40/24% and 126.
+  It also buys a development card while one card short of a city 32% of the time (the bot: 17%).
+  **A win rate cannot see any of this** — both sides of a mirror burn cards, so burning them
+  scores 50%. Same blindness that hid the refusal to expand. Why training allows it: at 15 VP
+  one bit of terminal reward is spread over ~600 decisions, so three cards thrown away move the
+  return by far less than the noise in the advantage estimate. **The wasteful trade is free in
+  the loss.** That is what `--shaping-weight` is aimed at: it does not punish the trade, it pays
+  for the city immediately so building wins the local comparison.
+- **There is no bot above `VictoryPointPlayer`.** This build of catanatron ships only
+  `RandomPlayer`, `WeightedRandomPlayer` and `VictoryPointPlayer`; `arena.py`'s `value` spec
+  *is* `VictoryPointPlayer`, which the pool already runs as its `greedy` slice. So "train
+  against a harder opponent" has exactly one available meaning: a pool checkpoint with search
+  on it (`--pool-search-frac`, off by default, costs rollout throughput).
 - **Action masking**: mandatory — most of the 294 actions are illegal each turn; always respect
   `info["valid_actions"]` / `env.unwrapped.get_valid_actions()`, or
   `src/agent/encoding.py:legal_action_mask` off a raw `Game`.
@@ -112,6 +132,7 @@ src/
 │   └── player.py        # wraps any agent; takes over only the opening
 ├── eval/
 │   ├── benchmark.py     # any agent vs any agent
+│   ├── waste.py         # what a turn actually buys; the mirror-match blind spot
 │   └── play.py          # human vs AI (matplotlib)
 └── bridge/              # (Phase 3) colonist.io bridge, one Playwright session for read+click
     ├── capture.py       # hand-driven browser; records WS frames + --summarize

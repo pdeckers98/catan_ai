@@ -284,6 +284,77 @@ what the agent does when its plan stalls.
 Self-play stat trap: `p0_settlements` *falls* as the agent improves, because building a city returns
 the settlement piece. Track `settlements + cities`. (Per player: 15 roads, 5 settlements, 4 cities.)
 
+Note that `value` here is **`VictoryPointPlayer`** — this build of catanatron ships only
+`RandomPlayer`, `WeightedRandomPlayer` and `VictoryPointPlayer`, and the pool already runs that
+same bot as its `greedy` slice. There is no stronger scripted opponent to reach for.
+
+### `src/eval/waste.py` — what a turn actually buys
+
+A decision-level audit, and the answer to a question the arena's waste line cannot reach: the
+arena counts what was bought, this counts what was *thrown away*. Measured 2026-08-19,
+`ppo-15vp-lr-step400000` over 30 self-play games at 15 VP:
+
+| | our agent | `VictoryPointPlayer` | weighted-random |
+| --- | --- | --- | --- |
+| turns containing a maritime trade | **36%** | 20% | 19% |
+| trades made while something was already affordable | **68%** | 40% | 30% |
+| trades giving away a resource acquired the same turn | **42%** | 24% | 21% |
+| cards paid to the bank per game | **136** | 126 | 116 |
+| dev cards bought while one card short of a city | **32%** | 17% | — |
+
+It trades constantly, mostly while it can already build, and undoes itself in a single turn
+nearly half the time. It never buys a development card while `BUILD_CITY` is *legal* — it buys
+one when it is a single card away, spending the wheat and ore the city was waiting on.
+
+**Why no benchmark caught it.** Both sides of a mirror burn cards, so burning them costs nothing
+relative to the opponent and the match scores 50%. Exactly the blindness that hid the refusal to
+expand — the pathology has to be *counted*, not scored.
+
+**Why training allows it.** The terminal win/loss is one bit spread over ~600 of the agent's own
+decisions at 15 VP with `--gamma 0.999`. Three cards handed to the bank move the return by far
+less than the noise in the advantage estimate, so the wasteful trade is **free in the loss**;
+nothing pushes it down and the entropy bonus keeps probability mass on it. Self-play compounds it,
+because the opponent is wasting too.
+
+Run it on any agent spec `benchmark` accepts:
+
+```bash
+python -m src.eval.waste --vps-to-win 15 --longest-road --max-turns 1500     --agent ppo --model checkpoints/archive/ppo-15vp-lr-step400000.zip     --placement-model checkpoints/placement/scorer_ppo.pt     --bundle-model    checkpoints/placement/bundle_noroads.pt --games 30
+```
+
+### Potential-based shaping (`--shaping-weight`) — built, never run
+
+`PotentialShapingWrapper` adds `F(s, s') = γΦ(s') − Φ(s)` with
+`Φ(s) = w·(my actual VP − their visible VP)`. This is the Ng/Harada/Russell form: over an episode
+it telescopes to `γ^T Φ(s_T) − Φ(s_0)`, and with `Φ` forced to zero in the absorbing state the
+total added return is the constant `−Φ(s_0)`. **It cannot invent a new optimal policy.** Verified
+on real games — four different policies on one board seed each added exactly `+0.05`.
+
+This is *not* the deleted `RewardShapingWrapper` returning. That one paid one-time bonuses for
+crossing VP milestones, which do not telescope and genuinely could move the optimum; that is why
+it was a crutch and why it is still not coming back.
+
+It does not punish the wasteful trade — a trade moves no victory point, so it earns exactly what
+it earned before. It pays for the **city**, immediately, so building wins the local comparison
+that 600 decisions of credit assignment currently erase.
+
+Two deliberate choices, both tested in `tests/test_shaping.py`:
+
+- **The opponent contributes their *visible* VP**, ours our actual. Scoring their actual would
+  leak a face-down victory-point card into the reward and teach the critic to expect a signal it
+  cannot observe.
+- **Truncation is absorbing too.** A turn-limited game pays 0 and teaches nothing; leaving `Φ`
+  standing there would let a policy bank shaping for a lead it never converted, which is the one
+  way this wrapper could stop being policy-invariant.
+
+`--pool-search-frac` is the other half of the same idea from the opponent side: a slice of the
+pool played with search on top, since search is worth ~+9.8 points and there is no scripted bot
+above `VictoryPointPlayer` to reach for instead. It is off by default because every simulation is
+a forward pass on the rollout workers' own cores.
+
+**Neither has been run.** When one is, the check is `src/eval/waste.py` and games against
+`VictoryPointPlayer` — **not** a mirror benchmark, which is constitutionally unable to answer.
+
 ### Reproducibility
 
 Every entry point calls `src/env/determinism.py:ensure_hash_seed()`, which **relaunches the process
