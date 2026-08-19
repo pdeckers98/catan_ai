@@ -165,6 +165,85 @@ class TurnLimitWrapper(Wrapper):
         return self.env.reset(**kwargs)
 
 
+class PotentialShapingWrapper(Wrapper):
+    """Potential-based reward shaping on the victory-point differential.
+
+    ``F(s, s') = gamma * Phi(s') - Phi(s)`` with ``Phi(s) = weight * (my VP -
+    their VP)``. This is the Ng/Harada/Russell form, and the reason it is
+    allowed here when the old ``RewardShapingWrapper`` was not: the shaping
+    telescopes over an episode to ``gamma^T Phi(s_T) - Phi(s_0)``, so with
+    ``Phi`` forced to zero in the absorbing state the total added return is the
+    constant ``-Phi(s_0)``. It cannot invent a new optimal policy. The deleted
+    wrapper paid one-time bonuses for crossing VP milestones, which do not
+    telescope and genuinely could move the optimum; that is a different object
+    and it is still not coming back.
+
+    What this is for. At 15 VP the agent takes ~600 decisions per episode for
+    one bit of terminal reward, so a single wasteful action moves the return by
+    far less than the noise in its own advantage estimate -- burning three cards
+    on a maritime trade is *free in the loss*, which is why the agent does it on
+    36% of its turns and two thirds of the time while it can already afford
+    something (``python -m src.eval.waste``). Shaping does not punish the trade;
+    it pays for the *city*, immediately, so building has a local advantage over
+    trading that survives the credit-assignment distance.
+
+    Two deliberate choices:
+
+    - **The opponent's contribution is their VISIBLE VP**, not their actual. Our
+      own uses actual, because the agent knows its own hidden cards; scoring
+      theirs would leak a face-down victory-point card into the reward and teach
+      the critic to expect a signal it cannot observe.
+    - **Truncation is treated as absorbing too.** A turn-limited game pays 0 and
+      teaches nothing either way, so leaving ``Phi`` un-zeroed there would let
+      shaping pay out a return no terminal reward ever balances -- the one way
+      this wrapper could stop being policy-invariant.
+
+    Place it INSIDE :class:`EpisodeStatsWrapper` and OUTSIDE
+    :class:`TurnLimitWrapper`, so it sees the truncation flag.
+
+    Args:
+        env: the base environment.
+        weight: scale of the potential, in units of the terminal +/-1 reward
+            per victory point of lead. Zero disables the wrapper's effect.
+        gamma: the discount the trainer uses. Shaping is only policy-invariant
+            at the gamma it is written for, so this must match ``--gamma``.
+        agent_color: whose point of view.
+    """
+
+    def __init__(self, env, weight: float, gamma: float,
+                 agent_color=Color.BLUE):
+        super().__init__(env)
+        self.weight = weight
+        self.gamma = gamma
+        self.agent_color = agent_color
+        self._prev_potential = 0.0
+
+    def _potential(self) -> float:
+        from catanatron.state_functions import get_visible_victory_points
+        state = self.env.unwrapped.game.state
+        key = f"P{state.color_to_index[self.agent_color]}"
+        mine = state.player_state[f"{key}_ACTUAL_VICTORY_POINTS"]
+        theirs = max(
+            (get_visible_victory_points(state, c) for c in state.colors
+             if c != self.agent_color),
+            default=0,
+        )
+        return self.weight * (mine - theirs)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._prev_potential = self._potential()
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        done = terminated or truncated
+        potential = 0.0 if done else self._potential()
+        shaping = self.gamma * potential - self._prev_potential
+        self._prev_potential = potential
+        return obs, reward + shaping, terminated, truncated, info
+
+
 class EpisodeStatsWrapper(Wrapper):
     """Record end-of-episode VP and build counts in ``info``. Reward untouched.
 

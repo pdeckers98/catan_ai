@@ -1,8 +1,15 @@
 """MaskablePPO training with self-play and W&B logging -- the agent's only trainer.
 
-The reward is the sparse win/loss outcome and nothing else; there is no shaping
-and no machinery for it. ``EpisodeStatsWrapper`` keeps the end-of-episode
-telemetry (VPs, settlements, cities, roads) without touching the reward.
+The reward defaults to the sparse win/loss outcome and nothing else, which is
+what every archived checkpoint trained under. ``--shaping-weight`` adds a
+*potential-based* term on the victory-point differential -- see
+:class:`~src.env.catan_env.PotentialShapingWrapper`, which telescopes to a
+constant and so cannot move the optimum, unlike the VP-milestone bonuses that
+were deleted. It exists because at 15 VP one bit of terminal reward is spread
+over ~600 decisions, and a maritime trade that burns three cards is therefore
+free in the loss; ``python -m src.eval.waste`` counts what that costs.
+``EpisodeStatsWrapper`` keeps the end-of-episode telemetry (VPs, settlements,
+cities, roads) without touching the reward either way.
 
 ``--opponent pool`` is the strongest setting: frozen past checkpoints mixed with
 a slice of scripted games, rated by Elo against the run's own ladder rather than
@@ -65,7 +72,7 @@ from src.agent.elo import Ladder, elo_delta
 from src.agent import pool as opponent_pool
 from src.env.catan_env import (
     MAX_TURNS, make_1v1_env, valid_action_mask, TurnLimitWrapper,
-    EpisodeStatsWrapper,
+    EpisodeStatsWrapper, PotentialShapingWrapper,
 )
 from src.env import ruleset
 
@@ -200,13 +207,17 @@ def _opponent_opens_with_scorer(enemy) -> bool:
     opening edge it will not have against anything competent, so its win rate
     there overstates it. That is why they are a small slice.
     """
-    from src.agent.opponent import PolicyPlayer
-    return isinstance(enemy, PolicyPlayer)
+    from src.agent.opponent import PolicyPlayer, SearchPlayer
+    # SearchPlayer is a trained checkpoint too -- the same argument applies, and
+    # more sharply: a searching opponent handed an untrained opening would spend
+    # its whole simulation budget rescuing a position it never had to be in.
+    return isinstance(enemy, (PolicyPlayer, SearchPlayer))
 
 
 def make_vec_env(num_envs: int, enemy=None, enemies=None,
                  placement_model=None, lookahead: bool = False,
-                 bundle_model=None):
+                 bundle_model=None, shaping_weight: float = 0.0,
+                 gamma: float = 0.999):
     """Create a vectorized environment with num_envs parallel games.
 
     Args:
@@ -230,6 +241,12 @@ def make_vec_env(num_envs: int, enemy=None, enemies=None,
             (614 -> 642). Must match the checkpoint at evaluation time, which
             :class:`~src.agent.opponent.PolicyPlayer` infers from the model's
             observation space rather than being told.
+        shaping_weight: scale of the potential-based VP-differential shaping
+            (:class:`~src.env.catan_env.PotentialShapingWrapper`). Zero, the
+            default, leaves the reward exactly as sparse as it has always been.
+        gamma: the trainer's discount. Only read when ``shaping_weight`` is
+            non-zero, and it must match ``--gamma`` or the shaping stops
+            telescoping and stops being policy-invariant.
 
     Returns:
         SubprocVecEnv with num_envs workers.
@@ -271,6 +288,8 @@ def make_vec_env(num_envs: int, enemy=None, enemies=None,
             env = TurnLimitWrapper(
                 ActionMasker(env, valid_action_mask), max_turns=MAX_TURNS
             )
+            if shaping_weight:
+                env = PotentialShapingWrapper(env, shaping_weight, gamma)
             return EpisodeStatsWrapper(env)
         return _init
 
@@ -434,6 +453,18 @@ def main():
                              "Defaults to the W&B run name.")
     parser.add_argument("--seed", type=int, default=None,
                         help="RNG seed. Omit to pick one randomly.")
+    parser.add_argument("--shaping-weight", type=float, default=0.0,
+                        help="Potential-based reward shaping on the victory-point "
+                             "differential, in units of the terminal +/-1 reward "
+                             "per VP of lead. 0 (the default) is the sparse "
+                             "reward every archived checkpoint was trained under. "
+                             "This is the Ng/Harada/Russell form and telescopes to "
+                             "a constant, so unlike the deleted milestone bonuses "
+                             "it cannot move the optimal policy -- it only shortens "
+                             "the credit-assignment distance, which is the reason "
+                             "a wasteful trade is currently free in the loss. See "
+                             "src.env.catan_env.PotentialShapingWrapper and "
+                             "`python -m src.eval.waste`. Try 0.05.")
     parser.add_argument("--n-steps", type=int, default=4096,
                         help="PPO rollout length per env before each update.")
     parser.add_argument("--batch-size", type=int, default=256,
@@ -542,6 +573,21 @@ def main():
                              "because the two fail differently: weighted-random "
                              "is broad and weak, greedy walks straight at the "
                              "win condition. Also rounded up to at least one env.")
+    parser.add_argument("--pool-search-frac", type=float, default=0.0,
+                        help="Share of the pool slice played with tree search "
+                             "instead of straight off the policy head. Search is "
+                             "worth ~+9.8 points over the same weights, so this "
+                             "is the only opponent available that is stronger "
+                             "than the learner's own past selves -- catanatron "
+                             "ships no bot above VictoryPointPlayer. It is also "
+                             "the only one that spends forward passes on the "
+                             "rollout workers' cores, so measure steps/s before "
+                             "committing a run to it. Off by default.")
+    parser.add_argument("--pool-search-simulations", type=int, default=10,
+                        help="Search budget for --pool-search-frac. Deployment "
+                             "runs 50; a training opponent is kept far lower "
+                             "because every simulation is throughput the learner "
+                             "does not get.")
     parser.add_argument("--pool-max", type=int, default=25,
                         help="Opponent pool size (~6 MB per entry).")
     parser.add_argument("--pool-deterministic", action="store_true",
@@ -602,12 +648,15 @@ def main():
             "learning_rate": args.learning_rate,
             "gamma": args.gamma,
             "ent_coef": args.ent_coef,
+            "shaping_weight": args.shaping_weight,
             **ruleset.as_config(),
             "placement_model": args.placement_model,
             "bundle_model": args.bundle_model,
             "opponent": args.opponent,
             "pool_weighted_frac": args.pool_weighted_frac,
             "pool_greedy_frac": args.pool_greedy_frac,
+            "pool_search_frac": args.pool_search_frac,
+            "pool_search_simulations": args.pool_search_simulations,
             "pool_max": args.pool_max,
             "seed": seed,
         },
@@ -646,18 +695,22 @@ def main():
             num_envs, checkpoint_dir, args.pool_weighted_frac, rng,
             deterministic=args.pool_deterministic,
             greedy_frac=args.pool_greedy_frac,
+            search_frac=args.pool_search_frac,
+            search_simulations=args.pool_search_simulations,
         )
         print(f"[Pool] Opponents: {opponent_pool.describe(enemies)}")
         env = make_vec_env(
             num_envs=num_envs, enemies=enemies,
             placement_model=args.placement_model, lookahead=args.lookahead,
             bundle_model=args.bundle_model,
+            shaping_weight=args.shaping_weight, gamma=args.gamma,
         )
     else:
         env = make_vec_env(
             num_envs=num_envs,
             placement_model=args.placement_model, lookahead=args.lookahead,
             bundle_model=args.bundle_model,
+            shaping_weight=args.shaping_weight, gamma=args.gamma,
         )
 
     if args.resume:
@@ -809,12 +862,15 @@ def main():
                     num_envs, checkpoint_dir, args.pool_weighted_frac, rng,
                     deterministic=args.pool_deterministic,
                     greedy_frac=args.pool_greedy_frac,
+                    search_frac=args.pool_search_frac,
+                    search_simulations=args.pool_search_simulations,
                 )
                 print(f"[Pool] Opponents: {opponent_pool.describe(enemies)}")
                 new_env = make_vec_env(
                     num_envs=num_envs, enemies=enemies,
                     placement_model=args.placement_model,
                     lookahead=args.lookahead, bundle_model=args.bundle_model,
+                    shaping_weight=args.shaping_weight, gamma=args.gamma,
                 )
             else:
                 opponent = sample_opponent(checkpoint_dir)
@@ -823,6 +879,7 @@ def main():
                     num_envs=num_envs, enemy=opponent,
                     placement_model=args.placement_model,
                     lookahead=args.lookahead, bundle_model=args.bundle_model,
+                    shaping_weight=args.shaping_weight, gamma=args.gamma,
                 )
             model.set_env(new_env)
             # The old vector env owns ``num_envs`` live subprocesses. Rebinding

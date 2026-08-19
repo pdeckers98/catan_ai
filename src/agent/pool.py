@@ -96,7 +96,7 @@ SCRIPTED_BOTS = {
 
 
 def make_enemy(path=None, color=Color.RED, deterministic: bool = False,
-               kind: str = "weighted"):
+               kind: str = "weighted", simulations: int = 0):
     """Build one opponent: a pool checkpoint, or a scripted bot if ``path`` is None.
 
     Pool opponents act *stochastically* by default. A greedy opponent plays one
@@ -110,17 +110,28 @@ def make_enemy(path=None, color=Color.RED, deterministic: bool = False,
         deterministic: play a pool opponent greedily.
         kind: which scripted bot, when ``path`` is None. ``weighted`` is
             catanatron's WeightedRandomPlayer; ``greedy`` is VictoryPointPlayer,
-            which plays the move that most immediately raises its own VP.
+            which plays the move that most immediately raises its own VP. Those
+            are the only two this build of catanatron ships -- there is no
+            stronger scripted bot to reach for, which is why the hard opponent
+            here has to be one of our own checkpoints.
+        simulations: play a pool checkpoint with tree search at this budget
+            instead of straight off the policy head. Ignored when ``path`` is
+            None. See :class:`~src.agent.opponent.SearchPlayer`; it costs this
+            many forward passes per opponent move.
     """
     if path is None:
         return SCRIPTED_BOTS[kind](color)
+    if simulations:
+        from src.agent.opponent import SearchPlayer
+        return SearchPlayer(color, model_path=path, simulations=simulations)
     from src.agent.opponent import PolicyPlayer
     return PolicyPlayer(color, model_path=path, deterministic=deterministic)
 
 
 def sample_enemies(num_envs: int, checkpoint_dir, weighted_frac: float = 0.1,
                    rng=None, deterministic: bool = False,
-                   greedy_frac: float = 0.1) -> list:
+                   greedy_frac: float = 0.1, search_frac: float = 0.0,
+                   search_simulations: int = 10) -> list:
     """Draw one opponent per environment: a mixture of pool and scripted bots.
 
     The mixture is spread across environments rather than across time, so every
@@ -150,6 +161,11 @@ def sample_enemies(num_envs: int, checkpoint_dir, weighted_frac: float = 0.1,
         rng: ``random.Random``, or None for the module-level RNG.
         deterministic: play pool opponents greedily.
         greedy_frac: target share of envs facing VictoryPointPlayer.
+        search_frac: share of the *pool* slice played with tree search rather
+            than off the policy head. Zero by default: it is the only opponent
+            stronger than the learner's own past selves, and also the only one
+            that costs forward passes on the rollout workers' own cores.
+        search_simulations: search budget for that slice.
 
     Returns:
         A list of ``num_envs`` Player instances.
@@ -188,8 +204,16 @@ def sample_enemies(num_envs: int, checkpoint_dir, weighted_frac: float = 0.1,
         while len(picked) < remaining:
             take = min(remaining - len(picked), len(entries))
             picked += rng.sample(entries, take)
+        # At least one searching env whenever the fraction is non-zero, for the
+        # same reason the scripted slices round up: a 10% target over 6 pool
+        # envs rounds to 0.6, and silently dropping it would remove the only
+        # opponent in the run that is stronger than the learner's own head.
+        num_search = min(max(1, round(search_frac * len(picked)))
+                         if search_frac > 0 else 0, len(picked))
         enemies += [
-            make_enemy(path, deterministic=deterministic) for path in picked
+            make_enemy(path, deterministic=deterministic,
+                       simulations=search_simulations if i < num_search else 0)
+            for i, path in enumerate(picked)
         ]
     else:
         # No pool yet -- the first interval of a from-scratch run, before any
@@ -209,12 +233,20 @@ def sample_enemies(num_envs: int, checkpoint_dir, weighted_frac: float = 0.1,
 
 def describe(enemies) -> str:
     """One-line summary of a drawn opponent set, for the training log."""
-    from src.agent.opponent import PolicyPlayer
+    from src.agent.opponent import PolicyPlayer, SearchPlayer
     steps = [
         Path(e.model_path).stem.split("_")[-1]
         for e in enemies if isinstance(e, PolicyPlayer)
     ]
     weighted = sum(isinstance(e, WeightedRandomPlayer) for e in enemies)
     greedy = sum(isinstance(e, VictoryPointPlayer) for e in enemies)
-    return (f"{weighted} weighted-random + {greedy} greedy + "
+    searching = sum(isinstance(e, SearchPlayer) for e in enemies)
+    steps += [Path(e.model_path).stem.split("_")[-1]
+              for e in enemies if isinstance(e, SearchPlayer)]
+    line = (f"{weighted} weighted-random + {greedy} greedy + "
             f"pool steps {sorted(set(steps))}")
+    if searching:
+        sims = next(e.simulations for e in enemies
+                    if isinstance(e, SearchPlayer))
+        line += f" ({searching} of them searching at {sims} sims)"
+    return line

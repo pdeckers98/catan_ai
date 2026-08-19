@@ -351,3 +351,100 @@ def test_draws_stay_uniform_over_the_whole_pool(tmp_path):
     expected = 1.0 / len(steps)
     for name, count in seen.items():
         assert abs(count / total - expected) < 0.02, f"{name} is over/under-drawn"
+
+
+# --------------------------------------------------------------------------
+# The searching opponent slice
+# --------------------------------------------------------------------------
+def test_search_is_off_unless_asked_for(tmp_path):
+    """The default pool is what every archived checkpoint trained against."""
+    from src.agent.opponent import SearchPlayer
+
+    for step in (1000, 2000, 3000):
+        opponent_pool.add_to_pool(_fake_checkpoint(tmp_path, step), step,
+                                  tmp_path, 25)
+    enemies = opponent_pool.sample_enemies(
+        8, tmp_path, weighted_frac=0.1, rng=random.Random(0), greedy_frac=0.1
+    )
+    assert not any(isinstance(e, SearchPlayer) for e in enemies)
+
+
+def test_a_searching_slice_only_eats_pool_envs(tmp_path):
+    """The scripted bots are fixed difficulty references and stay scripted.
+
+    Only the pool slice can search -- there is nothing to search *with* for a
+    scripted bot, and converting one would remove the fixed reference the
+    mixture keeps it for.
+    """
+    from src.agent.opponent import PolicyPlayer, SearchPlayer
+
+    for step in (1000, 2000, 3000):
+        opponent_pool.add_to_pool(_fake_checkpoint(tmp_path, step), step,
+                                  tmp_path, 25)
+    enemies = opponent_pool.sample_enemies(
+        8, tmp_path, weighted_frac=0.1, rng=random.Random(0), greedy_frac=0.1,
+        search_frac=0.5, search_simulations=7,
+    )
+    assert len(enemies) == 8
+    assert sum(isinstance(e, WeightedRandomPlayer) for e in enemies) == 1
+    assert sum(isinstance(e, VictoryPointPlayer) for e in enemies) == 1
+    searching = [e for e in enemies if isinstance(e, SearchPlayer)]
+    heads = [e for e in enemies if isinstance(e, PolicyPlayer)]
+    assert len(searching) + len(heads) == 6
+    assert len(searching) == 3
+    assert all(e.simulations == 7 for e in searching)
+
+
+def test_a_fraction_that_rounds_to_zero_still_gets_one_searching_env(tmp_path):
+    """Same rule the scripted slices follow, for a sharper reason: this is the
+    only opponent in the run stronger than the learner's own policy head, and
+    rounding it away would silently return the pool to self-play."""
+    from src.agent.opponent import SearchPlayer
+
+    opponent_pool.add_to_pool(_fake_checkpoint(tmp_path, 1000), 1000,
+                              tmp_path, 25)
+    enemies = opponent_pool.sample_enemies(
+        8, tmp_path, weighted_frac=0.1, rng=random.Random(0), greedy_frac=0.1,
+        search_frac=0.05,
+    )
+    assert sum(isinstance(e, SearchPlayer) for e in enemies) == 1
+
+
+def test_the_searching_opponent_pickles_by_path_too(tmp_path):
+    """It holds an evaluator wrapping a live torch model once built, so it has
+    to be built in the worker and not before."""
+    import pickle
+
+    from src.agent.opponent import SearchPlayer
+
+    player = SearchPlayer(Color.RED, tmp_path / "model.zip", simulations=10)
+    restored = pickle.loads(pickle.dumps(player))
+
+    assert restored._player is None
+    assert restored.model_path == str(tmp_path / "model.zip")
+    assert restored.simulations == 10
+
+
+def test_a_searching_opponent_is_given_the_placement_scorer(tmp_path):
+    """It is a trained checkpoint, so the argument in
+    ``test_only_trained_opponents_are_given_the_placement_scorer`` applies."""
+    from src.agent.opponent import SearchPlayer
+    from src.agent.train import _opponent_opens_with_scorer
+
+    assert _opponent_opens_with_scorer(
+        SearchPlayer(Color.RED, _fake_checkpoint(tmp_path, 1000))
+    )
+
+
+def test_the_log_line_says_how_many_are_searching(tmp_path):
+    from src.agent.opponent import SearchPlayer
+
+    enemies = [
+        WeightedRandomPlayer(Color.RED),
+        SearchPlayer(Color.RED, tmp_path / "pool_step_00001000.zip",
+                     simulations=7),
+    ]
+    line = opponent_pool.describe(enemies)
+    assert "1 of them searching at 7 sims" in line
+    # The searching entry is a pool checkpoint and belongs in the step list.
+    assert "00001000" in line

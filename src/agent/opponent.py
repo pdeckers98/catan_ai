@@ -140,3 +140,60 @@ class PolicyPlayer(Player):
 
         action_int = self._forward(policy, obs, mask)
         return cenv.from_action_space(action_int, playable_actions)
+
+
+class SearchPlayer(Player):
+    """A frozen checkpoint played *with* search, as a training opponent.
+
+    The pool's other opponents are all the learner's own past selves playing
+    their policy head directly, and 50-sim search is worth ~+9.8 points over
+    exactly that (see the note in CLAUDE.md). So the strongest opponent this
+    project can field against itself is a pool entry with a tree on top, and
+    without one the run's hardest reference is strictly weaker than the agent
+    that eventually gets deployed.
+
+    It is expensive. Every opponent move costs ``simulations`` forward passes
+    inside the env worker, on the same cores the rollouts need, so this is a
+    slice of a few envs and a small simulation count -- not the whole batch.
+    Measure throughput before committing a run to it.
+
+    Like :class:`PolicyPlayer` it ships its *path* through the SubprocVecEnv
+    pipe and builds the network in the worker; an evaluator holding a live
+    torch model would pickle the weights on every opponent swap.
+    """
+
+    def __init__(self, color, model_path, simulations: int = 10,
+                 temperature: float = 0.0, seed=None):
+        super().__init__(color)
+        self.model_path = str(model_path)
+        self.simulations = simulations
+        self.temperature = temperature
+        self.seed = seed
+        self._player = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_player"] = None
+        return state
+
+    def _ensure_player(self):
+        if self._player is None:
+            import torch
+            torch.set_num_threads(1)
+            from src.agent.evaluator import PPOEvaluator
+            from src.agent.mcts import MCTSPlayer
+            self._player = MCTSPlayer(
+                self.color, PPOEvaluator.from_path(self.model_path),
+                simulations=self.simulations, temperature=self.temperature,
+                dirichlet_epsilon=0.0, seed=self.seed,
+            )
+        return self._player
+
+    def reset_state(self):
+        if self._player is not None:
+            self._player.reset_state()
+
+    def decide(self, game, playable_actions):
+        if len(playable_actions) == 1:
+            return playable_actions[0]
+        return self._ensure_player().decide(game, playable_actions)
