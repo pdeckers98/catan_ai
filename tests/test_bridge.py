@@ -1246,3 +1246,80 @@ def test_the_only_answer_to_an_offer_is_no():
         moves.SEND_TRADE_RESPONSE,
         {"id": "MQs4", "response": moves.TRADE_RESPONSE_DECLINE},
     )
+
+
+def test_an_unknown_entry_that_moves_nothing_is_narration():
+    """The stance change: fatal only where guessing would actually be a guess.
+
+    Colonist narrates a lot that is not the game -- a karma vote, a resignation,
+    a trade offer, an opponent's connection dropping -- and each of those cost a
+    live game before it was recognised, because an unknown entry was fatal on
+    principle. An entry whose diff moves nothing cannot have changed anything,
+    whatever it means, and saying so involves no guess.
+    """
+    decoder = make_decoder()
+
+    # the opponent disconnecting: entry 24, and isConnected beside it
+    decoder.feed({"playerStates": {"2": {"isConnected": False}},
+                  "gameLogState": {"1": {"text": {
+                      "type": 24, "playerColor": 2,
+                      "is10SecondRuleDisabled": True}}}})
+
+    assert decoder.narration == {24: 1}
+    assert decoder.actions == []
+
+
+def test_an_unknown_entry_that_moves_something_is_still_fatal():
+    """Where the principle bites, it still bites: a rule we do not model."""
+    decoder = make_decoder()
+
+    with pytest.raises(protocol.ProtocolError, match="moves something"):
+        decoder.feed({"playerStates": {"2": {"resourceCards": {"cards": [1, 2]}}},
+                      "gameLogState": {"1": {"text": {"type": 999}}}})
+
+
+@pytest.mark.parametrize("diff, material", [
+    ({"currentState": {"actionState": 3}}, False),
+    ({"gameChatState": {"0": {"text": "hi"}}}, False),
+    ({"playerStates": {"1": {"isConnected": False}}}, False),
+    ({"playerStates": {"1": {"resourceCards": {"cards": [1]}}}}, True),
+    ({"mapState": {"tileEdgeStates": {"3": {"owner": 1}}}}, True),
+    ({"bankState": {"resourceCards": {"1": 18}}}, True),
+    ({"mechanicDevelopmentCardsState": {"players": {}}}, True),
+])
+def test_what_counts_as_moving_something(diff, material):
+    """playerStates carries both kinds, so it is checked field by field."""
+    assert protocol.diff_moves_something(diff) is material
+
+
+def test_an_unknown_entry_riding_with_a_known_one_is_not_fatal():
+    """Several entries share one diff, so materiality alone is too blunt.
+
+    Colonist announced "must discard" (64) in the same diff as the discard
+    itself (55). The diff moves cards, so the blunt rule called it fatal -- but
+    the movement is entirely explained by the discard, which we decode. The
+    unknown entry was riding along, not causing anything.
+    """
+    decoder = make_decoder()
+
+    decoder.feed({
+        "bankState": {"resourceCards": {"1": 17}},
+        "gameLogState": {
+            "1": {"text": {"type": 64, "playerColor": 2}},
+            "2": {"text": {"type": 55, "playerColor": 2,
+                           "cardEnums": [1, 1], "areResourceCards": True}},
+        },
+    })
+
+    assert decoder.narration == {64: 1}
+    assert [a.action_type for a in decoder.actions] == \
+        [ActionType.DISCARD, ActionType.DISCARD]
+
+
+def test_an_unknown_entry_alone_in_a_moving_diff_is_still_fatal():
+    """Nothing explains the change, so a guess would really be a guess."""
+    decoder = make_decoder()
+
+    with pytest.raises(protocol.ProtocolError, match="nothing else explains"):
+        decoder.feed({"bankState": {"resourceCards": {"1": 17}},
+                      "gameLogState": {"1": {"text": {"type": 999}}}})

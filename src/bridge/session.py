@@ -475,6 +475,9 @@ class DryRun:
         self._deferred: List[tuple] = []
         #: Offers already answered, so a repeated diff does not answer twice.
         self._declined: set = set()
+        #: Unknown-but-harmless log entries already reported, so each is named
+        #: once rather than every diff.
+        self._narrated: set = set()
 
     def arm(self, page_sender, delay: float = 0.0) -> None:
         """Let the agent play its decisions rather than only report them."""
@@ -506,6 +509,7 @@ class DryRun:
         if progress.repaired:
             print(f"  [repair] redrew the opponent's unseen cards "
                   f"{progress.repaired}x at turn {self.live.game.state.num_turns}")
+        self._report_narration()
         for action in progress.observed:
             self._score(action)
         self._flush_deferred()
@@ -639,6 +643,21 @@ class DryRun:
             print(f"  -> sent action {code} {json.dumps(payload, default=str)} "
                   f"(seq {result.get('sequence')})")
         return True
+
+    def _report_narration(self) -> None:
+        """Name every unknown log entry once, without stopping for it.
+
+        The entry moved nothing -- that is what got it here -- but it is still a
+        message nobody has read, and the only way one gets named is by being
+        noticed in a game where it appeared.
+        """
+        for kind, count in self.live.decoder.narration.items():
+            if kind in self._narrated:
+                continue
+            self._narrated.add(kind)
+            print(f"  [note] game-log entry {kind} is not decoded; it moved "
+                  f"nothing, so play continues (seen {count}x)")
+            self._record({"kind": "narration", "entry": kind})
 
     def _answer_offers(self) -> None:
         """Decline any trade the opponent has put to us.

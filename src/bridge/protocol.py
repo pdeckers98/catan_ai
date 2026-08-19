@@ -140,10 +140,46 @@ ACTION_STATE_IDLE = 0
 ACTION_STATE_SELECT_YEAR_OF_PLENTY = 32
 ACTION_STATE_SELECT_MONOPOLY = 33
 
+# Sections of a diff that can move something. An unknown log entry riding in a
+# diff that touches none of them cannot have changed the position -- see
+# ``_ActionDecoder._entry``.
+MATERIAL_SECTIONS = frozenset({
+    "mapState", "bankState", "mechanicDevelopmentCardsState",
+})
+MATERIAL_PLAYER_FIELDS = frozenset({
+    "resourceCards", "developmentCards", "bankTradeRatiosState",
+})
+
 #: The server is holding a played card open, waiting to be told which resources.
 AWAITING_CARD_SELECTION = frozenset({
     ACTION_STATE_SELECT_YEAR_OF_PLENTY, ACTION_STATE_SELECT_MONOPOLY,
 })
+
+
+def diff_moves_something(diff: dict) -> bool:
+    """Whether a diff touches the position at all.
+
+    The discriminator behind the decoder's stance on entries it does not know.
+    Colonist narrates a great deal that is not the game -- a karma vote, a
+    resignation, a trade offer, an opponent's connection dropping -- and each of
+    those cost a live game before it was recognised, because an unknown entry
+    was fatal on principle.
+
+    The principle is still right where it bites: an unknown entry in a diff that
+    *does* move cards or pieces is a rule we do not model, and guessing there
+    produces a confident agent reading a fiction. But an entry whose diff moves
+    nothing cannot have changed anything, whatever it means, and there is no
+    guess involved in saying so.
+
+    ``playerStates`` is checked field by field because it carries both kinds:
+    ``isConnected`` next to ``resourceCards``.
+    """
+    if any(diff.get(section) for section in MATERIAL_SECTIONS):
+        return True
+    for state in (diff.get("playerStates") or {}).values():
+        if any(field in (state or {}) for field in MATERIAL_PLAYER_FIELDS):
+            return True
+    return False
 
 
 class ProtocolError(RuntimeError):
@@ -436,6 +472,11 @@ class _ActionDecoder:
         #: it, and a hand that only ever grows makes the second buy of a card we
         #: already hold look like no buy at all. See :meth:`absorb_dev_cards`.
         self.our_dev_cards: List[int] = []
+        #: Unknown log entries that moved nothing, by type and count. Not an
+        #: error, but worth reading: each one is a message we have not named.
+        self.narration: Dict[int, int] = {}
+        #: Whether the diff being decoded contains an entry we understand.
+        self._explained = False
         #: Per player, per card enum, how many cards the bank asks for. Colonist
         #: keeps this on the wire (``bankTradeRatiosState``) and it starts at 4
         #: everywhere; ports lower it. Tracked because a trade's log entry gives
@@ -473,6 +514,14 @@ class _ActionDecoder:
             self.action_state = current["actionState"]
         self.absorb_trades(diff.get("tradeState"))
         entries = sorted((diff.get("gameLogState") or {}).items(), key=lambda kv: int(kv[0]))
+        # Whether anything in this diff is an entry we decode. An unknown entry
+        # sharing a diff with a known one is riding along with it: colonist
+        # announces "must discard" (64) in the same diff as the discard (55),
+        # so the material change is already accounted for and the unknown entry
+        # is not the thing that caused it.
+        known = self._handlers()
+        self._explained = any(
+            (entry or {}).get("text", {}).get("type") in known for _, entry in entries)
         for _, entry in entries:
             self._entry((entry or {}).get("text") or {}, diff)
         # After the entries, so _bought_dev_card still compares against the hand
@@ -547,7 +596,23 @@ class _ActionDecoder:
         if kind in LOG_IGNORED or kind is None:
             return
 
-        handler = {
+        handler = self._handlers().get(kind)
+        if handler is None:
+            if diff_moves_something(diff) and not self._explained:
+                raise ProtocolError(
+                    f"unhandled game-log entry {kind} in a diff that moves "
+                    f"something nothing else explains: {text}"
+                )
+            # Narration: either nothing moved, or what moved is accounted for by
+            # an entry in the same diff that we do decode -- a "must discard"
+            # announcement riding along with the discard itself, say. Counted so
+            # it can be read back and named later.
+            self.narration[kind] = self.narration.get(kind, 0) + 1
+            return
+        handler(text, diff)
+
+    def _handlers(self):
+        return {
             LOG_TURN_STARTED: self._turn_started,
             LOG_ROLL: self._roll,
             LOG_FREE_PLACEMENT: self._placement,
@@ -561,10 +626,7 @@ class _ActionDecoder:
             LOG_MONOPOLY: self._monopoly,
             LOG_YEAR_OF_PLENTY: self._year_of_plenty,
             LOG_DISCARDED: self._discard,
-        }.get(kind)
-        if handler is None:
-            raise ProtocolError(f"unhandled game-log entry {kind}: {text}")
-        handler(text, diff)
+        }
 
     # -- handlers -----------------------------------------------------------
     def _turn_started(self, text: dict, diff: dict) -> None:
@@ -894,6 +956,11 @@ class MessageDecoder:
     def started(self) -> bool:
         """Whether a full state has arrived and the board is known."""
         return self._decoder is not None
+
+    @property
+    def narration(self) -> Dict[int, int]:
+        """Unknown log entries that moved nothing, by type. Worth reading."""
+        return {} if self._decoder is None else self._decoder.narration
 
     @property
     def action_state(self) -> int:
