@@ -6,11 +6,18 @@ reconstruction, replay, the protocol translator, and a live session that follows
 time and says what the agent would play. **Rung 1 of the ladder below has now been run live** --
 one full 1v1 game watched end to end. It found one real translation bug (2:1 ports), which is
 fixed; the captured game now reconstructs all 88 turns and the agent answered 141 positions
-legally. **The action sender now works, and that was the last real unknown.** On 2026-08-19 a
+legally. **The action sender works, and that was the last real unknown.** On 2026-08-19 a
 synthesized `end turn` frame was accepted by a live server: the frame went out at capture line 658
 and the server's turn marker came back at 662, followed by the opponent's roll. Colonist takes
 frames the page's own client never authored, so the sender is a msgpack write and the
-coordinate/click project this doc once scoped is not needed. Opt-in.
+coordinate/click project this doc once scoped is not needed.
+
+**Rung 2 has now been run twice: the agent plays its own games.** `--auto-play` arms the live
+session, and on 2026-08-19 it played two 1v1 casual matchmaking games start to finish, opening
+placement included, with no human input after the game began. 59 moves sent in the first, 0
+determinization repairs in either. Both ended on a bug rather than a result, and **both bugs were
+found by playing, not by testing** — the offline round-trip agreed with three captured games and
+still missed them. See rung 2 below. Opt-in.
 
 > ⚠️ **ToS / bans:** Automating play on colonist.io likely violates its Terms of Service and can
 > get accounts banned. Use a **throwaway account**, run supervised, and never automate ranked play
@@ -80,6 +87,13 @@ protocol translator ──► BoardSpec + observed Actions ──► GameReplay 
   solution, the board rebuild, and a decoder that walks the server's state diffs. `decode_capture`
   turns a recording into `(board, seating, our colour, actions)`. It says nothing about *sending* a
   move, on purpose — see component 2 below.
+- **`moves.py`** — the mirror: a catanatron `Action` to the frames colonist's client would have
+  sent. Pure, and no browser anywhere near it, so it round-trips offline against the frames a real
+  capture recorded. Every code was correlated against the log entry it produced rather than read
+  off its number.
+- **`sender.py`** — those frames on the wire, over colonist's own socket. `FrameCodec` learns the
+  routing header by watching the client and falls back to the `serverId` the server announces, so
+  a game with nobody clicking can still be routed.
 - **`session.py`** — the live read loop, and rung 1. `LiveGame` keeps a `GameReplay` in step
   with the message stream one message at a time; `DryRun` puts the agent around it, logs the move
   it *would* play, and clicks nothing. Two things make it worth more than a `decode_capture` in a
@@ -260,6 +274,35 @@ hosting the authenticated session. Unproven until we send one.
    - **A synthesized frame is indistinguishable by construction**, which is a verification problem
      as much as a feature: ours is identified in the capture by its timing and sequence, not its
      bytes. `FrameCodec.sent` is the record of what we spent.
+
+   **Which frame to send is a separate module**, `src/bridge/moves.py` — the mirror of
+   `protocol.py`, and pure. Every code in its table was correlated against the log entry it
+   produced across three captured games, which is why several disagree with a plausible reading
+   of the numbers: `7` is not "discard", it is *confirm the current selection*, preceded by `8`
+   frames carrying the selection as it grows.
+
+   Three shapes do not line up one-to-one, and each is a real difference between the two games:
+
+   - `PLAY_MONOPOLY` and `PLAY_YEAR_OF_PLENTY` name their resource in the action; colonist plays
+     the card first and resolves it after.
+   - **`DISCARD` runs the other way.** `src/env/rules.py` made it one action per card, because
+     that is the decision the policy has a slot for; colonist wants the finished hand. So the
+     agent is asked repeatedly against a *private copy* of the game — the live replay cannot
+     advance in between, since it only moves on what the server says happened — and the whole
+     discard goes out as one frame.
+   - colonist **batches** several bank trades into a single frame. Catanatron has no such action,
+     so the read side decodes one frame as N trades and the write side re-emits N frames.
+
+   The offline proof is the same shape as the replay test: decode a captured game, hand every
+   move *we* made back to the translator, and compare against what the browser actually put on
+   the wire. `game1` regenerates all 141 in-game frames, in order, exactly.
+
+   **That proof was not sufficient, and the way it failed is the lesson.** It can only check
+   mappings a human's clicks happened to exercise; the two live games each died on one it did
+   not. Codes now proven *live* are roll, end turn, opening settlement and road, road, city, buy
+   dev, move robber, knight, monopoly, road building, and bank trade. Still unproven: **Year of
+   Plenty (`48 15`)** and the **discard** selection — a live YoP has not yet been played, and no 7
+   has been rolled against a big enough hand.
 3. **Coordinate translation** — ✅ solved, and it was never the pixel problem this doc feared.
    Colonist addresses corners and edges as `(hex, z)`; a hex owns its north and south corners and
    its three western edges. Laying both boards on one integer grid and matching positions gives the
@@ -351,21 +394,72 @@ hosting the authenticated session. Unproven until we send one.
    agreement with a human is a weak yardstick in the direction that flatters the agent — most
    positions offer one sensible move, and the disagreements cluster exactly where they should
    (whether to trade, whether to buy a dev card or end the turn).
-2. **Single supervised live game** on a throwaway account, human ready to intervene. 🚧 **The
-   channel is open** — one hand-triggered `end turn` was accepted live on 2026-08-19 (component 2
-   above). What remains is the agent's own action → catanatron-to-colonist translation, which was
-   deliberately not written until the channel was known to exist. Two things that game turned up
-   and that rung 2 has to handle first:
+2. **Single supervised live game** on a throwaway account, human ready to intervene. 🚧 **Run
+   twice on 2026-08-19, both times through 1v1 casual matchmaking with no human input after the
+   game started.** Add `--auto-play` to the live command. The opening is the agent's too — the
+   placement specialist places it, and the free-placement codes (`15`/`11`) are visibly different
+   from the paid ones in the log.
 
-   - **The karma vote.** Log entries 36/26/33 broke the session at turn 4. A player types
-     `/disablekarma` in chat, the server opens a vote (message 51), and those three narrate it.
-     Fixed — they are ignored, on the strength of the whole chain being visible in the capture.
-   - **A session is not a game.** The capture holds *two* full-state messages with empty boards,
+   The first game: **61 decisions, 59 moves sent, 0 repairs, 90.6% agreement** with what the
+   position offered. The routing header came from the server's `serverId` with no human click,
+   which is what makes an autonomous game possible at all — the codec used to learn routing by
+   watching the client, and a client nobody clicks never speaks.
+
+   **Both games ended on a bug, and neither bug was in the sender.** That is the substantive
+   finding of this rung:
+
+   - **Our own dev cards went unattributed once we played one.** Colonist sends our whole hand in
+     the diff that carries the buy, so the new card is whatever the hand gained — but the
+     remembered hand was only updated *on a purchase*, so playing a card never removed it. Buy a
+     knight, play it, buy another, and the new hand is a subset of the stale one: nothing looks
+     new, and the purchase decodes as `None`. `None` means "the opponent's, unknown", so the
+     determinizer drew from the deck and handed the agent a Year of Plenty it did not own. It
+     tried to play it three turns running; each turn ended with nothing done. **No `DesyncError`
+     fires**, because the server never reports the move we could not make — the one failure this
+     module is built to make loud was silent, since the illegal move never happened. Fixed:
+     `absorb_dev_cards` runs on every diff.
+   - **Road Building's roads are placed, not bought.** The card itself worked (`48 14` → log 20),
+     then the road went out as `12` and colonist *ignored* it — no refusal, no entry, just a turn
+     that would not advance. Colonist splits its build codes by who pays rather than by when: an
+     opening road and a Road Building road both log as entry 4, "placed for free", while every
+     bought road logs as entry 5. Four Road Building plays across the captures agree. So the two
+     free roads go out as `11`, and `translate()` takes `state.is_road_building` as an argument —
+     catanatron cannot say so through the prompt, since it stays in `PLAY_TURN`.
+
+   Both were invisible to three games of offline round-tripping, because a round-trip can only
+   check the mappings a human's clicks happened to exercise.
+
+   Still to handle:
+
+   - **A session is not a game.** A capture holds *two* full-state messages with empty boards,
      i.e. two games on one session, and `LiveGame` rebuilds from move one on a full state without
      regard for which game it belongs to. Everything after the second one desyncs. Unattended play
      means many games per session, so this is rung 2 work, not rung 3.
+   - **Year of Plenty and discard are still unproven live** (component 2).
 
-   The probe itself, for repeating it:
+   Fixed along the way: the **karma vote** (log entries 36/26/33 — a player types `/disablekarma`,
+   the server opens a vote, and those three narrate it) and a **resignation** (112), which ends a
+   game rather than changing it and was being reported as a decoding failure.
+
+   Playing a live game, which is what this rung is:
+
+   ```bash
+   python -m src.bridge.session --vps-to-win 15 --longest-road --max-turns 1500 \
+       --auto-play --send-delay 1.5 --simulations 50 \
+       --send-file data/bridge/send.txt --log data/bridge/decisions.jsonl \
+       --model checkpoints/archive/ppo-15vp-lr-step400000.zip \
+       --placement-model checkpoints/placement/scorer_ppo.pt \
+       --bundle-model    checkpoints/placement/bundle_noroads.pt
+   ```
+
+   Pick 1v1 casual matchmaking and stop touching it when the board appears. Read the `==` lines,
+   not the `-> sent` ones: `-> sent` only means the bytes left the page, while `==` means the
+   *server* reported the move back. Two failures announce themselves that way and no other —
+   frames that go out and never return, and a second `game started:` line. A broken
+   reconstruction stops the agent sending at all, and an unanswered move is reported but never
+   resent: resending a settlement plays it twice, somewhere the search never looked.
+
+   The hand probe, for sending one frame without arming the agent:
 
    ```bash
    python -m src.bridge.session --allow-send --vps-to-win 15 --longest-road --max-turns 1500        --simulations 50 --model checkpoints/archive/ppo-15vp-lr-step400000.zip        --placement-model checkpoints/placement/scorer_ppo.pt        --bundle-model    checkpoints/placement/bundle_noroads.pt
