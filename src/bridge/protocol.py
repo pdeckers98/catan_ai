@@ -125,6 +125,22 @@ LOG_IGNORED = frozenset({
     2, 22, 26, 33, 36, 45, 47, 49, 60, 66, 68, 74, 112, 139,
 })
 
+# ``currentState.actionState``: what the server is waiting for. Unlike a log
+# entry, which records what *happened*, this says what it will accept next --
+# and for the two cards that carry a choice it is the only acknowledgement
+# there is. Colonist does not log a monopoly or a year of plenty until the
+# choice arrives, so a sender that waits for log 20 before sending the choice
+# waits forever. Measured: the state change comes back ~120ms after the bare
+# card play, while log 20 never comes at all.
+ACTION_STATE_IDLE = 0
+ACTION_STATE_SELECT_YEAR_OF_PLENTY = 32
+ACTION_STATE_SELECT_MONOPOLY = 33
+
+#: The server is holding a played card open, waiting to be told which resources.
+AWAITING_CARD_SELECTION = frozenset({
+    ACTION_STATE_SELECT_YEAR_OF_PLENTY, ACTION_STATE_SELECT_MONOPOLY,
+})
+
 
 class ProtocolError(RuntimeError):
     """A message the decoder does not understand.
@@ -403,6 +419,9 @@ class _ActionDecoder:
         #: already applied just changed underneath it.
         self.revised_from: Optional[int] = None
         self.rolled_this_turn = False
+        #: The server's ``currentState.actionState``, i.e. what it will accept
+        #: next. Tracked for the write side; see AWAITING_CARD_SELECTION.
+        self.action_state: int = ACTION_STATE_IDLE
         self.pending_dev_card: Optional[int] = None
         #: Our development hand as colonist last reported it. Kept in step with
         #: *every* diff rather than only with a purchase: playing a card removes
@@ -441,6 +460,9 @@ class _ActionDecoder:
         """Decode one diff. Returns the lowest index it rewrote, or ``None``."""
         self.revised_from = None
         self.absorb_ratios(diff.get("playerStates"))
+        current = diff.get("currentState") or {}
+        if "actionState" in current:
+            self.action_state = current["actionState"]
         entries = sorted((diff.get("gameLogState") or {}).items(), key=lambda kv: int(kv[0]))
         for _, entry in entries:
             self._entry((entry or {}).get("text") or {}, diff)
@@ -821,13 +843,22 @@ class MessageDecoder:
         #: a trade names its ``creator`` -- and it is the one place the
         #: colour mapping has to run backwards.
         self.our_colonist_color: Optional[int] = None
+        #: colonist's player colour -> catanatron ``Color``, both seats.
+        self.color_by_colonist: Dict[int, Color] = {}
         #: The lobby's own settings, as the full state reported them. This is how
         #: the house rules stop being an assumption: ``victoryPointsToWin`` and
         #: ``cardDiscardLimit`` are on the wire, so they can be checked against
         #: the patches in :mod:`src.env.rules` instead of eyeballed.
         self.settings: dict = {}
-        #: Bumped on every full state, so a caller can tell one game from the next.
+        #: Bumped on every full state that starts a game, so a caller can tell
+        #: one game from the next. A mid-game resync does *not* bump it.
         self.game_id = 0
+        #: Full states that re-described a game already in progress.
+        self.resyncs = 0
+        #: The most recent one, kept because it is the server stating the whole
+        #: position outright -- the only chance to audit our reconstruction
+        #: against the truth mid-game. See ``LiveGame._audit``.
+        self.last_resync: Optional[dict] = None
         self._decoder: Optional[_ActionDecoder] = None
 
     @property
@@ -836,16 +867,22 @@ class MessageDecoder:
         return self._decoder is not None
 
     @property
-    def awaiting_card_choice(self) -> Optional[int]:
-        """The dev card the server has logged as played and not yet resolved.
+    def action_state(self) -> int:
+        """What the server says it is waiting for. See AWAITING_CARD_SELECTION.
 
-        Monopoly and year of plenty are two steps on colonist: the card goes
-        down, the server enters a state that asks which resource, and only then
-        does the choice mean anything. This is that gap, and the write side
-        waits on it -- a choice sent before the card is acknowledged is
-        discarded, not queued.
+        This is the write side's acknowledgement, and it has to be this rather
+        than a log entry: colonist does not *log* a monopoly or a year of plenty
+        until the choice arrives, so gating the choice on the log deadlocks. It
+        was gated on the log for exactly one live game, which spent three turns
+        holding a card the server was patiently waiting on.
         """
-        return None if self._decoder is None else self._decoder.pending_dev_card
+        return (ACTION_STATE_IDLE if self._decoder is None
+                else self._decoder.action_state)
+
+    @property
+    def awaiting_card_selection(self) -> bool:
+        """The server is holding a played card open, waiting for its resources."""
+        return self.action_state in AWAITING_CARD_SELECTION
 
     @property
     def actions(self) -> List[Action]:
@@ -861,6 +898,14 @@ class MessageDecoder:
         case) or was not one we decode.
         """
         if kind == MSG_FULL_STATE and isinstance(payload, dict):
+            if self._is_resync(payload):
+                # Not a new game: the server re-sent the state of the one we are
+                # already reconstructing. Rebuilding from here would throw away
+                # every action we have and leave an empty board being fed
+                # mid-game moves, which is exactly how it failed live.
+                self.resyncs += 1
+                self.last_resync = payload
+                return None
             self._begin(payload)
             return 0
         if kind == MSG_DIFF and self._decoder is not None and isinstance(payload, dict):
@@ -868,6 +913,36 @@ class MessageDecoder:
             if isinstance(diff, dict):
                 return self._decoder.feed(diff)
         return None
+
+    def _is_resync(self, payload: dict) -> bool:
+        """Whether this full state re-describes the game already in progress.
+
+        Colonist re-sends the whole state mid-game -- a reconnect, or its client
+        deciding it has drifted. It looks identical to the message that starts a
+        game apart from two things: the settings id is the same one, and there
+        are pieces on the board.
+
+        **Both conditions, not either.** The id alone would be fooled by a
+        rematch in the same lobby; an occupied board alone would be fooled by
+        nothing today but is the cheaper half to be wrong about. Together they
+        are exactly "this is the game we are already watching".
+
+        The captures are unambiguous: two human-played games have one full state
+        each, and *every* game the agent played has at least one more, one of
+        them seven. Injecting frames the page's own client never authored is
+        what provokes it, so this is not an edge case to tolerate -- it is a
+        normal event for an agent, and the reason it has to be handled rather
+        than merely detected.
+        """
+        if self._decoder is None:
+            return False
+        settings = payload.get("gameSettings") or {}
+        if not settings.get("id") or settings.get("id") != self.settings.get("id"):
+            return False
+        map_state = (payload.get("gameState") or {}).get("mapState") or {}
+        corners = map_state.get("tileCornerStates") or {}
+        return any(isinstance(corner, dict) and corner.get("owner") is not None
+                   for corner in corners.values())
 
     def _begin(self, payload: dict) -> None:
         state = payload["gameState"]
@@ -879,6 +954,7 @@ class MessageDecoder:
         self.seating = tuple(by_colonist[c] for c in order)
         self.our_color = by_colonist[payload["playerColor"]]
         self.our_colonist_color = payload["playerColor"]
+        self.color_by_colonist = dict(by_colonist)
         self._decoder = _ActionDecoder(self.coords, by_colonist, self.our_color)
         self._decoder.absorb_ratios(state.get("playerStates"))
         self._decoder.absorb_dev_cards(

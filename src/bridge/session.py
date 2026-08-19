@@ -209,6 +209,10 @@ class LiveGame:
         #: Games replayed from move one because something already applied
         #: changed underneath. Routine -- a steal or a revealed purchase does it.
         self.rebuilds = 0
+        #: Full states that re-described the game already in progress. Routine
+        #: for an agent -- injected frames provoke them -- and each one is
+        #: audited rather than acted on.
+        self.resyncs = 0
 
         # Purchases we had to guess, keyed by their index in the action list.
         # Sticky: a guess is redrawn only when it is contradicted, so the
@@ -256,7 +260,13 @@ class LiveGame:
             self._rebuild()
 
         repairs_before = self.repairs
+        resyncs_before = self.resyncs
         self._sync()
+        self.resyncs = self.decoder.resyncs
+        if self.resyncs != resyncs_before and self.decoder.last_resync:
+            # Free audit: see _audit. Runs after _sync so it compares against a
+            # replay that has absorbed everything the resync's diffs carried.
+            self._audit(self.decoder.last_resync)
         return Progress(observed=list(self.decoder.actions[before:]),
                         repaired=self.repairs - repairs_before, started=started)
 
@@ -275,6 +285,45 @@ class LiveGame:
         self._guesses.clear()
         self._game_id = self.decoder.game_id
         self._rebuild()
+
+    def _audit(self, payload: dict) -> None:
+        """Check our reconstruction against the position the server just stated.
+
+        A resync is the one moment mid-game when colonist describes the whole
+        board outright instead of a diff, so it is the only chance to find out
+        whether the replay has drifted -- and drift is the failure this module
+        exists to catch. Ignoring the message is right; ignoring the *evidence*
+        in it would be waste.
+
+        Ownership only, of corners and edges. Building type is deliberately not
+        compared: the enum for a city has never been observed, and an audit that
+        can be wrong about what it is auditing is worse than a narrower one.
+        """
+        map_state = (payload.get("gameState") or {}).get("mapState") or {}
+        coords = self.decoder.coords
+        by_colonist = self.decoder.color_by_colonist
+
+        theirs_nodes, theirs_edges = {}, {}
+        for corner_id, corner in (map_state.get("tileCornerStates") or {}).items():
+            owner = (corner or {}).get("owner")
+            if owner is not None:
+                theirs_nodes[coords.node_by_corner[int(corner_id)]] = by_colonist[owner]
+        for edge_id, edge in (map_state.get("tileEdgeStates") or {}).items():
+            owner = (edge or {}).get("owner")
+            if owner is not None:
+                theirs_edges[coords.edge_by_edge[int(edge_id)]] = by_colonist[owner]
+
+        board = self.replay.state.board
+        ours_nodes = {node: colour for node, (colour, _) in board.buildings.items()}
+        ours_edges = {tuple(sorted(edge)): colour for edge, colour in board.roads.items()}
+
+        if ours_nodes != theirs_nodes or ours_edges != theirs_edges:
+            raise DesyncError(
+                "the server re-sent the position and it is not the one we "
+                f"reconstructed: {len(ours_nodes)} buildings and "
+                f"{len(ours_edges)} roads here against "
+                f"{len(theirs_nodes)} and {len(theirs_edges)} there"
+            )
 
     def _rebuild(self) -> None:
         self.rebuilds += 1
@@ -597,8 +646,14 @@ class DryRun:
         ``48``/``8``/``7`` burst leaving before the server had acknowledged
         anything. A human never trips it because clicking is slower than the
         round trip.
+
+        **The acknowledgement is a state change, not a log entry**, and getting
+        that wrong cost a second game. Colonist does not log a monopoly or a
+        year of plenty until the choice arrives, so gating the choice on the log
+        waits for something the choice itself causes. ``actionState`` comes back
+        about 120ms after the bare card play; the log never comes at all.
         """
-        if not self._deferred or self.live.decoder.awaiting_card_choice is None:
+        if not self._deferred or not self.live.decoder.awaiting_card_selection:
             return
         deferred, self._deferred = self._deferred, []
         self._send_frames(deferred)

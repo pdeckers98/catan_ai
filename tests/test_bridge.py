@@ -1097,7 +1097,86 @@ def test_an_ordinary_move_defers_nothing():
         assert (lead, deferred) == (frames, [])
 
 
-def test_the_gate_is_the_server_saying_the_card_is_down():
-    """`awaiting_card_choice` is the acknowledgement, not a delay."""
+def test_the_gate_is_a_state_change_and_not_a_log_entry():
+    """Gating the card choice on log 20 deadlocks, and did, for a whole game.
+
+    Colonist does not *log* a monopoly or a year of plenty until the choice
+    arrives -- so waiting for the log before sending the choice waits for
+    something the choice itself causes. The acknowledgement that does arrive is
+    ``currentState.actionState``, about 120ms after the bare card play, and it
+    is what the human client waits for too.
+    """
     decoder = protocol.MessageDecoder()
-    assert decoder.awaiting_card_choice is None  # no game yet
+    assert not decoder.awaiting_card_selection  # no game yet
+
+    decoder._decoder = make_decoder()
+    decoder._decoder.feed({"currentState": {"actionState": 32}})
+    assert decoder.awaiting_card_selection
+
+    decoder._decoder.feed({"currentState": {"actionState": 0}})
+    assert not decoder.awaiting_card_selection
+
+
+def resync_payload(base, corners):
+    """A full state for a game already in progress: same id, pieces on board."""
+    payload = json.loads(json.dumps(base))
+    for corner_id, owner in corners.items():
+        payload["gameState"]["mapState"]["tileCornerStates"][corner_id]["owner"] = owner
+    return payload
+
+
+@pytest.mark.skipif(not CAPTURES, reason="no colonist capture recorded locally")
+def test_a_mid_game_resync_does_not_restart_the_reconstruction():
+    """Colonist re-sends the whole state mid-game, and it is not a new game.
+
+    Two human-played captures have one full state each; *every* game the agent
+    played has at least one more, one of them seven -- injecting frames the
+    page's own client never authored is what provokes it. Treating the second
+    one as a new game is what happened live: an empty board, rebuilt at the
+    opening prompt, then fed a mid-game Year of Plenty.
+    """
+    resynced = [path for path in CAPTURES if _full_states(path) > 1]
+    if not resynced:
+        pytest.skip("no capture contains a resync")
+
+    for path in resynced:
+        decoder = protocol.MessageDecoder()
+        for record in protocol.iter_colonist_frames(path):
+            message = protocol.server_message(record)
+            if message is not None:
+                try:
+                    decoder.feed(*message)
+                except protocol.ProtocolError:
+                    break
+        assert decoder.game_id == 1, f"{path.name} restarted mid-session"
+        assert decoder.resyncs >= 1, path.name
+
+
+def _full_states(path):
+    count = 0
+    for record in protocol.iter_colonist_frames(path):
+        message = protocol.server_message(record)
+        if message is not None and message[0] == protocol.MSG_FULL_STATE:
+            count += 1
+    return count
+
+
+def test_a_second_game_in_one_session_is_still_a_new_game():
+    """The resync check must not swallow an actual rematch."""
+    decoder = protocol.MessageDecoder()
+    decoder.settings = {"id": "white6996"}
+    decoder._decoder = object()  # started
+
+    fresh_corners = {"1": {"owner": None}, "2": {"owner": None}}
+    same_game = {"gameSettings": {"id": "white6996"},
+                 "gameState": {"mapState": {"tileCornerStates": fresh_corners}}}
+    other_game = {"gameSettings": {"id": "sheep7625"},
+                  "gameState": {"mapState": {"tileCornerStates":
+                                             {"1": {"owner": 2}}}}}
+
+    # same id but an empty board: a rematch in the same lobby, not a resync
+    assert not decoder._is_resync(same_game)
+    # a different id, pieces or not
+    assert not decoder._is_resync(other_game)
+    # same id and pieces on the board: the game we are already watching
+    assert decoder._is_resync(resync_payload(same_game, {"1": 2}))
