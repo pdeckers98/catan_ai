@@ -60,11 +60,13 @@ import argparse
 import json
 import random
 import sys
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Queue
 from typing import Dict, List, Optional
 
 from catanatron import Color
@@ -72,7 +74,7 @@ from catanatron.models.actions import Action
 from catanatron.models.decks import starting_devcard_bank
 from catanatron.models.enums import ActionType
 
-from src.bridge import protocol
+from src.bridge import protocol, sender
 from src.bridge.capture import CAPTURE_DIR, PROFILE_DIR, decode_payload
 from src.bridge.player import DEFAULT_SIMULATIONS, build_bridge_player
 from src.bridge.replay import DesyncError, GameReplay
@@ -511,23 +513,79 @@ def run_replay(dry: DryRun, path: Path) -> None:
         dry.feed_frame(record)
 
 
-def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path]) -> None:
+SEND_HELP = """
+send console -- rung 2's first question, asked by hand.
+
+  roll            send action 2 (roll dice)
+  end             send action 6 (end turn)
+  send <n> <json> send action <n> with a JSON payload, e.g. `send 12 53`
+  status          what the codec has learned from the client so far
+  help            this
+  (blank line)    nothing
+
+Nothing is sent until you type it. Send only on your own turn, and read the
+game log rather than the console to find out whether the server took it.
+"""
+
+
+def _console_reader(queue: "Queue[str]") -> None:
+    """Read commands off stdin forever, on a thread of their own.
+
+    Playwright's sync API is not thread-safe, so this thread only *collects*;
+    the browser loop drains the queue and does the sending itself.
+    """
+    for line in sys.stdin:
+        queue.put(line.strip())
+
+
+def _run_command(command: str, page_sender: "sender.PageSender") -> None:
+    """Execute one console line. Never raises: a typo must not end the game."""
+    parts = command.split(maxsplit=2)
+    verb = parts[0].lower()
+    try:
+        if verb == "help":
+            print(SEND_HELP)
+        elif verb == "status":
+            codec = page_sender.codec
+            print(f"  header={codec.header} last_sequence={codec.last_sequence} "
+                  f"sent={len(codec.sent)}")
+        elif verb in sender.PROBE_ACTIONS:
+            print(f"  -> {page_sender.send_probe(verb)}")
+        elif verb == "send" and len(parts) >= 2:
+            payload = parts[2] if len(parts) > 2 else "true"
+            print(f"  -> {page_sender.send_raw(int(parts[1]), payload)}")
+        else:
+            print(f"  ? {command!r} -- type `help`")
+    except (sender.SendError, ValueError) as exc:
+        print(f"  !! {exc}")
+
+
+def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
+             allow_send: bool = False) -> None:
     """Attach to a browser you drive by hand and follow the game in real time.
 
     The same CDP plumbing :mod:`src.bridge.capture` uses, writing a capture in
     the same format -- a dry run is a capture that happens to have an agent
     attached, and you only get to play each game once.
 
-    **Both directions are recorded, only ``recv`` is decoded.** The client's own
-    frames say nothing the server does not repeat back, so the agent has no use
-    for them; but they are the entire specification of the action sender, which
-    is the next piece of work. Dropping them would mean playing another game by
-    hand to get them back.
+    **Both directions are recorded, and ``sent`` is now read too.** The client's
+    own frames say nothing the server does not repeat back, so the agent has no
+    use for them -- but they are the entire specification of the action sender,
+    and with ``allow_send`` they are also its calibration:
+    :class:`~src.bridge.sender.FrameCodec` learns this room's routing header and
+    sequence counter by watching the client use them.
+
+    ``allow_send`` adds a console on stdin and nothing else. **No move is ever
+    sent that you did not type**, because the open question at rung 2 is whether
+    the server accepts a synthesized frame at all, and the cheapest way to ask
+    is one harmless frame at a moment of your choosing.
     """
     from playwright.sync_api import sync_playwright
 
     handle = record_to.open("w", encoding="utf-8") if record_to else None
     sockets: Dict[str, str] = {}
+    codec = sender.FrameCodec()
+    commands: "Queue[str]" = Queue()
 
     def write(entry: dict) -> None:
         if handle is None:
@@ -559,6 +617,9 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path]) -> 
                 # gateway, a pile of localhost RPC. Only colonist's has a game on
                 # it, and only the server's half of that describes one.
                 if direction != "recv":
+                    # ...but our own half says how to speak, so the codec reads
+                    # the routing header and sequence counter off the client.
+                    codec.observe(entry)
                     return
                 if "colonist" not in sockets.get(event.get("requestId"), ""):
                     return
@@ -579,14 +640,29 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path]) -> 
             user_data_dir=str(PROFILE_DIR), channel=channel or None,
             headless=False, viewport=None, args=["--start-maximized"],
         )
+        if allow_send:
+            # Before any navigation, or colonist's socket is already open and
+            # the hook has nothing left to wrap.
+            sender.install(context)
         context.on("page", attach)
         page = context.pages[0] if context.pages else context.new_page()
         attach(page)
         page.goto(url)
+        page_sender = sender.PageSender(page, codec) if allow_send else None
+        if page_sender is not None:
+            threading.Thread(target=_console_reader, args=(commands,),
+                             daemon=True).start()
+            print(SEND_HELP)
         print("watching. play a game by hand; close the window when done.")
         try:
             while context.pages and not context.pages[0].is_closed():
                 context.pages[0].wait_for_timeout(500)
+                # Drained here rather than on the reader thread: Playwright's
+                # sync API belongs to the thread that created the browser.
+                while page_sender is not None and not commands.empty():
+                    command = commands.get()
+                    if command:
+                        _run_command(command, page_sender)
         except KeyboardInterrupt:
             print("\ninterrupted")
         except Exception as exc:  # the window was closed mid-wait
@@ -616,6 +692,9 @@ def main() -> int:
     parser.add_argument("--channel", default="chrome")
     parser.add_argument("--no-record", action="store_true",
                         help="do not also write a capture of the live session")
+    parser.add_argument("--allow-send", action="store_true",
+                        help="open a console that can put frames on colonist's "
+                             "socket. Nothing is sent that you do not type.")
     # Declared so --help lists them; they were already read at import time by
     # ruleset.apply_cli_overrides(), which has to run above the engine imports.
     parser.add_argument("--vps-to-win", type=int)
@@ -636,7 +715,7 @@ def main() -> int:
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
             record_to = CAPTURE_DIR / f"dryrun-{stamp}.jsonl"
             print(f"recording to {record_to}")
-        run_live(dry, args.url, args.channel, record_to)
+        run_live(dry, args.url, args.channel, record_to, args.allow_send)
 
     print(dry.summary())
     return 1 if dry.broken is not None else 0

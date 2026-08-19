@@ -8,6 +8,7 @@ so it is pinned before any protocol work starts.
 """
 
 import base64
+import json
 import pathlib
 import random
 
@@ -27,7 +28,7 @@ from catanatron.players.weighted_random import WeightedRandomPlayer
 
 from src.agent.encoding import encode_observation
 from src.bridge.board import BoardSpec, build_map_from_spec, spec_from_map
-from src.bridge import protocol
+from src.bridge import protocol, sender
 from src.bridge.capture import decode_payload, message_type, shape
 from src.bridge.player import build_bridge_player
 from src.bridge.replay import DesyncError, GameReplay, blank_outcome
@@ -651,3 +652,95 @@ def test_a_lobby_that_is_not_our_ruleset_is_refused():
 
     with pytest.raises(LobbyMismatch, match="victoryPointsToWin"):
         live._check_lobby()
+
+
+# --------------------------------------------------------------------------
+# The action sender. The codec half is pure and can be held to the strictest
+# standard available offline: the bytes a real client actually put on the wire.
+# --------------------------------------------------------------------------
+
+
+def client_frames():
+    """Every in-game frame our own client sent, across all local captures."""
+    frames = []
+    for path in CAPTURES:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                entry = json.loads(line)
+                if entry.get("dir") == "sent" and "header" in entry:
+                    frames.append(entry)
+    return frames
+
+
+def test_a_routing_header_round_trips_through_its_parts():
+    header = sender.RoutingHeader.parse(bytes.fromhex("030106303246373037"))
+
+    assert (header.kind, header.channel, header.room) == (3, 1, "02F707")
+    assert header.encode() == bytes.fromhex("030106303246373037")
+
+
+def test_a_header_whose_length_disagrees_with_its_name_is_refused():
+    """The length byte is the only self-check the header carries; use it."""
+    with pytest.raises(sender.SendError, match="length"):
+        sender.RoutingHeader.parse(b"	" + b"02F707")
+
+
+@pytest.mark.skipif(not CAPTURES, reason="no colonist capture recorded locally")
+def test_synthesized_frames_are_byte_identical_to_the_client_s_own():
+    """The strongest offline statement the sender can make.
+
+    A frame that merely *decodes* the same proves our reading is consistent.
+    Identical bytes prove the server has nothing to distinguish our frame from
+    the client's -- which is the entire question rung 2 asks.
+    """
+    in_game = [f for f in client_frames()
+               if bytes.fromhex(f["header"])[0] == sender.ROOM_GAME]
+    assert in_game, "no in-game client frames in the local captures"
+
+    # Lobby frames are excluded rather than fixed: one of them carries a msgpack
+    # Timestamp extension that the *capture* stringifies on its way to JSON, so
+    # it cannot round-trip through a recording -- and we never send one.
+    mismatches = sender.frames_round_trip(in_game)
+
+    assert mismatches == [], mismatches[:3]
+
+
+@pytest.mark.skipif(not CAPTURES, reason="no colonist capture recorded locally")
+def test_the_codec_learns_its_routing_by_watching_the_client():
+    """Nothing about the room is hardcoded; it is observed, like the rest."""
+    codec = sender.FrameCodec()
+    assert not codec.ready
+
+    for entry in client_frames():
+        codec.observe(entry)
+
+    assert codec.ready
+    assert codec.header is not None and codec.header.kind == sender.ROOM_GAME
+    assert codec.last_sequence and codec.last_sequence > 0
+
+
+def test_the_codec_will_not_speak_before_it_has_listened():
+    """A guessed header would route a move nowhere, silently."""
+    with pytest.raises(sender.SendError, match="no game frame observed"):
+        sender.FrameCodec().build(sender.SEND_ROLL, True)
+
+
+def test_the_lobby_is_not_mistaken_for_a_game_room():
+    codec = sender.FrameCodec()
+    codec.observe({"dir": "sent", "header": bytes(b"lobby").hex(),
+                   "payload": {"action": 1, "payload": {}, "sequence": 3}})
+
+    assert not codec.ready
+
+
+def test_each_frame_takes_the_next_sequence_number():
+    """The client has no idea we consumed one, which is worth being able to see."""
+    codec = sender.FrameCodec()
+    codec.observe({"dir": "sent", "header": bytes(b"" + b"02F707").hex(),
+                   "payload": {"action": 6, "payload": True, "sequence": 41}})
+
+    codec.build(sender.SEND_ROLL, True)
+    codec.build(sender.SEND_END_TURN, True)
+
+    assert codec.last_sequence == 43
+    assert [record["sequence"] for record in codec.sent] == [42, 43]

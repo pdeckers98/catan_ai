@@ -6,7 +6,9 @@ reconstruction, replay, the protocol translator, and a live session that follows
 time and says what the agent would play. **Rung 1 of the ladder below has now been run live** --
 one full 1v1 game watched end to end. It found one real translation bug (2:1 ports), which is
 fixed; the captured game now reconstructs all 88 turns and the agent answered 141 positions
-legally. What is left is the action sender, which no amount of reading can settle. Opt-in.
+legally. The **action sender is now built** (`src/bridge/sender.py`): its encoder rebuilds all 188
+in-game client frames of that live game byte for byte, and it puts them on colonist's own socket
+from inside the page. What it has not done is send one. Opt-in.
 
 > ⚠️ **ToS / bans:** Automating play on colonist.io likely violates its Terms of Service and can
 > get accounts banned. Use a **throwaway account**, run supervised, and never automate ranked play
@@ -93,6 +95,17 @@ protocol translator ──► BoardSpec + observed Actions ──► GameReplay 
   `protocol.py` was refactored to make it possible: the state machine that used to live inside
   `decode_capture` is now `MessageDecoder`, fed a message at a time, and `decode_capture` is a
   loop over it. So the offline tests exercise the live path.
+- **`sender.py`** — the write half, and the only part of the bridge that talks *to* colonist.
+  Two pieces on purpose. `FrameCodec` turns a move into the bytes the client would have emitted
+  and is pure, so it can be held to the strictest standard available offline: re-encoded against
+  a real capture, **all 188 in-game frames come out byte-identical**, which is a stronger claim
+  than "it decodes the same" — identical bytes mean the server has nothing to tell our frame from
+  the client's. Nothing about the room is hardcoded: the codec learns the routing header and the
+  `sequence` counter by *watching* the client use them, the same stance the read side takes.
+  `PageSender` is the transport: CDP has no command for writing a websocket frame, so an init
+  script wraps `window.WebSocket` before colonist opens it and exposes a send hook, and we write
+  on **colonist's own authenticated socket** rather than opening a second one.
+  `session.py --allow-send` puts a console on stdin around it and sends **only what you type**.
 - **`player.py`** — `build_bridge_player`, which refuses to build anything less than all three
   artifacts. Every other entry point makes search and the placement models optional flags, which is
   right for benchmarking and wrong for live play.
@@ -177,6 +190,18 @@ gives the table:
 `sequence` increments per action. Codes 47, 53, 64, 66 produced no log entry and look like UI
 chatter (66 mostly carries a null payload); they are not needed to play.
 
+**And the routing header is no longer a mystery.** It is `<kind> <channel> <len> <room>`: byte 0
+is the room kind (2 lobby, 3 game), byte 1 a channel id constant for the room's life, byte 2 the
+name's length, then the room name as ASCII — `"lobby"`, or the game id in play. Across the whole
+live game the in-game header was byte-identical on all 188 frames (`03 01 06 "02F707"`) while the
+lobby used `02 07 05 "lobby"`, which is what "the second byte varies while the room does not" in
+the older note below was actually seeing: different rooms, not different frames.
+
+`sequence` is the one thing a synthesized frame cannot get right by copying. It counts the
+client's actions, and the client has no idea we spent one — so after we send, its next frame
+reuses the number. Whether the server minds is part of what the first live send is for;
+`FrameCodec.sent` records every number we consumed so it can be read back against what happened.
+
 **This removes the hard part.** `docs/` previously scoped pixel/coordinate translation as its own
 mini-project. If the server accepts a synthesized frame — and the client is doing nothing more
 than emitting these — the action sender is a msgpack write, and Playwright's role shrinks to
@@ -208,11 +233,20 @@ hosting the authenticated session. Unproven until we send one.
    Prior art, no longer needed but worth keeping:
    [robottler](https://github.com/meesg/robottler),
    [this writeup](https://medium.com/@alberttheblacksheep/abusing-my-computer-science-knowledge-to-cheat-at-catan-a0f72fa30309).
-2. **Action sender** — the one real unknown left. The client's own frames are legible and could in
-   principle be synthesized, but the server may well require a genuine click, with whatever else the
-   page attaches to it. **Assume nothing here until a frame has actually been sent and accepted.**
-   `protocol.py` deliberately says nothing about sending, so either strategy can be built on it: a
-   msgpack write, or a Playwright click sequence driven by the same corner/edge ids.
+2. **Action sender** — 🚧 built, unproven. `src/bridge/sender.py`. The encoder is done and about as
+   verified as an encoder can be without a server: every in-game frame of the live capture rebuilds
+   byte for byte. The transport is JS injection — an init script wraps `window.WebSocket` before
+   colonist opens it, so a frame goes out on the page's own authenticated socket. That was chosen
+   over the two alternatives: Playwright clicks reintroduce the whole DOM/coordinate problem
+   component 3 was relieved to have avoided, and a second socket of our own would have to
+   re-authenticate, would look like a duplicate session, and is the version most likely to read as
+   a bot.
+
+   **The remaining unknown is not the format, it is acceptance.** The server may require something
+   the click path attaches that we do not. So the first send is deliberately the smallest possible
+   question: `--allow-send` opens a console, the agent stays silent, and a human types one harmless
+   frame (`roll` or `end`) at a moment of their choosing. Until that has been answered, nothing here
+   claims to work, and the click layer stays the fallback rather than being written pre-emptively.
 3. **Coordinate translation** — ✅ solved, and it was never the pixel problem this doc feared.
    Colonist addresses corners and edges as `(hex, z)`; a hex owns its north and south corners and
    its three western edges. Laying both boards on one integer grid and matching positions gives the
@@ -304,7 +338,20 @@ hosting the authenticated session. Unproven until we send one.
    agreement with a human is a weak yardstick in the direction that flatters the agent — most
    positions offer one sensible move, and the disagreements cluster exactly where they should
    (whether to trade, whether to buy a dev card or end the turn).
-2. **Single supervised live game** on a throwaway account, human ready to intervene.
+2. **Single supervised live game** on a throwaway account, human ready to intervene. 🚧 The sender
+   exists; its first question is one hand-typed frame:
+
+   ```bash
+   python -m src.bridge.session --allow-send --vps-to-win 15 --longest-road --max-turns 1500        --simulations 50 --model checkpoints/archive/ppo-15vp-lr-step400000.zip        --placement-model checkpoints/placement/scorer_ppo.pt        --bundle-model    checkpoints/placement/bundle_noroads.pt
+   ```
+
+   Join a 1v1, play normally, and on **your own turn** type `roll` (or `end`) instead of clicking.
+   Three outcomes worth telling apart, and the game log answers all three better than the console
+   does: the move happens (frames work, and the rest of rung 2 is translation); nothing happens
+   (silently dropped — probably `sequence`, or an origin check); or the server drops the
+   connection (it can tell, and the click layer is back on the table). What is *not* yet built, on
+   purpose, is the agent's own action → frame translation — there is no point writing it against a
+   channel that may not exist.
 3. Only then consider unattended runs.
 
 ## What is blocked on captured traffic
@@ -316,8 +363,9 @@ The protocol is undocumented, so nothing colonist-specific can be written withou
 - ✅ **The lobby settings** — they ride on the full-state message and are now checked
   automatically against `src/env/rules.py`.
 - ✅ **Our own client frames** — the live dry run records both directions, so
-  `data/bridge/dryrun-*.jsonl` contains 906 `sent` frames: the entire specification of the action
-  sender, which is the next piece of work.
+  `data/bridge/dryrun-*.jsonl` contains 1237 `sent` frames. They were the entire specification of
+  the action sender, and they have now been spent on it: the routing header is decoded, and
+  `tests/test_bridge.py` re-encodes every in-game frame byte for byte against them.
 - ⬜ **A DOM dump of a live board**, for the click layer — only if frames turn out not to work.
 
 Frames the agent's own moves generate are as valuable as the ones it receives: the `sent`
