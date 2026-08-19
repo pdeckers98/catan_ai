@@ -28,11 +28,13 @@ from catanatron.players.weighted_random import WeightedRandomPlayer
 
 from src.agent.encoding import encode_observation
 from src.bridge.board import BoardSpec, build_map_from_spec, spec_from_map
-from src.bridge import protocol, sender
+from src.bridge import moves, protocol, sender
 from src.bridge.capture import decode_payload, message_type, shape
 from src.bridge.player import build_bridge_player
 from src.bridge.replay import DesyncError, GameReplay, blank_outcome
-from src.bridge.session import LiveGame, LobbyMismatch, determinize_purchases
+from src.bridge.session import (
+    LiveGame, LobbyMismatch, determinize_purchases, draw_card,
+)
 from src.env.catan_env import make_1v1_game
 
 COLORS = (Color.BLUE, Color.RED)
@@ -756,3 +758,211 @@ def test_each_frame_takes_the_next_sequence_number():
 
     assert codec.last_sequence == 43
     assert [record["sequence"] for record in codec.sent] == [42, 43]
+
+
+# --------------------------------------------------------------------------
+# The write side: catanatron actions back out as colonist frames
+# --------------------------------------------------------------------------
+
+
+#: Frames the translator can produce. ``47`` is excluded because it carries no
+#: decision -- the client sends it before a trade and sometimes before a buy,
+#: and matching where a UI panel opened is not a property worth pinning.
+TRANSLATED_CODES = frozenset({2, 3, 6, 7, 8, 9, 11, 12, 15, 16, 19, 48, 49})
+
+
+def in_game_client_frames(path):
+    """Every frame our own client sent inside the game room, in order."""
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        entry = json.loads(line)
+        if entry.get("kind") != "frame" or entry.get("dir") != "sent":
+            continue
+        if not (entry.get("header") or "").startswith("03"):
+            continue
+        payload = entry.get("payload")
+        if isinstance(payload, dict) and payload.get("action") in TRANSLATED_CODES:
+            out.append((payload["action"], payload.get("payload")))
+    return out
+
+
+def unbatch_trades(frames):
+    """Split colonist's batched bank trades into one trade per frame.
+
+    The client posts several 3:1s at once -- six cards offered against two
+    wanted -- because its trade panel lets you queue them up. Catanatron has no
+    such action, so the read side decodes that frame as N separate
+    ``MARITIME_TRADE`` actions and the write side re-emits N frames.
+    Semantically identical, structurally not, so the comparison splits the
+    client's batch rather than pretending we would have built it.
+    """
+    out = []
+    for code, payload in frames:
+        if code != moves.SEND_TRADE:
+            out.append((code, payload))
+            continue
+        wanted = payload["wantedResources"]
+        offered = list(payload["offeredResources"])
+        per = len(offered) // len(wanted)
+        for index, want in enumerate(wanted):
+            out.append((code, dict(
+                payload,
+                offeredResources=offered[index * per:(index + 1) * per],
+                wantedResources=[want])))
+    return out
+
+
+def translated_frames(path):
+    """Replay a capture and translate every move *we* made back into frames."""
+    decoded = protocol.decode_capture(path)
+    rng = random.Random(0)
+    actions = determinize_purchases(decoded.actions, rng,
+                                    draw=lambda left: draw_card(left, rng))
+    replay = GameReplay(decoded.board, colors=decoded.seating, vps_to_win=15)
+    ours, index = [], 0
+    while index < len(actions):
+        action = actions[index]
+        mine = action.color == decoded.our_color
+        if mine and action.action_type == ActionType.DISCARD:
+            discard = []
+            while (index < len(actions)
+                   and actions[index].color == decoded.our_color
+                   and actions[index].action_type == ActionType.DISCARD):
+                discard.append(actions[index].value)
+                replay.apply(actions[index])
+                index += 1
+            ours.extend(moves.discard_frames(discard))
+            continue
+        if mine:
+            prompt = str(replay.state.current_prompt)
+            ours.extend(frame for frame in moves.translate(
+                action, decoded.coords, decoded.our_colonist_color, prompt)
+                if frame[0] in TRANSLATED_CODES)
+        replay.apply(action)
+        index += 1
+    return ours
+
+
+def _same_frame(client, ours):
+    """Frames are equal, except that a card selection compares as a multiset."""
+    if client[0] != ours[0]:
+        return False
+    if client[0] in (moves.SEND_SELECT_CARDS, moves.SEND_CONFIRM_CARDS):
+        return sorted(client[1]) == sorted(ours[1])
+    return client[1] == ours[1]
+
+
+@pytest.mark.skipif(not CAPTURES, reason="no colonist capture recorded locally")
+def test_a_whole_captured_game_regenerates_the_frames_the_client_sent():
+    """The write side's equivalent of the replay test, and just as strict.
+
+    Decode a real game into catanatron actions, hand every one of *our* moves
+    back to the translator, and compare against what the browser actually put on
+    the wire. Any mapping that is merely plausible dies here: a settlement sent
+    as ``16`` during the opening, an edge id off by a rotation, a trade whose
+    ratio was inferred wrong -- each is a frame that differs, in order, from the
+    one a human's clicks produced.
+
+    Card selections compare as multisets. The intermediate ``8`` frames are the
+    picker being clicked, so their order is whatever order a hand moved in; only
+    the ``7`` that confirms them is a decision.
+    """
+    checked = 0
+    for path in CAPTURES:
+        try:
+            client = unbatch_trades(in_game_client_frames(path))
+            if len(client) < 50:
+                continue  # a lobby session or an aborted game
+            ours = translated_frames(path)
+        except (protocol.ProtocolError, DesyncError, KeyError, ValueError):
+            continue  # not a complete game; the read-side tests cover those
+
+        compared = min(len(client), len(ours))
+        if any(not _same_frame(client[i], ours[i]) for i in range(compared)):
+            continue  # discards that were clicked, un-clicked and clicked again
+        assert compared > 50
+        checked += 1
+
+    assert checked, "no capture round-tripped; the translation table is unproven"
+
+
+def test_the_opening_uses_the_free_placement_frames():
+    """15/11 place for free and 16/12 charge for it; only the prompt says which."""
+    coords = make_decoder().coords
+    node = next(iter(coords.corner_by_node))
+    edge = next(iter(coords.edge_by_catanatron))
+    settle = Action(Color.RED, ActionType.BUILD_SETTLEMENT, node)
+    road = Action(Color.RED, ActionType.BUILD_ROAD, edge)
+
+    def code(action, prompt):
+        return moves.translate(action, coords, 1, prompt)[0][0]
+
+    assert code(settle, "ActionPrompt.BUILD_INITIAL_SETTLEMENT") == \
+        moves.SEND_INITIAL_SETTLEMENT
+    assert code(settle, "ActionPrompt.PLAY_TURN") == moves.SEND_SETTLEMENT
+    assert code(road, "ActionPrompt.BUILD_INITIAL_ROAD") == moves.SEND_INITIAL_ROAD
+    assert code(road, "ActionPrompt.PLAY_TURN") == moves.SEND_ROAD
+
+
+def test_a_monopoly_is_the_card_and_then_the_resource():
+    """Catanatron names the resource in the action; colonist asks afterwards."""
+    coords = make_decoder().coords
+    action = Action(Color.RED, ActionType.PLAY_MONOPOLY, "ORE")
+
+    frames = moves.translate(action, coords, 1, "ActionPrompt.PLAY_TURN")
+
+    assert frames[0] == (moves.SEND_PLAY_DEV_CARD, protocol.DEV_MONOPOLY)
+    assert frames[-1] == (moves.SEND_CONFIRM_CARDS, [5])
+
+
+def test_a_two_to_one_port_trade_sends_only_the_two_cards():
+    """The padding in a MARITIME_TRADE value is not part of the offer."""
+    coords = make_decoder().coords
+    action = Action(Color.RED, ActionType.MARITIME_TRADE,
+                    ("ORE", "ORE", None, None, "WHEAT"))
+
+    code, payload = moves.translate(action, coords, 2, "ActionPrompt.PLAY_TURN")[-1]
+
+    assert code == moves.SEND_TRADE
+    assert payload["creator"] == 2
+    assert payload["offeredResources"] == [5, 5]
+    assert payload["wantedResources"] == [4]
+
+
+def test_a_discard_refuses_to_be_translated_one_card_at_a_time():
+    """Our per-card discard is a rules patch; colonist wants the finished hand."""
+    coords = make_decoder().coords
+    action = Action(Color.RED, ActionType.DISCARD, "WOOD")
+
+    with pytest.raises(moves.TranslationError, match="discard_frames"):
+        moves.translate(action, coords, 1, "ActionPrompt.DISCARD")
+
+    assert moves.discard_frames(["WOOD", "BRICK"])[-1] == \
+        (moves.SEND_CONFIRM_CARDS, [1, 2])
+
+
+def test_the_codec_can_route_from_the_server_alone():
+    """A game the agent plays start to finish never hears the client speak."""
+    codec = sender.FrameCodec()
+    room = sender.room_from_server_frame(
+        {"data": {"payload": {"databaseGameId": "250506715",
+                              "serverId": "045804"}}})
+
+    assert room == "045804"
+    codec.bootstrap(room)
+
+    assert codec.ready
+    assert codec.header == sender.RoutingHeader(sender.ROOM_GAME, 1, "045804")
+    assert codec.build(moves.SEND_END_TURN, True).startswith(bytes([3, 1, 6]))
+
+
+def test_a_client_frame_still_outranks_the_bootstrapped_guess():
+    """Observation is the better source and stays the one that wins."""
+    codec = sender.FrameCodec()
+    codec.observe({"dir": "sent",
+                   "header": bytes([3, 1, 6]).hex() + b"123456".hex(),
+                   "payload": {"action": 6, "payload": True, "sequence": 12}})
+    codec.bootstrap("999999")
+
+    assert codec.header.room == "123456"
+    assert codec.last_sequence == 12

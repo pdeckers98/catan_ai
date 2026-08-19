@@ -48,8 +48,11 @@ Usage::
     python -m src.bridge.session --vps-to-win 15 --longest-road --max-turns 1500 \\
         --model ... --placement-model ... --bundle-model ...
 
-⚠️ Use a throwaway account. This module never sends a move, but the session it
-attaches to is the one that later will.
+Add ``--auto-play`` to the live form and the agent sends its own decisions
+instead of only reporting them; everything else about the run is identical.
+
+⚠️ Use a throwaway account. Without ``--auto-play`` this module sends nothing;
+with it, the agent plays a real game against a real person.
 """
 
 import src.env.ruleset as ruleset  # the engine reads the rules at import time
@@ -72,9 +75,9 @@ from typing import Dict, List, Optional
 from catanatron import Color
 from catanatron.models.actions import Action
 from catanatron.models.decks import starting_devcard_bank
-from catanatron.models.enums import ActionType
+from catanatron.models.enums import ActionPrompt, ActionType
 
-from src.bridge import protocol, sender
+from src.bridge import moves, protocol, sender
 from src.bridge.capture import CAPTURE_DIR, PROFILE_DIR, decode_payload
 from src.bridge.player import DEFAULT_SIMULATIONS, build_bridge_player
 from src.bridge.replay import DesyncError, GameReplay
@@ -365,7 +368,20 @@ class LiveGame:
 
 
 class DryRun:
-    """The agent, watching. It decides on every one of our turns and clicks nothing.
+    """The agent, deciding on every one of our turns.
+
+    By default it clicks nothing -- that is rung 1, and it is what the name
+    means. Give it a :class:`~src.bridge.sender.PageSender` through
+    :meth:`arm` and the same decisions go out on colonist's socket instead of
+    only to the console; nothing else about the class changes, which is the
+    point. The board it plays from is the same reconstruction a dry run scores,
+    so a dry run that agrees with a human is the evidence that armed play is
+    worth allowing at all.
+
+    **The safety property is that a broken reconstruction cannot send.**
+    :attr:`broken` already stops the agent being asked; armed, that is also what
+    stops it moving. A stalled game is a bad outcome a human can fix in one
+    click, and a confident move off a fictional board is not.
 
     Args:
         model_path, placement_path, bundle_path, simulations: the three
@@ -395,6 +411,21 @@ class DryRun:
         #: to be wrong, and a confident answer off a wrong board is the one
         #: output worse than no answer.
         self.broken: Optional[Exception] = None
+        #: Set by :meth:`arm`. While ``None`` this is rung 1 and nothing is sent.
+        self.sender = None
+        #: Seconds to wait before putting a decision on the wire. The search
+        #: answers in a fifth of a second and a human does not; a move that
+        #: lands the instant the server finishes speaking is the single loudest
+        #: thing about an agent playing.
+        self.send_delay = 0.0
+        self.sent_moves = 0
+        self._sent_at: Optional[float] = None
+        self._stalled = False
+
+    def arm(self, page_sender, delay: float = 0.0) -> None:
+        """Let the agent play its decisions rather than only report them."""
+        self.sender = page_sender
+        self.send_delay = delay
 
     def _build_player(self, color):
         model_path, placement_path, bundle_path = self._artifacts
@@ -452,17 +483,117 @@ class DryRun:
             return  # same position; the agent has already answered it
         self._asked_at = len(state.actions)
 
+        if state.current_prompt == ActionPrompt.DISCARD:
+            self._decide_discard()
+            return
+
         legal = self.live.replay.playable_actions
         started = time.time()
         action = self.player.decide(self.live.game, legal)
         elapsed = time.time() - started
         self.decisions += 1
         self._pending = action
+        verb = "plays" if self.sender is not None else "would play"
         print(f"turn {state.num_turns} [{state.current_prompt}] "
-              f"agent would play {action}  ({elapsed:.2f}s, {len(legal)} legal)")
+              f"agent {verb} {action}  ({elapsed:.2f}s, {len(legal)} legal)")
         self._record({"kind": "decision", "turn": state.num_turns,
                       "prompt": str(state.current_prompt), "action": str(action),
                       "legal": len(legal), "seconds": round(elapsed, 3)})
+        self._play(action, lambda: moves.translate(
+            action, self.live.decoder.coords,
+            self.live.decoder.our_colonist_color, str(state.current_prompt)))
+
+    def _decide_discard(self) -> None:
+        """Choose a whole discard, then send it as the one frame colonist wants.
+
+        The mismatch is structural rather than incidental. ``src/env/rules.py``
+        made discarding one action per card, because that is the decision the
+        policy has a slot for; colonist's client picks cards in the UI and posts
+        the finished hand. So the agent has to be asked several times before
+        anything can be sent, and the live replay cannot advance in between --
+        it only moves on what the *server* says happened.
+
+        The way out is a private copy of the game. Each pick is applied to the
+        copy so the next question is asked from the right position, and the copy
+        is thrown away; the real replay still learns the discard the ordinary
+        way, from log entry 55. Nothing here is speculative about the opponent,
+        because a discard is a decision about our own hand alone.
+        """
+        game = self.live.game.copy()
+        state = self.live.game.state
+        chosen: List[str] = []
+        started = time.time()
+        while (game.state.current_prompt == ActionPrompt.DISCARD
+               and game.state.current_color() == self.live.our_color):
+            action = self.player.decide(game, game.state.playable_actions)
+            if action.action_type != ActionType.DISCARD:
+                break
+            chosen.append(action.value)
+            game.execute(action)
+        elapsed = time.time() - started
+        self.decisions += 1
+        # Not scored against the human's move: _score compares one action, and
+        # a discard is several. The frame is what matters here.
+        self._pending = None
+        print(f"turn {state.num_turns} [DISCARD] agent discards "
+              f"{', '.join(chosen)}  ({elapsed:.2f}s)")
+        self._record({"kind": "decision", "turn": state.num_turns,
+                      "prompt": "DISCARD", "action": f"DISCARD {chosen}",
+                      "legal": len(self.live.replay.playable_actions),
+                      "seconds": round(elapsed, 3)})
+        self._play(f"DISCARD {chosen}", lambda: moves.discard_frames(chosen))
+
+    def _play(self, action, build) -> None:
+        """Put a decision on colonist's socket, if this run is armed for it.
+
+        ``build`` is a thunk so the translation only runs when it is going to be
+        used -- a dry run should not be able to fail on a frame it was never
+        going to send.
+        """
+        if self.sender is None:
+            return
+        try:
+            frames = build()
+        except moves.TranslationError as exc:
+            self._break(exc)
+            return
+        if self.send_delay:
+            time.sleep(self.send_delay)
+        for code, payload in frames:
+            try:
+                result = self.sender.send(code, payload)
+            except sender.SendError as exc:
+                print(f"  !! could not send action {code}: {exc}", file=sys.stderr)
+                self._record({"kind": "send-failed", "action": code,
+                              "detail": str(exc)})
+                return
+            print(f"  -> sent action {code} {json.dumps(payload, default=str)} "
+                  f"(seq {result.get('sequence')})")
+        self.sent_moves += 1
+        self._sent_at = time.time()
+        self._stalled = False
+        self._record({"kind": "sent", "action": str(action),
+                      "frames": [code for code, _ in frames]})
+
+    def check_stall(self, seconds: float = 30.0) -> None:
+        """Say so, once, when a sent move has gone unanswered.
+
+        Deliberately not a retry. A frame the server ignored and a frame whose
+        answer is merely slow look identical from here, and resending the second
+        one plays the move twice -- which in Catan can mean a settlement in a
+        place the search never evaluated. A human with the window open fixes
+        either case in one click, so the useful thing is to be told.
+        """
+        if self._sent_at is None or self._stalled or not self.live.our_turn():
+            return
+        waited = time.time() - self._sent_at
+        if waited < seconds:
+            return
+        self._stalled = True
+        print(f"\n!! no answer to the last move after {waited:.0f}s, and it is "
+              f"still our turn.\n   Nothing will be resent -- play the move by "
+              f"hand in the browser and the agent picks up again.\n",
+              file=sys.stderr)
 
     def _break(self, exc: Exception) -> None:
         """Stop deciding; the caller keeps recording.
@@ -492,9 +623,10 @@ class DryRun:
                 if self.comparable else "n/a")
         broken = ("" if self.broken is None
                   else f", BROKEN by {type(self.broken).__name__}: {self.broken}")
+        sent = f", {self.sent_moves} moves sent" if self.sender is not None else ""
         return (f"{self.decisions} decisions, {self.comparable} comparable to a move "
                 f"actually played, {rate} agreed on the action type, "
-                f"{self.live.repairs} repairs{broken}")
+                f"{self.live.repairs} repairs{sent}{broken}")
 
 
 # --------------------------------------------------------------------------
@@ -586,7 +718,8 @@ def _run_command(command: str, page_sender: "sender.PageSender") -> None:
 
 
 def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
-             allow_send: bool = False, send_file: Optional[Path] = None) -> None:
+             allow_send: bool = False, send_file: Optional[Path] = None,
+             auto_play: bool = False, send_delay: float = 0.0) -> None:
     """Attach to a browser you drive by hand and follow the game in real time.
 
     The same CDP plumbing :mod:`src.bridge.capture` uses, writing a capture in
@@ -600,12 +733,17 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
     :class:`~src.bridge.sender.FrameCodec` learns this room's routing header and
     sequence counter by watching the client use them.
 
-    ``allow_send`` adds a console and nothing else. **No move is ever sent that
-    you did not ask for**, because the open question at rung 2 is whether the
-    server accepts a synthesized frame at all, and the cheapest way to ask is
-    one harmless frame at a moment of your choosing. Commands arrive on stdin,
-    or -- when the session was started detached and stdin is not a keyboard --
-    by appending a line to ``send_file``.
+    ``allow_send`` adds a console and nothing else: no move goes out that you
+    did not type. That was rung 2's first question -- whether the server accepts
+    a synthesized frame at all -- and it is answered. Commands arrive on stdin,
+    or, when the session was started detached and stdin is not a keyboard, by
+    appending a line to ``send_file``.
+
+    ``auto_play`` is the rung after: the agent sends its own decisions and the
+    game plays itself. The console stays available on top of it, which is the
+    intended way to intervene -- there is no pause button, but there is a
+    browser window you can click in, and a reconstruction that breaks stops the
+    agent dead rather than letting it guess.
     """
     from playwright.sync_api import sync_playwright
 
@@ -648,6 +786,14 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
                     # the routing header and sequence counter off the client.
                     codec.observe(entry)
                     return
+                if not codec.ready:
+                    # A game the agent plays start to finish has no human
+                    # clicking, so the client may never send a frame to copy.
+                    # The server names the room itself when it starts the game.
+                    room = sender.room_from_server_frame(entry.get("payload"))
+                    if room:
+                        codec.bootstrap(room)
+                        print(f"  routing: game room {room!r}")
                 if "colonist" not in sockets.get(event.get("requestId"), ""):
                     return
                 try:
@@ -676,6 +822,10 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
         attach(page)
         page.goto(url)
         page_sender = sender.PageSender(page, codec) if allow_send else None
+        if page_sender is not None and auto_play:
+            dry.arm(page_sender, send_delay)
+            print(f"AUTO-PLAY ARMED: the agent will send its own moves "
+                  f"({send_delay:.1f}s before each). Close the window to stop.")
         if page_sender is not None:
             threading.Thread(target=_console_reader, args=(commands,),
                              daemon=True).start()
@@ -692,6 +842,7 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
                 context.pages[0].wait_for_timeout(500)
                 # Drained here rather than on the reader thread: Playwright's
                 # sync API belongs to the thread that created the browser.
+                dry.check_stall()
                 while page_sender is not None and not commands.empty():
                     command = commands.get()
                     if command:
@@ -731,6 +882,11 @@ def main() -> int:
     parser.add_argument("--send-file", type=Path,
                         help="also read send commands from this file, one per "
                              "line, for when stdin is not a keyboard")
+    parser.add_argument("--auto-play", action="store_true",
+                        help="the agent sends its own moves. Implies "
+                             "--allow-send. Throwaway account, supervised.")
+    parser.add_argument("--send-delay", type=float, default=1.5,
+                        help="seconds to pause before each move (default 1.5)")
     # Declared so --help lists them; they were already read at import time by
     # ruleset.apply_cli_overrides(), which has to run above the engine imports.
     parser.add_argument("--vps-to-win", type=int)
@@ -751,8 +907,9 @@ def main() -> int:
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
             record_to = CAPTURE_DIR / f"dryrun-{stamp}.jsonl"
             print(f"recording to {record_to}")
-        run_live(dry, args.url, args.channel, record_to, args.allow_send,
-                 args.send_file)
+        run_live(dry, args.url, args.channel, record_to,
+                 args.allow_send or args.auto_play, args.send_file,
+                 args.auto_play, args.send_delay)
 
     print(dry.summary())
     return 1 if dry.broken is not None else 0

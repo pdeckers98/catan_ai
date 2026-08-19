@@ -39,6 +39,13 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from src.bridge.moves import (  # noqa: F401  -- re-exported, see the note below
+    PROBE_ACTIONS, SEND_BUY_DEV_CARD, SEND_CITY, SEND_CONFIRM_CARDS,
+    SEND_END_TURN, SEND_INITIAL_ROAD, SEND_INITIAL_SETTLEMENT, SEND_MOVE_ROBBER,
+    SEND_PLAY_DEV_CARD, SEND_ROAD, SEND_ROLL, SEND_SELECT_CARDS,
+    SEND_SETTLEMENT, SEND_TRADE,
+)
+
 try:
     import msgpack
 except ImportError:  # pragma: no cover - exercised by the import guard alone
@@ -46,30 +53,20 @@ except ImportError:  # pragma: no cover - exercised by the import guard alone
 
 
 # --------------------------------------------------------------------------
-# What the client sends. Correlated against the log entries each frame produced,
-# over three captured games; see docs/PHASE3_WEB.md for the derivation.
+# What the client sends lives in src/bridge/moves.py, next to the translation
+# that uses it -- one table, correlated against the log entries each frame
+# produced. Re-exported here so a caller that only wants to put bytes on the
+# wire (the hand console, the probe) need not import the translator.
 # --------------------------------------------------------------------------
-
-SEND_ROLL = 2                 # payload: true
-SEND_END_TURN = 6             # payload: true
-SEND_RESOLVE_CARDS = 7        # payload: [card, ...]   (a discard)
-SEND_RESOLVE_CARD = 8         # payload: [card]        (monopoly / year of plenty)
-SEND_INITIAL_ROAD = 11        # payload: edge id
-SEND_ROAD = 12                # payload: edge id
-SEND_INITIAL_SETTLEMENT = 15  # payload: corner id
-SEND_SETTLEMENT = 16          # payload: corner id
-SEND_CITY = 19                # payload: corner id
-SEND_MOVE_ROBBER = 3          # payload: tile index
-SEND_PLAY_DEV_CARD = 48       # payload: card enum
-SEND_TRADE = 49               # payload: {creator, isBankTrade, ...}
-
-#: Frames that are safe to send as a probe: they either succeed at a moment we
-#: chose or are refused, and neither outcome costs a position.
-PROBE_ACTIONS = {"roll": (SEND_ROLL, True), "end": (SEND_END_TURN, True)}
 
 #: The room kinds seen in a header's first byte.
 ROOM_LOBBY = 2
 ROOM_GAME = 3
+
+#: The channel byte of a game room. Constant across all 148 in-game frames of a
+#: captured game, and the reason :meth:`FrameCodec.bootstrap` can build a header
+#: the client has not yet demonstrated.
+GAME_CHANNEL = 1
 
 
 class SendError(RuntimeError):
@@ -158,9 +155,32 @@ class FrameCodec:
             if self.last_sequence is None or sequence > self.last_sequence:
                 self.last_sequence = sequence
 
+    def bootstrap(self, room: str) -> None:
+        """Route by the room name the *server* announced, having heard no client.
+
+        Learning from the client is the better source and stays the default --
+        it cannot be wrong about a convention we have only inferred. But a game
+        the agent plays start to finish has no human clicking, so the client may
+        never send a frame we could copy, and waiting for one would deadlock on
+        the opening settlement.
+
+        The server names the room itself: the lobby message that starts a game
+        carries ``serverId``, and that string is exactly the room in every
+        captured in-game header. The channel byte was constant, so the header is
+        fully determined. Anything the client later sends still wins -- this
+        only fills a gap.
+        """
+        if self.header is None:
+            self.header = RoutingHeader(ROOM_GAME, GAME_CHANNEL, room)
+        if self.last_sequence is None:
+            # The client's counter is unknown and the server does not enforce it
+            # -- proven live, when ours and the client's both used 21 and both
+            # were accepted. Starting from zero is therefore safe.
+            self.last_sequence = 0
+
     @property
     def ready(self) -> bool:
-        """True once the client has shown us how this game's frames are routed."""
+        """True once we know how this game's frames are routed."""
         return self.header is not None and self.last_sequence is not None
 
     def build(self, action: int, payload: Any) -> bytes:
@@ -175,6 +195,30 @@ class FrameCodec:
         self.sent.append({"action": action, "payload": payload,
                           "sequence": self.last_sequence, "raw": frame.hex()})
         return frame
+
+
+def room_from_server_frame(payload: Any) -> Optional[str]:
+    """The game room's name, dug out of whatever the server just said.
+
+    Colonist announces a new game on the lobby socket with a message carrying
+    ``serverId``, and that string is the room every in-game frame is addressed
+    to. Searched for structurally rather than by message type, because the
+    envelope around it varies and the field does not.
+    """
+    if isinstance(payload, dict):
+        room = payload.get("serverId")
+        if isinstance(room, str) and room:
+            return room
+        for value in payload.values():
+            found = room_from_server_frame(value)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = room_from_server_frame(value)
+            if found is not None:
+                return found
+    return None
 
 
 def frames_round_trip(records: List[dict]) -> List[dict]:

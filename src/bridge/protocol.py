@@ -368,6 +368,8 @@ class DecodedGame:
     seating: Tuple[Color, ...]
     our_color: Color
     actions: List[Action]
+    #: Our seat in colonist's own numbering; the write side needs it.
+    our_colonist_color: Optional[int] = None
 
 
 class _ActionDecoder:
@@ -776,6 +778,10 @@ class MessageDecoder:
         self.coords: Optional[CoordinateMap] = None
         self.seating: Tuple[Color, ...] = ()
         self.our_color: Optional[Color] = None
+        #: Our seat in colonist's own numbering. The write side needs it --
+        #: a trade names its ``creator`` -- and it is the one place the
+        #: colour mapping has to run backwards.
+        self.our_colonist_color: Optional[int] = None
         #: The lobby's own settings, as the full state reported them. This is how
         #: the house rules stop being an assumption: ``victoryPointsToWin`` and
         #: ``cardDiscardLimit`` are on the wire, so they can be checked against
@@ -821,6 +827,7 @@ class MessageDecoder:
         by_colonist = {c: self.colors[i] for i, c in enumerate(order)}
         self.seating = tuple(by_colonist[c] for c in order)
         self.our_color = by_colonist[payload["playerColor"]]
+        self.our_colonist_color = payload["playerColor"]
         self._decoder = _ActionDecoder(self.coords, by_colonist, self.our_color)
         self._decoder.absorb_ratios(state.get("playerStates"))
         self.game_id += 1
@@ -839,7 +846,8 @@ class MessageDecoder:
         actions = reveal_purchases(self.actions) if reveal else list(self.actions)
         return DecodedGame(board=self.board, coords=self.coords,
                            seating=self.seating, our_color=self.our_color,
-                           actions=actions)
+                           actions=actions,
+                           our_colonist_color=self.our_colonist_color)
 
 
 def decode_capture(path: Path, colors=(Color.BLUE, Color.RED),
