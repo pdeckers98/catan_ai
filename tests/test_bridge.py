@@ -966,3 +966,71 @@ def test_a_client_frame_still_outranks_the_bootstrapped_guess():
 
     assert codec.header.room == "123456"
     assert codec.last_sequence == 12
+
+
+def dev_diff(logs, hand=None):
+    """One colonist diff: some log entries, and optionally our new hand."""
+    diff = {"gameLogState": {str(i): {"text": text} for i, text in enumerate(logs)}}
+    if hand is not None:
+        diff["mechanicDevelopmentCardsState"] = {
+            "players": {"1": {"developmentCards": {"cards": list(hand)}}}}
+    return diff
+
+
+def test_our_own_purchases_stay_attributed_after_we_play_a_card():
+    """The bug that threw away three turns of the first game the agent played.
+
+    Our purchases are the one hidden card we are *not* guessing: colonist sends
+    the whole hand in the same diff as the buy, and the new card is whatever the
+    hand gained. That only works if the hand we compare against is current --
+    and it was only ever updated on a purchase, so playing a card left a stale
+    hand behind. Buy a knight, play it, buy another: the second hand (``[11]``)
+    is a subset of the remembered one (``[11]``), nothing looks new, and the
+    purchase decodes as ``None``.
+
+    ``None`` means "the opponent's, unknown", so the determinizer drew a card
+    from the deck -- live, a Year of Plenty we did not own. The agent then tried
+    to play it every turn, the server ignored the frame, and each turn ended
+    with nothing done. No ``DesyncError`` fires, because the server never
+    reports the move we could not make.
+    """
+    decoder = make_decoder()
+
+    decoder.feed(dev_diff([{"type": 1, "playerColor": 1}], hand=[11]))
+    decoder.feed(dev_diff([{"type": 20, "playerColor": 1, "cardEnum": 11}], hand=[]))
+    decoder.feed(dev_diff([{"type": 1, "playerColor": 1}], hand=[11]))
+
+    buys = [a for a in decoder.actions
+            if a.action_type == ActionType.BUY_DEVELOPMENT_CARD]
+    assert [a.value for a in buys] == ["KNIGHT", "KNIGHT"]
+
+
+def test_the_opponent_s_purchases_are_still_honestly_unknown():
+    """The fix must not start inventing knowledge we do not have."""
+    decoder = make_decoder()
+
+    decoder.feed(dev_diff([{"type": 1, "playerColor": 2}], hand=[]))
+
+    buys = [a for a in decoder.actions
+            if a.action_type == ActionType.BUY_DEVELOPMENT_CARD]
+    assert [a.value for a in buys] == [None]
+
+
+@pytest.mark.skipif(not CAPTURES, reason="no colonist capture recorded locally")
+def test_no_capture_leaves_one_of_our_own_purchases_unattributed():
+    """The same claim, against every real game on disk rather than a fixture."""
+    checked = 0
+    for path in CAPTURES:
+        try:
+            decoded = protocol.decode_capture(path)
+        except (protocol.ProtocolError, KeyError, ValueError):
+            continue
+        ours = [a for a in decoded.actions
+                if a.action_type == ActionType.BUY_DEVELOPMENT_CARD
+                and a.color == decoded.our_color]
+        if not ours:
+            continue
+        checked += 1
+        assert [a for a in ours if a.value is None] == [], path.name
+
+    assert checked, "no capture contained a purchase of ours"

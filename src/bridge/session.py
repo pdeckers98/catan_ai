@@ -584,16 +584,15 @@ class DryRun:
         place the search never evaluated. A human with the window open fixes
         either case in one click, so the useful thing is to be told.
         """
-        if self._sent_at is None or self._stalled or not self.live.our_turn():
+        if self._sent_at is None or self._stalled or self._pending is None:
             return
         waited = time.time() - self._sent_at
         if waited < seconds:
             return
         self._stalled = True
-        print(f"\n!! no answer to the last move after {waited:.0f}s, and it is "
-              f"still our turn.\n   Nothing will be resent -- play the move by "
-              f"hand in the browser and the agent picks up again.\n",
-              file=sys.stderr)
+        print(f"\n!! the move we sent {waited:.0f}s ago has not come back from "
+              f"the server.\n   Nothing will be resent -- play it by hand in the "
+              f"browser and the agent picks up again.\n", file=sys.stderr)
 
     def _break(self, exc: Exception) -> None:
         """Stop deciding; the caller keeps recording.

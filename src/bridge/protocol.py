@@ -386,6 +386,9 @@ class _ActionDecoder:
         self.coords = coords
         self.colors = colors
         self.our_color = our_color
+        #: Our seat in colonist's numbering, needed to find our own rows in the
+        #: state colonist keys by colour.
+        self.our_id = next(cid for cid, color in colors.items() if color == our_color)
         self.actions: List[Action] = []
         #: Lowest index the last :meth:`feed` *rewrote* (as opposed to appended).
         #: Only a steal does this, and only to the robber move before it -- but a
@@ -394,6 +397,10 @@ class _ActionDecoder:
         self.revised_from: Optional[int] = None
         self.rolled_this_turn = False
         self.pending_dev_card: Optional[int] = None
+        #: Our development hand as colonist last reported it. Kept in step with
+        #: *every* diff rather than only with a purchase: playing a card removes
+        #: it, and a hand that only ever grows makes the second buy of a card we
+        #: already hold look like no buy at all. See :meth:`absorb_dev_cards`.
         self.our_dev_cards: List[int] = []
         #: Per player, per card enum, how many cards the bank asks for. Colonist
         #: keeps this on the wire (``bankTradeRatiosState``) and it starts at 4
@@ -430,7 +437,32 @@ class _ActionDecoder:
         entries = sorted((diff.get("gameLogState") or {}).items(), key=lambda kv: int(kv[0]))
         for _, entry in entries:
             self._entry((entry or {}).get("text") or {}, diff)
+        # After the entries, so _bought_dev_card still compares against the hand
+        # as it stood before this diff -- which is what identifies the new card.
+        self.absorb_dev_cards(diff.get("mechanicDevelopmentCardsState"))
         return self.revised_from
+
+    def absorb_dev_cards(self, mechanic_state) -> None:
+        """Track our own development hand from the state colonist keeps sending.
+
+        Our purchases are the one piece of hidden information we are *not*
+        guessing: colonist tells us what we drew, as a whole hand, in the same
+        diff as the buy. Reading the new card out of it means knowing what the
+        hand was a moment earlier -- so this runs on every diff that mentions
+        the hand, not only on a purchase.
+
+        **It used to run only on a purchase, and that was a live bug**: playing
+        a card never removed it here, so once we had bought and played a knight,
+        the next knight bought looked like no change at all and decoded as
+        ``None``. ``None`` means "the opponent's, unknown" and gets a card drawn
+        from the deck instead -- which handed the agent a Year of Plenty it did
+        not own, three turns running, each one thrown away when the server
+        ignored the frame.
+        """
+        hand = (((mechanic_state or {}).get("players") or {})
+                .get(str(self.our_id)) or {}).get("developmentCards")
+        if isinstance(hand, dict) and isinstance(hand.get("cards"), list):
+            self.our_dev_cards = [c for c in hand["cards"] if c != DEV_HIDDEN]
 
     def absorb_ratios(self, player_states) -> None:
         """Merge ``bankTradeRatiosState`` out of a full state or a diff.
@@ -830,6 +862,8 @@ class MessageDecoder:
         self.our_colonist_color = payload["playerColor"]
         self._decoder = _ActionDecoder(self.coords, by_colonist, self.our_color)
         self._decoder.absorb_ratios(state.get("playerStates"))
+        self._decoder.absorb_dev_cards(
+            state.get("mechanicDevelopmentCardsState"))
         self.game_id += 1
 
     def decoded(self, reveal: bool = False) -> "DecodedGame":
