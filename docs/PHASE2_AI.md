@@ -109,9 +109,32 @@ python -m src.agent.train --vps-to-win 15 --longest-road --max-turns 1500 --gamm
 ### `src/agent/mcts.py` — PUCT search
 
 - **Stochastic transitions are sampled, not enumerated.** Each edge holds a dict of children keyed
-  by the *realized* outcome (`_outcome_key`: dice sum, dev card drawn, resource stolen) and lets the
-  engine's RNG sample it. Repeated visits land on children in proportion to true probabilities,
-  giving an unbiased expectation without an 11-way fan-out per roll.
+  by the *realized* outcome (`_outcome_key`: dice sum, dev card drawn, resource stolen). Repeated
+  visits land on children in proportion to true probabilities, giving an unbiased expectation
+  without a full fan-out per roll.
+- **Dead rolls are pooled into one chance outcome.** A dice sum is *live* if either player has a
+  building on a tile carrying that number which the robber is not on; 7 is always live. Everything
+  else pays nobody, and catanatron's non-7 roll branch does nothing but pay production and set the
+  prompt — so two dead sums leave byte-identical successor states, which
+  `test_pooled_dead_rolls_leave_identical_positions` pins down. The search therefore samples the roll itself from a
+  compressed table — one entry per live sum at its true 1/36-table probability, plus a single
+  pooled entry carrying all the dead mass — and forces the dice via `Action(color, ROLL, (d1, d2))`,
+  which the engine honours (`state.py`: `dices = action.value or roll_dice()`). **The distribution
+  over successor states is unchanged, so the estimator stays exactly unbiased**; what changes is
+  that identical positions stop scattering across up to ten children that each cost a network call
+  and each get one visit.
+  Measured over 1063 mid-game roll positions, **7.0 of 11 sums are live**, so a roll edge branches
+  ~8 ways instead of 11. The effect is modest and shows up as depth, not node count (an MCTS
+  simulation always creates exactly one node): at 200 sims mean tree depth goes 3.85 → 4.16 and max
+  depth 4.83 → 5.83; at 50 sims, 2.79 → 2.97. Biggest early, when few numbers are built on, and
+  whenever the robber blanks a number.
+- **`horizon` caps the search in game turns.** Off by default — depth is normally a budget, not a
+  horizon, and every measurement on record was taken without it. Set it and a position that many
+  turns past the root is scored by the value head instead of expanded (`_beyond_horizon`, applied in
+  `_expand` where the leaf value is already in hand), trading depth for breadth near the root. Turns
+  count the way `max_turns` counts them, so in 1v1 `horizon=1` reaches the end of the opponent's
+  reply and `horizon=2` the end of your next turn. Exposed as `--horizon` / `--opponent-horizon` on
+  `src.eval.benchmark` and `--horizon` on `src.eval.play`.
 - **Non-alternating perspective.** A Catan turn is many consecutive decisions by one player. Each
   node records who is to move; values negate on backup whenever perspective flips.
 - **Forced moves are free** — single-legal-action plies are played without search.
@@ -322,7 +345,7 @@ Run it on any agent spec `benchmark` accepts:
 python -m src.eval.waste --vps-to-win 15 --longest-road --max-turns 1500     --agent ppo --model checkpoints/archive/ppo-15vp-lr-step400000.zip     --placement-model checkpoints/placement/scorer_ppo.pt     --bundle-model    checkpoints/placement/bundle_noroads.pt --games 30
 ```
 
-### Potential-based shaping (`--shaping-weight`) — built, never run
+### Potential-based shaping (`--shaping-weight`) — run on 2026-08-21, and it lost
 
 `PotentialShapingWrapper` adds `F(s, s') = γΦ(s') − Φ(s)` with
 `Φ(s) = w·(my actual VP − their visible VP)`. This is the Ng/Harada/Russell form: over an episode
@@ -334,10 +357,6 @@ This is *not* the deleted `RewardShapingWrapper` returning. That one paid one-ti
 crossing VP milestones, which do not telescope and genuinely could move the optimum; that is why
 it was a crutch and why it is still not coming back.
 
-It does not punish the wasteful trade — a trade moves no victory point, so it earns exactly what
-it earned before. It pays for the **city**, immediately, so building wins the local comparison
-that 600 decisions of credit assignment currently erase.
-
 Two deliberate choices, both tested in `tests/test_shaping.py`:
 
 - **The opponent contributes their *visible* VP**, ours our actual. Scoring their actual would
@@ -347,13 +366,80 @@ Two deliberate choices, both tested in `tests/test_shaping.py`:
   standing there would let a policy bank shaping for a lead it never converted, which is the one
   way this wrapper could stop being policy-invariant.
 
+**The run.** From a random init at `--shaping-weight 0.05`, 15 VP + Longest Road, 1500-turn cap,
+`--gamma 0.999 --lookahead --opponent pool`, evaluated every 300k steps. Stopped by hand at
+**1.8M of 3M** once the picture stopped changing (`checkpoints/ppo-15vp-shaped/`, W&B run
+`c9hanngt`). It did exactly what it was designed to do, and it did not help.
+
+**It fixed the trade waste.** `src/eval/waste.py`, mirror games, against the
+`ppo-15vp-lr-step400000` baseline in the section above:
+
+| | archive | 600k | 900k | 1.2M | 1.5M | 1.8M (40 games) |
+| --- | --- | --- | --- | --- | --- | --- |
+| trades/game | 56 | 35 | 35 | 71 | 28 | **31** |
+| % of turns trading | 36% | 29% | 31% | 40% | 27% | **30%** |
+| bought nothing that turn | 77% | 66% | 63% | 81% | 60% | **60%** |
+| made while already affordable | 68% | 53% | 55% | 75% | 52% | **55%** |
+| same-turn giveaway | 42% | 22% | 19% | 38% | 20% | **20%** |
+| cards to the bank/game | 136 | 91 | 85 | 157 | 74 | **80** |
+| dev bought one short of a city | 32% | 29% | 29% | 32% | 39% | **32%** |
+
+Cards to the bank fell **136 → 80**, a 41% cut, stable across four evals. The mechanism is the
+stated one: a trade moves no victory point so it earns what it always earned, while a city now
+pays immediately, and building wins the local comparison that 600 decisions of credit assignment
+erase. What did *not* change is the character of the decision — 55% of trades are still made with
+something already affordable, 60% still buy nothing, and `dev bought one card short of a city`
+returned to the archive's exact 32%. Shaping cut the volume of waste, not the judgement.
+
+**The 1.2M column is a 20-game sampling artefact, not a regression.** It was read as one at the
+time and it was wrong to do so. Audits at 20 games swing by 2x on these rates; the per-eval audit
+went to 40 games from 1.8M on. **Budget 40+ games for a waste audit** — the same discipline the
+head-to-heads already have.
+
+**It did not expand.** Settlements per game fell monotonically, 2.9 → 2.7 → 2.5 → 2.4, then held
+at ~2.5 for the rest of the run while cities sat at 2.8 and dev buys at ~15. Games got 28% shorter
+over the same span (230 → 166 turns). **Speed and expansion moved in opposite directions**: the
+fast line is the dev-card/city line that needs no brick and no roads. Anything proposed on the
+theory that quicker wins imply more building has to answer this table first.
+
+**And the score went nowhere.** Against `ppo-15vp-lr-step400000`, both sides with the placement
+models:
+
+| comparison | score | note |
+| --- | --- | --- |
+| bare policy, 800 games | **50.3%** (397W-392L-11D) | ±1.8%; rules out any edge above ~4 points |
+| **50-sim search both sides, 200 games** | **42.2%** (83W-114L-3D) | ±3.5% |
+
+Note the reference is *handicapped*: `ppo-15vp-lr-step400000` trained under the pre-2026-08-19
+friendly-robber rule and before the Road Building fix, so it plays these games under rules it
+never saw. A tie against it is uninformative; **losing to it is the signal.**
+
+**Why search makes it worse — the part worth remembering.** Potential shaping leaves the optimal
+policy alone but it does *not* leave the value function alone: the critic of the shaped MDP learns
+`V(s) − Φ(s)`. That is harmless to PPO, which only ever forms advantages inside the shaped MDP.
+It is not harmless to MCTS, which takes that same value head as a leaf evaluator and runs it over
+the **unshaped** game — `mcts.py` searches raw `Game` objects and never adds `Φ` back along the
+path. Every leaf is therefore scored with a systematic `−w·(VP lead)` bias, marking down exactly
+the positions the agent should be steering toward, and more simulations apply the bias more
+thoroughly. This predicts the observed pattern — neutral bare, harmful under search — and matches
+the 1.5 VP deficit in the final margin (11.2 vs 12.7). It is a hypothesis with one confirming
+experiment, not a proven cause; the cheap test is to add `Φ` at the leaf and re-run the 200 games.
+
+So the finding is stronger than "shaping bought nothing": **shaping is incompatible with the
+deployed configuration**, which is always search plus the policy, never the policy alone.
+
+**Two lessons that outlive this experiment:**
+
+1. **Measure reward changes with search on.** The bare number said "no effect, harmless" and that
+   was wrong by 8 points. Any reward change alters the critic, and the critic is what search runs on.
+2. **A behavioural metric improving is not evidence of strength.** The waste audit measured
+   something real, moved it 41% in the intended direction, and converted to nothing. It stays
+   useful as a diagnosis of *what* a policy does; it is not a substitute for a head-to-head.
+
 `--pool-search-frac` is the other half of the same idea from the opponent side: a slice of the
 pool played with search on top, since search is worth ~+9.8 points and there is no scripted bot
 above `VictoryPointPlayer` to reach for instead. It is off by default because every simulation is
-a forward pass on the rollout workers' own cores.
-
-**Neither has been run.** When one is, the check is `src/eval/waste.py` and games against
-`VictoryPointPlayer` — **not** a mirror benchmark, which is constitutionally unable to answer.
+a forward pass on the rollout workers' own cores. **It has still not been run.**
 
 ### Reproducibility
 
@@ -453,6 +539,13 @@ which is why the whole dataset/train pipeline is kept.
   costs ~40% throughput for nothing.
 - **`feas01` / `feas02` checkpoints** never converged. A null result measured against them is
   uninformative, not evidence.
+- **Potential-based reward shaping (`--shaping-weight 0.05`).** Run from scratch on 2026-08-21 and
+  stopped at 1.8M steps. It cut cards-paid-to-the-bank 136 → 80 exactly as designed, and scored
+  **50.3%** over 800 bare games and **42.2%** over 200 games with 50-sim search against
+  `ppo-15vp-lr-step400000` — a reference handicapped by the old friendly-robber rule. The waste it
+  removed was real and worth nothing; the search result is worse than nothing, most likely because
+  the shaped critic learns `V − Φ` while `mcts.py` evaluates leaves in the unshaped game. Full
+  write-up in the shaping section above. `checkpoints/ppo-15vp-shaped/best.zip` is kept as evidence.
 
 ## Setup and cloud
 

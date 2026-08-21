@@ -70,25 +70,30 @@ the agent and, later, the web integration.
   removed, so **games are now the only check on a refit** — budget 800+ of them.
   Opening *roads* are deliberately unmodelled: a bundle over (settlement, road) × 2 scored 44.1%
   over 1200 games and was cut. The road replay in data generation stays; it is a correct control.
-- **Reward shaping**: off by default — every archived checkpoint trained on the bare
-  win/loss outcome. The old `RewardShapingWrapper` (one-time bonuses for crossing VP
+- **Reward shaping**: off by default, and **keep it off** — every archived checkpoint trained on
+  the bare win/loss outcome. The old `RewardShapingWrapper` (one-time bonuses for crossing VP
   milestones) is gone for good; `EpisodeStatsWrapper` keeps its telemetry without touching
-  the reward. What exists now is a different object: `--shaping-weight` installs
-  `PotentialShapingWrapper`, `F = γΦ(s′) − Φ(s)` with `Φ = w·(my actual VP − their visible
-  VP)`. That form telescopes to `−Φ(s₀)`, so it **cannot move the optimal policy** — verified
-  on real games, four policies on one board seed all add exactly the same constant. Milestone
-  bonuses did not telescope, which is the whole difference. **Untested in a run.**
-- **The agent burns its hand.** Measured 2026-08-19 over 30 self-play games at 15 VP
-  (`python -m src.eval.waste`): it trades on **36%** of its turns, **68%** of those while it
-  could already afford something, **42%** give away a resource it acquired the same turn, and
-  **136 cards a game** go to the bank. `VictoryPointPlayer` does those at 20/40/24% and 126.
-  It also buys a development card while one card short of a city 32% of the time (the bot: 17%).
-  **A win rate cannot see any of this** — both sides of a mirror burn cards, so burning them
-  scores 50%. Same blindness that hid the refusal to expand. Why training allows it: at 15 VP
-  one bit of terminal reward is spread over ~600 decisions, so three cards thrown away move the
-  return by far less than the noise in the advantage estimate. **The wasteful trade is free in
-  the loss.** That is what `--shaping-weight` is aimed at: it does not punish the trade, it pays
-  for the city immediately so building wins the local comparison.
+  the reward. `--shaping-weight` installs a different object, `PotentialShapingWrapper`,
+  `F = γΦ(s′) − Φ(s)` with `Φ = w·(my actual VP − their visible VP)`. That form telescopes to
+  `−Φ(s₀)`, so it **cannot move the optimal policy**. **Run at 0.05 on 2026-08-21 and it lost.**
+  It cut cards-to-the-bank 136 → 80 as designed, then scored **50.3%** over 800 bare games and
+  **42.2%** over 200 games with 50-sim search against `ppo-15vp-lr-step400000`. Policy-invariance
+  is not value-invariance: the shaped critic learns `V − Φ`, and `mcts.py` evaluates leaves in the
+  **unshaped** game, so every leaf carries a `−w·(VP lead)` bias. **Any future reward change must
+  be benchmarked with search on** — the bare number said "harmless" and was wrong by 8 points.
+  Full write-up in `PHASE2_AI.md`.
+- **The agent burns its hand — and fixing it does not help.** Measured 2026-08-19 over 30
+  self-play games at 15 VP (`python -m src.eval.waste`): it trades on **36%** of its turns,
+  **68%** of those while it could already afford something, **42%** give away a resource it
+  acquired the same turn, and **136 cards a game** go to the bank. `VictoryPointPlayer` does those
+  at 20/40/24% and 126. It also buys a development card while one card short of a city 32% of the
+  time (the bot: 17%). **A win rate cannot see any of this** — both sides of a mirror burn cards,
+  so burning them scores 50%. Why training allows it: at 15 VP one bit of terminal reward is
+  spread over ~600 decisions, so three cards thrown away move the return by far less than the
+  noise in the advantage estimate — **the wasteful trade is free in the loss.** The shaping run
+  above then cut the waste 41% and converted it into **nothing**, so treat this audit as a
+  description of *what* a policy does, never as a proxy for strength. Budget **40+ games**: at 20
+  games these rates swing by 2x.
 - **There is no bot above `VictoryPointPlayer`.** This build of catanatron ships only
   `RandomPlayer`, `WeightedRandomPlayer` and `VictoryPointPlayer`; `arena.py`'s `value` spec
   *is* `VictoryPointPlayer`, which the pool already runs as its `greedy` slice. So "train
@@ -117,6 +122,8 @@ src/
 │   ├── encoding.py      # obs vector + action mask off a live Game
 │   ├── evaluator.py     # leaf evaluators: PPO adapter, uniform control
 │   ├── mcts.py          # PUCT search with chance nodes; MCTSPlayer  <-- the +10 points
+│   │                    #   rolls sampled from a compressed table: live sums + one
+│   │                    #   pooled dead outcome. `horizon` caps depth in turns (off).
 │   ├── train.py         # MaskablePPO loop  <-- the only trainer
 │   ├── trunk.py         # shared policy/value trunk; REQUIRED to load the shipped model
 │   ├── arena.py         # head-to-head match play + agent-by-name registry
@@ -216,6 +223,15 @@ python -m src.eval.benchmark --vps-to-win 15 --longest-road --max-turns 1500 \
     --opponent-bundle-model    checkpoints/placement/bundle_noroads.pt
 ```
 
+**Search results changed again on 2026-08-21.** `mcts.py` now samples the dice itself from a
+compressed distribution -- one entry per *live* sum (a number some player is built on and the
+robber is not blocking), plus one pooled entry holding every dead sum's probability, since dead
+sums leave identical successor states. The distribution over successor states is unchanged and the
+estimator is still exactly unbiased, but the search's random stream diverges from the engine's, so
+**a seed no longer replays a pre-change search**. Statistics recorded before it stand; the games do
+not. Same commit added `--horizon`, an optional cap on how many game turns past the root the tree
+may reach; it is off by default and nothing measured has used it.
+
 **Any search measurement recorded before `c54ea46` is void.** MCTS built 614-value
 observations and handed them to nets expecting 642, so `ppo-mcts` crashed against every
 checkpoint trained with `--lookahead`. The older "80% → 95% vs weighted-random" and the
@@ -255,6 +271,7 @@ else). **None of these can place their own opening** — see the Caveats below.
 | `ppo-15vp-lr-step400000.zip` | 15 VP, LR | **current agent.** Fine-tuned from the 12 VP trunk model; run it with `--agent ppo-mcts --simulations 50` |
 | `ppo-12vp-trunk-step2000000.zip` | 12 VP, LR | shared trunk, 932k params; its parent |
 | `ppo-12vp-lr-step1800000.zip` | 12 VP, LR | two-tower `[256,256]`, 537k params; a statistical tie with the trunk model |
+| `ppo-15vp-shaped-step1800000.zip` | 15 VP, LR | **evidence, not a candidate.** The `--shaping-weight 0.05` run; 50.3% bare / 42.2% with search vs the 400k model |
 
 The first two are **trunk models**: their `policy_kwargs` names `src.agent.trunk.SharedTrunk` by
 module path, so `src/agent/trunk.py` cannot be moved or deleted without breaking them.
