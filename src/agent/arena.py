@@ -346,6 +346,7 @@ class AgentSpec:
     kind: str
     model_path: str = None
     simulations: int = 100
+    horizon: int = None
     batch_size: int = 1
     placement_path: str = None
     bundle_path: str = None
@@ -357,6 +358,7 @@ def build_agent_from_spec(spec: AgentSpec):
     return build_agent(
         spec.kind, spec.model_path, spec.simulations, spec.batch_size,
         spec.placement_path, spec.bundle_path, spec.partner_rank,
+        horizon=spec.horizon,
     )
 
 
@@ -376,7 +378,7 @@ def _as_factory(agent):
 
 def build_agent(spec: str, model_path=None, simulations: int = 100,
                 batch_size: int = 1, placement_path=None, bundle_path=None,
-                partner_rank: int = PARTNER_RANK):
+                partner_rank: int = PARTNER_RANK, horizon: int = None):
     """Build an agent factory from a short name.
 
     Specs:
@@ -393,6 +395,8 @@ def build_agent(spec: str, model_path=None, simulations: int = 100,
         model_path: checkpoint path, required for the network-backed specs.
         simulations: playouts per decision for search-backed specs.
         batch_size: leaves per evaluator call; see :class:`~src.agent.mcts.MCTS`.
+        horizon: cap the search at this many game turns past the root; ``None``
+            lets the simulation budget set the depth. Search-backed specs only.
         placement_path: optional PlacementNet checkpoint. Any agent above can be
             given one; it then takes over the opening settlements and nothing
             else, so the same spec with and without it isolates the opening.
@@ -408,12 +412,13 @@ def build_agent(spec: str, model_path=None, simulations: int = 100,
         callable(Color) -> Player.
     """
     return _with_placement(
-        _build_core_agent(spec, model_path, simulations, batch_size),
+        _build_core_agent(spec, model_path, simulations, batch_size, horizon),
         placement_path, bundle_path, partner_rank,
     )
 
 
-def _build_core_agent(spec: str, model_path, simulations: int, batch_size: int):
+def _build_core_agent(spec: str, model_path, simulations: int, batch_size: int,
+                      horizon: int = None):
     if spec in BASELINE_BOTS:
         bot = BASELINE_BOTS[spec]
         return lambda color: bot(color)
@@ -422,7 +427,7 @@ def _build_core_agent(spec: str, model_path, simulations: int, batch_size: int):
         evaluator = UniformEvaluator()
         return lambda color: MCTSPlayer(
             color, evaluator, simulations=simulations, dirichlet_epsilon=0.0,
-            batch_size=batch_size,
+            batch_size=batch_size, horizon=horizon,
         )
 
     if spec in ("ppo", "ppo-mcts"):
@@ -438,7 +443,7 @@ def _build_core_agent(spec: str, model_path, simulations: int, batch_size: int):
         evaluator = PPOEvaluator.from_path(model_path)
         return lambda color: MCTSPlayer(
             color, evaluator, simulations=simulations, dirichlet_epsilon=0.0,
-            batch_size=batch_size,
+            batch_size=batch_size, horizon=horizon,
         )
 
     raise ValueError(f"Unknown agent spec: {spec}")

@@ -133,6 +133,31 @@ def _affordable(hands: np.ndarray) -> np.ndarray:
     return (hands[..., None, :] >= COSTS).all(axis=-1).astype(np.float64)
 
 
+def live_dice_sums(game) -> np.ndarray:
+    """(11,) bool over :data:`DICE_SUMS`: which rolls actually change anything.
+
+    A sum is live if *either* player has a building adjacent to a tile carrying
+    that number which the robber is not sitting on. Not just ours -- a 3 that
+    pays the opponent two ore is not a dead roll. And the robber matters: if the
+    only 3-tile is blocked, 3 is dead this turn and live again next turn, so this
+    has to be recomputed per position rather than once per game.
+
+    7 is always live. It forces discards and moves the robber whatever the board
+    looks like.
+
+    Every other sum is dead, and dead sums are *interchangeable*: catanatron's
+    non-7 roll branch pays production out and sets the prompt, nothing else, so
+    two dead sums leave byte-identical successor states. Only the action log
+    tells them apart, and nothing here reads it. That is what lets
+    :mod:`src.agent.mcts` collapse them into a single chance outcome.
+    """
+    produced = np.zeros(len(DICE_SUMS), dtype=bool)
+    for color in game.state.colors:
+        produced |= _production_by_sum(game, color).any(axis=1)
+    produced[SEVEN] = True
+    return produced
+
+
 def lookahead_features(game, color) -> np.ndarray:
     """Two-roll projection for ``color``. Returns float32 of ``LOOKAHEAD_SIZE``.
 

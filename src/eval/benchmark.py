@@ -51,6 +51,15 @@ def main():
                         help="Playouts per decision for search-backed specs.")
     parser.add_argument("--opponent-simulations", type=int, default=None,
                         help="Defaults to --simulations.")
+    parser.add_argument("--horizon", type=int, default=None,
+                        help="Cap the search at this many game turns past "
+                             "the current position; positions beyond it "
+                             "are scored by the value head instead of "
+                             "expanded. Default searches as deep as the "
+                             "simulation budget reaches.")
+    parser.add_argument("--opponent-horizon", type=int, default=None,
+                        help="Same, for the opponent. Independent of "
+                             "--horizon, so the two can be compared directly.")
     parser.add_argument("--vps-to-win", type=int, default=ruleset.VPS_TO_WIN,
                         help="Victory points to win. Must match the ruleset the "
                              "checkpoints were trained under to mean anything.")
@@ -93,7 +102,8 @@ def main():
 
     challenger = AgentSpec(
         kind=args.agent, model_path=args.model,
-        simulations=args.simulations, batch_size=args.batch_size,
+        simulations=args.simulations, horizon=args.horizon,
+        batch_size=args.batch_size,
         placement_path=args.placement_model,
         bundle_path=args.bundle_model,
         partner_rank=args.partner_rank,
@@ -101,14 +111,26 @@ def main():
     opponent = AgentSpec(
         kind=args.opponent, model_path=args.opponent_model,
         simulations=args.opponent_simulations or args.simulations,
+        horizon=args.opponent_horizon,
         batch_size=args.batch_size,
         placement_path=args.opponent_placement_model,
         bundle_path=args.opponent_bundle_model,
         partner_rank=args.opponent_partner_rank,
     )
 
+    # Only the search specs consult --simulations; printing it unconditionally
+    # made a bare policy-vs-policy match read as though search had been on.
+    searching = [
+        f"{args.simulations} sims" if "mcts" in args.agent else None,
+        f"{args.opponent_simulations or args.simulations} sims"
+        if "mcts" in args.opponent else None,
+    ]
+    if any(searching):
+        sims = " vs ".join(s or "no search" for s in searching)
+    else:
+        sims = "no search"
     print(f"{args.agent} vs {args.opponent} over {args.games} games "
-          f"({args.simulations} sims/move, {args.workers or 1} workers)...",
+          f"({sims}, {args.workers or 1} workers)...",
           flush=True)
     result = play_match(
         challenger, opponent, args.games, seed=args.seed,

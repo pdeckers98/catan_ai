@@ -197,3 +197,188 @@ def test_an_evaluator_that_does_not_want_lookahead_still_gets_the_base_width():
     evaluator = UniformEvaluator()
     assert not getattr(evaluator, "wants_lookahead", False)
     assert MCTS(evaluator, simulations=2)._lookahead is False
+
+
+# --------------------------------------------------------------------------
+# Compressed roll outcomes
+# --------------------------------------------------------------------------
+def test_dead_dice_sums_share_one_chance_key():
+    """Every sum that pays nobody must collapse into a single pooled outcome.
+
+    This is the whole point of the compression: without it a board with five
+    unproductive numbers scatters five identical positions across five children,
+    each costing its own network call and each left with one visit.
+    """
+    from src.agent.mcts import DEAD_ROLL, _roll_distribution
+    from src.env.lookahead import DICE_PROBS, DICE_SUMS, live_dice_sums
+
+    game = make_1v1_game(seed=7)
+    live = live_dice_sums(game)
+    keys, pairs, probs = _roll_distribution(game)
+
+    live_sums = [total for index, total in enumerate(DICE_SUMS) if live[index]]
+    assert keys[:len(live_sums)] == live_sums
+    assert keys.count(DEAD_ROLL) == (0 if live.all() else 1)
+    assert len(keys) == len(live_sums) + (0 if live.all() else 1)
+
+    # Probabilities come off the fixed table, and the pooled entry carries
+    # exactly the mass of the sums it stands for.
+    for index, total in enumerate(live_sums):
+        assert np.isclose(probs[index], DICE_PROBS[DICE_SUMS.index(total)])
+    if not live.all():
+        assert np.isclose(probs[-1], DICE_PROBS[~live].sum())
+    assert np.isclose(probs.sum(), 1.0)
+
+    # Every pair must actually roll the sum it claims, and be a real pair of dice.
+    for key, pair in zip(keys, pairs):
+        assert 1 <= pair[0] <= 6 and 1 <= pair[1] <= 6
+        if key != DEAD_ROLL:
+            assert pair[0] + pair[1] == key
+
+
+def test_seven_is_live_even_when_no_tile_pays():
+    """A 7 discards and moves the robber; it is never poolable."""
+    from src.agent.mcts import _roll_distribution
+
+    game = make_1v1_game(seed=3)
+    keys, _, _ = _roll_distribution(game)
+    assert 7 in keys
+
+
+def test_pooled_dead_rolls_leave_identical_positions():
+    """The merge is exact, not an approximation.
+
+    Two different dead sums must produce the same successor state, or pooling
+    them silently averages over positions that are not the same.
+    """
+    from catanatron.models.enums import Action, ActionType
+
+    from src.agent.encoding import encode_observation
+    from src.env.lookahead import DICE_SUMS, live_dice_sums
+
+    game = make_1v1_game(seed=11)
+    while game.state.playable_actions[0].action_type != ActionType.ROLL:
+        game.execute(game.state.playable_actions[0], validate_action=False)
+
+    dead = [DICE_SUMS[i] for i, alive in enumerate(live_dice_sums(game))
+            if not alive]
+    assert len(dead) >= 2, "seed does not produce a board with two dead numbers"
+
+    color = game.state.current_color()
+    observations = []
+    for total in dead:
+        copy = game.copy()
+        pair = (min(6, total - 1), total - min(6, total - 1))
+        copy.execute(Action(color, ActionType.ROLL, pair), validate_action=False)
+        observations.append(encode_observation(copy, color))
+    for other in observations[1:]:
+        assert np.array_equal(observations[0], other)
+
+
+def test_roll_edges_never_branch_wider_than_the_live_set():
+    """Walk a real tree: no ROLL edge may hold a key outside its live set."""
+    from catanatron.models.enums import ActionType
+
+    from src.agent.mcts import DEAD_ROLL
+    from src.env.lookahead import DICE_SUMS, live_dice_sums
+
+    game = make_1v1_game(seed=5)
+    mcts = MCTS(NoisyEvaluator(), simulations=120)
+    mcts._root_turns = game.state.num_turns
+    root = mcts._make_node(game.copy())
+    rng = np.random.default_rng(0)
+    for _ in range(120):
+        mcts._simulate(root, rng)
+
+    roll_edges = 0
+
+    def walk(node):
+        nonlocal roll_edges
+        if node.is_terminal:
+            return
+        live = None
+        for index, action in enumerate(node.actions):
+            children = node.children[index]
+            if action.action_type == ActionType.ROLL:
+                if live is None:
+                    live = live_dice_sums(node.game)
+                allowed = {total for total, ok in zip(DICE_SUMS, live) if ok}
+                allowed.add(DEAD_ROLL)
+                assert set(children) <= allowed
+                roll_edges += 1
+            for child in children.values():
+                walk(child)
+
+    walk(root)
+    assert roll_edges > 0, "no ROLL edge was searched"
+
+
+def test_sampled_rolls_keep_the_true_marginal_distribution():
+    """Compression must not change the odds -- only which children share a node."""
+    from src.agent.mcts import DEAD_ROLL, _roll_distribution
+    from src.env.lookahead import DICE_PROBS, DICE_SUMS, live_dice_sums
+
+    game = make_1v1_game(seed=9)
+    live = live_dice_sums(game)
+    keys, _, probs = _roll_distribution(game)
+
+    # Unpooled marginal per live sum is unchanged; pooled mass equals the rest.
+    recovered = np.zeros(len(DICE_SUMS))
+    for key, prob in zip(keys, probs):
+        if key == DEAD_ROLL:
+            recovered[~live] = DICE_PROBS[~live]
+        else:
+            recovered[DICE_SUMS.index(key)] = prob
+    assert np.allclose(recovered, DICE_PROBS)
+
+
+# --------------------------------------------------------------------------
+# Search horizon
+# --------------------------------------------------------------------------
+def test_horizon_stops_the_tree_at_the_requested_turn():
+    game = make_1v1_game(seed=6)
+    root_turns = game.state.num_turns
+
+    mcts = MCTS(NoisyEvaluator(), simulations=150, horizon=1)
+    mcts._root_turns = root_turns
+    root = mcts._make_node(game.copy())
+    for _ in range(150):
+        mcts._simulate(root, np.random.default_rng(2))
+
+    depth_seen = []
+
+    def walk(node):
+        depth_seen.append(node.game.state.num_turns - root_turns)
+        assert node.game.state.num_turns - root_turns <= 1
+        if node.is_terminal:
+            return
+        for children in node.children:
+            for child in children.values():
+                walk(child)
+
+    walk(root)
+    assert max(depth_seen) >= 1, "horizon=1 should still reach the next turn"
+
+
+def test_horizon_none_is_the_default_and_searches_deeper():
+    unlimited = MCTS(NoisyEvaluator(), simulations=64)
+    assert unlimited.horizon is None
+
+    game = make_1v1_game(seed=6)
+    result = MCTS(NoisyEvaluator(), simulations=64, horizon=2).search(
+        game, rng=np.random.default_rng(0)
+    )
+    assert result.visits.sum() == 64
+    assert np.isclose(result.policy.sum(), 1.0)
+
+
+def test_horizon_must_be_at_least_one_turn():
+    import pytest
+
+    with pytest.raises(ValueError):
+        MCTS(UniformEvaluator(), simulations=8, horizon=0)
+
+
+def test_horizon_reaches_the_player_through_mcts_kwargs():
+    player = MCTSPlayer(Color.BLUE, UniformEvaluator(), simulations=8, horizon=3)
+    assert player.mcts.horizon == 3

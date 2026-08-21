@@ -122,11 +122,11 @@ class HumanVsAI:
 
     def __init__(self, agent_spec, model_path, seed=None, simulations=100,
                  placement_path=None, bundle_path=None,
-                 partner_rank=PARTNER_RANK):
+                 partner_rank=PARTNER_RANK, horizon=None):
         self.ai = build_agent(
             agent_spec, model_path, simulations,
             placement_path=placement_path, bundle_path=bundle_path,
-            partner_rank=partner_rank,
+            partner_rank=partner_rank, horizon=horizon,
         )(AI)
         # Placeholder players: this loop drives the engine itself and never calls
         # their decide(). Seating is randomized so the human isn't always second.
@@ -289,6 +289,12 @@ def main():
                         help="MCTS playouts per move for search-backed agents. "
                              "50 is where search saturates and keeps the wait "
                              "between moves short.")
+    parser.add_argument("--horizon", type=int, default=None,
+                        help="Cap the search at this many game turns past "
+                             "the current position; positions beyond it "
+                             "are scored by the value head instead of "
+                             "expanded. Default searches as deep as the "
+                             "simulation budget reaches.")
     parser.add_argument("--placement-model", default=None,
                         help="PlacementNet checkpoint that plays the AI's "
                              "opening settlements. Every archived checkpoint "
@@ -317,7 +323,7 @@ def main():
     print(f"[Rules] {ruleset.describe()}")
 
     HumanVsAI(args.agent, args.model, seed=args.seed,
-              simulations=args.simulations,
+              simulations=args.simulations, horizon=args.horizon,
               placement_path=args.placement_model,
               bundle_path=args.bundle_model,
               partner_rank=args.partner_rank)

@@ -4,11 +4,25 @@ Design notes specific to Catan:
 
 **Stochastic transitions.** Dice, dev-card draws and robber steals are chance
 events. Rather than enumerating outcomes, each edge keeps a dict of children keyed
-by the *realized* outcome and lets the engine's own RNG sample it. Repeated visits
-to the same edge therefore land on children in proportion to the true transition
-probabilities, so the backed-up value is an unbiased estimate of the expectation
-without paying for an 11-way fan-out on every roll. Dice children are keyed by the
-sum, since (2, 5) and (3, 4) are the same event as far as the game is concerned.
+by the *realized* outcome and samples it. Repeated visits to the same edge
+therefore land on children in proportion to the true transition probabilities, so
+the backed-up value is an unbiased estimate of the expectation without paying for
+a full fan-out on every roll. Dice children are keyed by the sum, since (2, 5) and
+(3, 4) are the same event as far as the game is concerned.
+
+**Dead rolls are one outcome, not ten.** Most boards leave several numbers paying
+nobody -- no building borders them, or the robber is on the only tile that
+carries them. Those rolls all produce the *same* successor state (see
+:func:`~src.env.lookahead.live_dice_sums` for why that is exact, not an
+approximation), yet keyed by their sum they used to scatter identical positions
+across up to ten children, each costing its own network call and each left with
+one visit. The search now samples the roll itself from a compressed distribution
+-- one entry per live sum, plus a single pooled entry carrying all the dead mass
+at its true probability from the 1/36 table -- and forces the dice through
+``Action(color, ROLL, (d1, d2))``. The distribution over successor states is
+unchanged, so the estimator stays exactly unbiased; what changes is that a roll
+edge on a sparse board branches ~6 ways instead of 11 and the shared dead child
+is visited often enough to actually be searched.
 
 **Alternating perspective.** A Catan turn is many consecutive decisions by one
 player, so the tree is not strictly alternating. Every node records who is to move
@@ -32,6 +46,12 @@ the dev box, the evaluator's forward pass dominates that copy roughly 20:1
 (~604 us against ~32 us), which is why batching leaves is the lever and shrinking
 the net is not.
 
+**Depth is a budget, not a horizon.** Nothing caps how far a descent runs; the
+simulation count decides how deep the tree gets. ``horizon`` adds an explicit cap
+in game turns for when you want the opposite trade -- breadth near the root, with
+positions past the cap scored by the evaluator instead of expanded. It is off by
+default and every measurement so far was taken without it.
+
 **Search saturates by ~50 simulations** against a PPO critic: 50 sims is worth
 +9.8 points in a mirror match and 100 sims only 60.8%. The ceiling is the value
 estimate, not the budget -- see :class:`~src.agent.evaluator.PPOEvaluator`.
@@ -42,12 +62,58 @@ import math
 import numpy as np
 
 from catanatron import Player
-from catanatron.models.enums import ActionType
+from catanatron.models.enums import Action, ActionType
 
 from src.agent.encoding import (
     action_indices, action_size, encode_observation, legal_action_mask,
 )
 from src.env.catan_env import MAX_TURNS
+from src.env.lookahead import DICE_PROBS, DICE_SUMS, live_dice_sums
+
+
+#: Chance key shared by every dice sum that pays nobody. Distinct from the int
+#: keys live sums use, so the two can never collide in a children dict.
+DEAD_ROLL = "dead"
+
+
+def _dice_pair(total):
+    """Some (d1, d2) summing to ``total``.
+
+    Which pair it is never matters -- the engine reads only the sum -- but the
+    value has to be non-None to override the engine's own roll, since
+    ``catanatron.state.apply_action`` does ``dices = action.value or roll_dice()``.
+    """
+    first = min(6, total - 1)
+    return (first, total - first)
+
+
+def _roll_distribution(game):
+    """Compressed chance outcomes for a roll from ``game``.
+
+    Returns ``(keys, pairs, probs)``: one entry per live dice sum, plus -- when
+    any sum is dead -- a single pooled :data:`DEAD_ROLL` entry carrying all of
+    their probability and standing in for all of their (identical) successor
+    states. ``probs`` comes off the fixed 1/36 table, not from counting samples.
+
+    Sampling this and forcing the dice reproduces the engine's distribution over
+    successor states exactly; the dead sums are merged, never dropped.
+    """
+    live = live_dice_sums(game)
+    keys, pairs, probs = [], [], []
+    for index, total in enumerate(DICE_SUMS):
+        if live[index]:
+            keys.append(total)
+            pairs.append(_dice_pair(total))
+            probs.append(float(DICE_PROBS[index]))
+
+    dead = np.flatnonzero(~live)
+    if len(dead):
+        keys.append(DEAD_ROLL)
+        pairs.append(_dice_pair(DICE_SUMS[dead[0]]))
+        probs.append(float(DICE_PROBS[dead].sum()))
+
+    probs = np.asarray(probs, dtype=np.float64)
+    return keys, pairs, probs / probs.sum()
 
 
 def _outcome_key(executed_action):
@@ -71,7 +137,7 @@ class Node:
 
     __slots__ = (
         "game", "to_play", "actions", "priors", "visits", "value_sum",
-        "children", "total_visits", "value_pred", "is_terminal",
+        "children", "total_visits", "value_pred", "is_terminal", "roll_dist",
     )
 
     def __init__(self, game, to_play, is_terminal, value_pred, actions=(), priors=None):
@@ -87,6 +153,10 @@ class Node:
         # children[i] maps chance-outcome key -> Node (key None for deterministic).
         self.children = [dict() for _ in range(n)]
         self.total_visits = 0
+        # Cached _roll_distribution for this position. The game is fixed once the
+        # node exists, so the live set is too; computing it costs a sweep over
+        # every building and would otherwise repeat on every visit.
+        self.roll_dist = None
 
 
 class _PendingLeaf:
@@ -150,6 +220,15 @@ class MCTS:
             parent's own value estimate, which stops the search from fanning out
             uniformly over Catan's very wide action lists.
         max_turns: simulations reaching this turn count score as a draw.
+        horizon: how many game *turns* past the root a descent may explore.
+            ``None`` (the default, and what every measurement so far used) lets
+            the simulation budget decide the depth. A number caps it: a position
+            that many turns beyond the root is scored by the evaluator and never
+            expanded, so the budget buys breadth near the root instead of a few
+            deep lines. Turns are counted the way ``max_turns`` counts them --
+            catanatron increments ``num_turns`` when a seat ends its turn -- so
+            in 1v1 ``horizon=1`` searches to the end of the opponent's reply and
+            ``horizon=2`` to the end of your next turn.
         batch_size: leaves to collect before one ``evaluate_batch`` call. 1 keeps
             the exact serial search; larger values amortize the forward pass at
             the cost of descending against slightly staler statistics.
@@ -166,6 +245,7 @@ class MCTS:
         dirichlet_epsilon: float = 0.0,
         fpu_reduction: float = 0.25,
         max_turns: int = MAX_TURNS,
+        horizon: int = None,
         batch_size: int = 1,
         virtual_loss: int = 1,
     ):
@@ -176,6 +256,11 @@ class MCTS:
         self.dirichlet_epsilon = dirichlet_epsilon
         self.fpu_reduction = fpu_reduction
         self.max_turns = max_turns
+        if horizon is not None and int(horizon) < 1:
+            raise ValueError("horizon must be >= 1 turn, or None for unlimited")
+        self.horizon = None if horizon is None else int(horizon)
+        # Set per search; the cap is relative to wherever the search started.
+        self._root_turns = 0
         self.batch_size = max(1, int(batch_size))
         self.virtual_loss = max(0, int(virtual_loss))
         self.num_actions = action_size()
@@ -209,8 +294,22 @@ class MCTS:
             encode_observation(game, to_play, lookahead=self._lookahead), \
             legal_action_mask(actions)
 
+    def _beyond_horizon(self, game):
+        """Is this position past the turn cap the search was given?"""
+        if self.horizon is None:
+            return False
+        return game.state.num_turns - self._root_turns >= self.horizon
+
     def _expand(self, game, to_play, actions, priors_full, value):
-        """Wrap an evaluated position in a Node."""
+        """Wrap an evaluated position in a Node.
+
+        Past the horizon the node is marked terminal so descents stop there and
+        back up the evaluator's value -- the standard depth-limited bootstrap.
+        Its action list would never be read, so it is not built.
+        """
+        if self._beyond_horizon(game):
+            return Node(game, to_play, True, float(value))
+
         # Map the action-space priors onto the positional action list. Several
         # catanatron Actions can normalize to one slot, so renormalize afterwards.
         indices = action_indices(actions)
@@ -239,6 +338,32 @@ class MCTS:
         eps = self.dirichlet_epsilon
         node.priors = ((1 - eps) * node.priors + eps * noise).astype(np.float32)
 
+    # ---- transitions -----------------------------------------------------
+    def _step(self, node, index, rng):
+        """Play ``node.actions[index]`` on a copy; return ``(child, chance key)``.
+
+        Rolls are sampled here rather than left to the engine, so that every dead
+        sum lands in one shared child instead of scattering identical positions
+        over as many keys as the board has unproductive numbers. Everything else
+        is executed as-is and keyed off the outcome the engine realized.
+        """
+        action = node.actions[index]
+        child_game = node.game.copy()
+
+        if action.action_type == ActionType.ROLL and action.value is None:
+            if node.roll_dist is None:
+                node.roll_dist = _roll_distribution(node.game)
+            keys, pairs, probs = node.roll_dist
+            choice = int(rng.choice(len(keys), p=probs))
+            child_game.execute(
+                Action(action.color, ActionType.ROLL, pairs[choice]),
+                validate_action=False,
+            )
+            return child_game, keys[choice]
+
+        executed = child_game.execute(action, validate_action=False)
+        return child_game, _outcome_key(executed)
+
     # ---- selection -------------------------------------------------------
     def _select(self, node):
         """PUCT: argmax over Q + c * P * sqrt(N_total) / (1 + N)."""
@@ -263,16 +388,17 @@ class MCTS:
     def search(self, game, rng=None) -> SearchResult:
         """Run ``simulations`` playouts from ``game`` and return root statistics."""
         rng = rng or np.random.default_rng()
+        self._root_turns = game.state.num_turns
         root = self._make_node(game.copy())
         if root.is_terminal:
             raise ValueError("Cannot search from a finished position")
         self._add_root_noise(root, rng)
 
         if self.batch_size > 1:
-            self._simulate_batched(root)
+            self._simulate_batched(root, rng)
         else:
             for _ in range(self.simulations):
-                self._simulate(root)
+                self._simulate(root, rng)
 
         obs = encode_observation(game, root.to_play, lookahead=self._lookahead)
         mask = legal_action_mask(root.actions)
@@ -305,7 +431,7 @@ class MCTS:
             parent.value_sum[index] += signed + vl
             parent.total_visits += 1 - vl
 
-    def _simulate(self, root):
+    def _simulate(self, root, rng):
         """One playout: descend to a leaf, evaluate it, back the value up."""
         node = root
         path = []  # (node, action index) pairs taken on the way down
@@ -318,9 +444,7 @@ class MCTS:
             index = self._select(node)
             path.append((node, index))
 
-            child_game = node.game.copy()
-            executed = child_game.execute(node.actions[index], validate_action=False)
-            key = _outcome_key(executed)
+            child_game, key = self._step(node, index, rng)
 
             child = node.children[index].get(key)
             if child is None:
@@ -347,7 +471,7 @@ class MCTS:
             parent.value_sum[index] -= vl
             parent.total_visits += vl
 
-    def _descend(self, root):
+    def _descend(self, root, rng):
         """Walk to a leaf, charging virtual loss on the way.
 
         Returns ``(path, kind, payload)`` where kind is ``"terminal"`` (payload is
@@ -365,9 +489,7 @@ class MCTS:
             index = self._select(node)
             path.append((node, index))
 
-            child_game = node.game.copy()
-            executed = child_game.execute(node.actions[index], validate_action=False)
-            key = _outcome_key(executed)
+            child_game, key = self._step(node, index, rng)
 
             child = node.children[index].get(key)
             if child is None:
@@ -375,7 +497,7 @@ class MCTS:
                 return path, "leaf", (child_game, node, index, key)
             node = child
 
-    def _simulate_batched(self, root):
+    def _simulate_batched(self, root, rng):
         """Run the simulation budget, evaluating leaves ``batch_size`` at a time.
 
         Terminal leaves need no network call, so they are backed up during
@@ -385,7 +507,7 @@ class MCTS:
         while remaining > 0:
             pending = []
             for _ in range(min(self.batch_size, remaining)):
-                path, kind, payload = self._descend(root)
+                path, kind, payload = self._descend(root, rng)
                 if kind == "terminal":
                     self._backup(path, payload.value_pred, payload.to_play, True)
                     continue
