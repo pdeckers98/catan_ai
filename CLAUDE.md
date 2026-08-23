@@ -32,15 +32,28 @@ the agent and, later, the web integration.
 - **An AlphaZero track existed and was removed** (`train_az.py`, `selfplay.py`, `net.py`). It never
   got past feasibility at 70.8% vs weighted-random. Recoverable from git history; the argument for
   it was always the value head, and that argument is still open. Don't rebuild it casually.
+- **The nodev curriculum, and what it did and did not buy** (2026-08-23). The current agent was
+  not fine-tuned from a 15 VP model; it came up a ladder with **development cards switched off**:
+  9 VP no-LR -> 11 VP with LR (the ceiling without cards) -> 15 VP with cards on. Two findings.
+  **The card mechanic transfers essentially for free**: one 150k-step interval against greedy took
+  a 5.2M-step nodev policy — whose dev-card logits had *never received a gradient*, still at
+  random init — to 96% vs greedy with 4.6 knights a game. Budget ~10 minutes for that rung, not an
+  hour, and cut it the moment the scripted references saturate. **And self-play Elo kept climbing
+  where every earlier run plateaued**: +35 -> +81 -> +143 -> +168 (promoted) -> +242 across five
+  100-game samples, still improving *after* the ladder re-anchored on a dev-card-playing self.
+  Then it played a live colonist game and built **zero cities and zero dev cards in 28 turns** — a
+  policy that averages 8.26 cards and 3.5 cities per game in training. **Treat a self-play Elo
+  climb as evidence about self-play and nothing else.**
 - **Game mode**: 1v1 (`enemies=[one bot]`, `map_type="BASE"`). The VP target, the
-  Longest Road award and the turn cap are **per-run**, selected via `src/env/ruleset.py`
-  (`--vps-to-win` / `--longest-road` / `--max-turns`, or `CATAN_*` env vars). Defaults
+  Longest Road award, the turn cap and **whether development cards exist at all** are
+  **per-run**, selected via `src/env/ruleset.py` (`--vps-to-win` / `--longest-road` /
+  `--max-turns` / `--no-dev-cards`, or `CATAN_*` env vars). Defaults
   reproduce the historical setup: 8 VP, no Longest Road. **The target is the colonist.io
   1v1 ruleset: 15 VP with Longest Road enabled**, and agents have now trained under it —
   see `checkpoints/archive/` below. Raise `--max-turns` to 1500 at 15 VP; the default 1000
   is already binding there, and a truncated episode pays 0, so capped games teach nothing.
 - **Custom rules**: `src/env/rules.py` monkeypatches Catanatron at import time. Applied
-  automatically via `src/env/catan_env.py`. Eight patches:
+  automatically via `src/env/catan_env.py`. Nine patches:
   1. discard on a 7 only above **9** cards (`discard_limit=9`, vs. stock 7)
   2. per-resource, one-card-at-a-time discard the policy actually chooses
      (expands the action space 290 → **294**)
@@ -57,6 +70,15 @@ the agent and, later, the web integration.
   8. **Road Building playable while broke** — upstream gates the card behind
      affording a road, though its two roads are free. Found via the colonist
      bridge; **every agent trained before this could not play it when short**
+  9. **Development cards can be removed entirely.** Off by default.
+     `CATAN_DEV_CARDS=0` (`--no-dev-cards`) empties the deck at deal time, which
+     is the whole rule: upstream already refuses to offer `BUY_DEVELOPMENT_CARD`
+     when the deck is empty, so no card action is ever legal and Largest Army is
+     unreachable. **The action space is unchanged**, so a model trained with dev
+     cards still loads. Its purpose is a curriculum rung: without cards the
+     reachable ceiling is **11 VP** (9 from buildings, 2 from Longest Road), and
+     an agent has to learn expansion there rather than papering over it with the
+     card economy. See the nodev ladder in `checkpoints/archive/`.
 - **Opening placement**: a separate self-trained specialist (`src/placement/`). Initial settlement
   choice gets ~2 of ~300 gradient samples per episode, so the main policy learned "settle where
   three tiles meet" but never learned that an 8 beats a 3. The specialist trains on random
@@ -82,6 +104,20 @@ the agent and, later, the web integration.
   **unshaped** game, so every leaf carries a `−w·(VP lead)` bias. **Any future reward change must
   be benchmarked with search on** — the bare number said "harmless" and was wrong by 8 points.
   Full write-up in `PHASE2_AI.md`.
+- **A flat settlement bonus was tried next, and it is inert.** `--settlement-bonus` (+0.03 per
+  settlement past the opening, capped at 3) is deliberately **not** policy-invariant — a potential
+  telescopes to a constant and so cannot make the agent *prefer* anything. The case for it was
+  real: at 15 VP with Longest Road the VP-differential potential pays **+2 for a road spree**,
+  twice what it pays for a settlement. Run 2026-08-23 as a controlled A/B against
+  `ppo-15vp-dev-step7550000` — same parent, same schedule, same budget, reward the only
+  difference — it scored **47.8%** against the current model (which had 1.45M more steps) and
+  **52.2%** against a matched-step control: **199W-199L-2D over 400 games, exactly 50.0%**, with
+  50-sim search on both sides. The behaviour it bought did not survive a real opponent either:
+  settlements built were 3.0 in eval vs weighted-random, 2.7 vs the current model, **2.3** vs the
+  matched control. And in eval the extra settlements came out of the **city** budget (3.7 → 3.4),
+  not the road budget — roads never moved. Two rules it earned: **keep a matched-step control**
+  (the unmatched head-to-head would have read as "the bonus hurts"), and **read build counts off
+  the head-to-head, not the bot eval**, which overstated the effect by 0.7 settlements.
 - **The agent burns its hand — and fixing it does not help.** Measured 2026-08-19 over 30
   self-play games at 15 VP (`python -m src.eval.waste`): it trades on **36%** of its turns,
   **68%** of those while it could already afford something, **42%** give away a resource it
@@ -215,8 +251,8 @@ deployed — worth ~10 points over the same weights playing directly:
 
 ```bash
 python -m src.eval.benchmark --vps-to-win 15 --longest-road --max-turns 1500 \
-    --agent ppo-mcts --model checkpoints/archive/ppo-15vp-lr-step400000.zip --simulations 50 \
-    --opponent ppo --opponent-model checkpoints/archive/ppo-15vp-lr-step400000.zip --games 200 \
+    --agent ppo-mcts --model checkpoints/archive/ppo-15vp-dev-step7550000.zip --simulations 50 \
+    --opponent ppo --opponent-model checkpoints/archive/ppo-15vp-dev-step7550000.zip --games 200 \
     --placement-model checkpoints/placement/scorer_ppo.pt \
     --bundle-model    checkpoints/placement/bundle_noroads.pt \
     --opponent-placement-model checkpoints/placement/scorer_ppo.pt \
@@ -250,7 +286,7 @@ models a benchmark would, or you are not playing the agent that was measured:
 
 ```bash
 python -m src.eval.play --vps-to-win 15 --longest-road --max-turns 1500 \
-    --agent ppo-mcts --model checkpoints/archive/ppo-15vp-lr-step400000.zip \
+    --agent ppo-mcts --model checkpoints/archive/ppo-15vp-dev-step7550000.zip \
     --simulations 50 \
     --placement-model checkpoints/placement/scorer_ppo.pt \
     --bundle-model    checkpoints/placement/bundle_noroads.pt
@@ -268,13 +304,19 @@ else). **None of these can place their own opening** — see the Caveats below.
 
 | file | rules | notes |
 | --- | --- | --- |
-| `ppo-15vp-lr-step400000.zip` | 15 VP, LR | **current agent.** Fine-tuned from the 12 VP trunk model; run it with `--agent ppo-mcts --simulations 50` |
-| `ppo-12vp-trunk-step2000000.zip` | 12 VP, LR | shared trunk, 932k params; its parent |
+| `ppo-15vp-dev-step7550000.zip` | 15 VP, LR, dev | **current agent.** The first archived model trained under rules that match colonist (corrected friendly robber, Road Building while broke). Elo +242; run it with `--agent ppo-mcts --simulations 50` |
+| `ppo-11vp-lr-nodev-best4850000.zip` | 11 VP, LR, **no dev** | its parent, and the tip of the nodev curriculum. 11 VP is the ceiling without cards |
+| `ppo-9vp-nodev-step4400000.zip` | 9 VP, no LR, **no dev** | the rung below that; where the nodev ladder started |
+| `ppo-15vp-lr-step400000.zip` | 15 VP, LR | the previous agent. Fine-tuned from the 12 VP trunk model; trained under the **wrong** friendly-robber rule |
+| `ppo-12vp-trunk-step2000000.zip` | 12 VP, LR | shared trunk, 932k params; the 400k model's parent |
 | `ppo-12vp-lr-step1800000.zip` | 12 VP, LR | two-tower `[256,256]`, 537k params; a statistical tie with the trunk model |
 | `ppo-15vp-shaped-step1800000.zip` | 15 VP, LR | **evidence, not a candidate.** The `--shaping-weight 0.05` run; 50.3% bare / 42.2% with search vs the 400k model |
+| `ppo-15vp-sbonus-step6100000.zip` | 15 VP, LR, dev | **evidence, not a candidate.** The `--settlement-bonus 0.03` run; 50.0% over 400 games vs its own matched control |
 
-The first two are **trunk models**: their `policy_kwargs` names `src.agent.trunk.SharedTrunk` by
-module path, so `src/agent/trunk.py` cannot be moved or deleted without breaking them.
+`ppo-15vp-lr-step400000` and `ppo-12vp-trunk-step2000000` are **trunk models**: their
+`policy_kwargs` names `src.agent.trunk.SharedTrunk` by module path, so `src/agent/trunk.py` cannot
+be moved or deleted without breaking them. Everything on the nodev ladder, and the current agent
+that descends from it, is a plain two-tower `[256,256]`.
 
 The 12 VP models play 15 VP without retraining (80–0 vs weighted-random out of the box,
 15.0 VP in 145 turns) — the win condition changes, the mechanics do not. 800k steps of 15 VP
@@ -313,7 +355,7 @@ See `docs/` for per-phase guides:
   ```bash
   python -m src.bridge.session --replay data/bridge/<capture>.jsonl \
       --vps-to-win 15 --longest-road --max-turns 1500 --simulations 50 \
-      --model checkpoints/archive/ppo-15vp-lr-step400000.zip \
+      --model checkpoints/archive/ppo-15vp-dev-step7550000.zip \
       --placement-model checkpoints/placement/scorer_ppo.pt \
       --bundle-model    checkpoints/placement/bundle_noroads.pt
   ```
