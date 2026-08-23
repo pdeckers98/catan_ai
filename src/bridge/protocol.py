@@ -34,7 +34,7 @@ from typing import Dict, List, Optional, Tuple
 
 from catanatron import Color
 from catanatron.models.actions import Action
-from catanatron.models.enums import ActionType
+from catanatron.models.enums import RESOURCES, ActionType
 from catanatron.models.map import (
     PORT_DIRECTION_TO_NODEREFS,
     EdgeRef,
@@ -828,7 +828,12 @@ class _ActionDecoder:
         if self.pending_dev_card != DEV_YEAR_OF_PLENTY:
             raise ProtocolError("a year of plenty resolved without being played")
         color = self._color(text["playerColor"])
-        cards = tuple(self._resources(text["cardEnums"]))
+        # Sorted into catanatron's own resource order, which is the whole fix:
+        # the two cards are a set, but the engine enumerates the pair as a
+        # sorted tuple, so colonist's ('ORE', 'WHEAT') matches nothing and the
+        # replay reads a legal card as a desync. It cost a live game at turn 96.
+        cards = tuple(sorted(self._resources(text["cardEnums"]),
+                             key=RESOURCES.index))
         self.actions.append(Action(color, ActionType.PLAY_YEAR_OF_PLENTY, cards))
         self.pending_dev_card = None
 
