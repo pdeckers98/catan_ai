@@ -66,6 +66,11 @@ def main():
     parser.add_argument("--longest-road", action=argparse.BooleanOptionalAction,
                         default=ruleset.LONGEST_ROAD_VP,
                         help="Award Longest Road its +2 VP.")
+    parser.add_argument("--dev-cards", action=argparse.BooleanOptionalAction,
+                        default=ruleset.DEV_CARDS,
+                        help="Deal a development deck at all. --no-dev-cards removes "
+                             "them from the game entirely: no Largest Army, "
+                             "no VP cards.")
     parser.add_argument("--max-turns", type=int, default=ruleset.MAX_TURNS,
                         help="Turn cap before a game is scored as a draw.")
     parser.add_argument("--seed", type=int, default=None)

@@ -4,7 +4,7 @@ We keep these as monkeypatches (not edits to the installed package) so the chang
 lives in version control and is reapplied automatically in every process -- including
 the fresh interpreters that ``SubprocVecEnv`` spawns for parallel training.
 
-Eight things happen here:
+Nine things happen here:
 
 1. **Discard threshold raised to 9.** Stock Catanatron makes you discard on a 7
    when you hold *more than 7* cards (``discard_limit=7``). The gym env builds
@@ -68,6 +68,17 @@ Eight things happen here:
    the colonist.io bridge, where an opponent did exactly that and won on longest
    road. Note the consequence for everything trained before this landed: those
    agents never had the card available when it mattered most.
+
+9. **Development cards can be removed from the game entirely.** Off by
+   default. ``CATAN_DEV_CARDS=0`` (``--no-dev-cards``) empties the development
+   deck at deal time, which is enough on its own: upstream already refuses to
+   offer ``BUY_DEVELOPMENT_CARD`` when the deck is empty, so no action ever
+   appears, no knight is ever played, and Largest Army becomes unreachable. The
+   action space is unchanged -- those slots are simply never legal -- so a model
+   trained with dev cards still *loads* under this rule. It has not trained
+   under it, though, and at a low VP target that is a different game: buildings
+   cap at 9 VP (5 settlements, 4 upgraded to cities), so with dev cards gone
+   that cap is the only source of points besides Longest Road.
 """
 
 import gymnasium.spaces as _spaces
@@ -84,7 +95,7 @@ from catanatron.state_functions import (
     player_deck_subtract,
 )
 
-from src.env.ruleset import LONGEST_ROAD_VP
+from src.env.ruleset import DEV_CARDS, LONGEST_ROAD_VP
 
 DISCARD_LIMIT = 9
 
@@ -96,7 +107,8 @@ _PATCH_FLAG = "_catan_rules_patched"
 
 
 def apply_rule_patches(discard_limit: int = DISCARD_LIMIT,
-                       longest_road_vp: bool = LONGEST_ROAD_VP) -> None:
+                       longest_road_vp: bool = LONGEST_ROAD_VP,
+                       dev_cards: bool = DEV_CARDS) -> None:
     """Idempotently install the custom-rule monkeypatches.
 
     Safe to call from any module/process; only the first call takes effect.
@@ -108,6 +120,8 @@ def apply_rule_patches(discard_limit: int = DISCARD_LIMIT,
             ``CATAN_LONGEST_ROAD=1`` is set in the environment. Passing it
             explicitly is for tests; a training run sets the variable, because
             the patch has to land the same way in every spawned worker.
+        dev_cards: deal a development deck at all. Defaults to
+            :data:`src.env.ruleset.DEV_CARDS`, i.e. on unless ``CATAN_DEV_CARDS=0``.
     """
     if getattr(_game_mod, _PATCH_FLAG, False):
         return
@@ -118,6 +132,8 @@ def apply_rule_patches(discard_limit: int = DISCARD_LIMIT,
     if not longest_road_vp:
         _patch_no_longest_road()
     _patch_dev_card_summoning_sickness()
+    if not dev_cards:
+        _patch_no_dev_cards()
     _patch_free_road_building()
     _patch_gym_action_space()
     setattr(_game_mod, _PATCH_FLAG, True)
@@ -341,6 +357,28 @@ def _patch_no_longest_road() -> None:
 
     _state_mod.mantain_longest_road = patched_mantain
     _state_functions_mod.mantain_longest_road = patched_mantain
+
+
+def _patch_no_dev_cards() -> None:
+    """Deal an empty development deck, removing dev cards from the game.
+
+    One line does the whole rule because upstream already handles an exhausted
+    deck: ``generate_playable_actions`` gates ``BUY_DEVELOPMENT_CARD`` on
+    ``len(state.development_listdeck) > 0``, so with nothing to deal the action
+    is never offered, nobody ever holds a card, and the play-card branches are
+    dead too. Largest Army goes with it -- no knights are ever drawn.
+
+    Patched on ``State.__init__`` rather than ``Game.__init__`` so it survives
+    every path that builds a state, and after the original runs so the shuffle
+    it performs is simply discarded.
+    """
+    orig_init = _state_mod.State.__init__
+
+    def patched_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        self.development_listdeck = []
+
+    _state_mod.State.__init__ = patched_init
 
 
 # --------------------------------------------------------------------------

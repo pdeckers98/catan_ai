@@ -39,6 +39,7 @@ Usage:
 import argparse
 import random
 import shutil
+import time
 from pathlib import Path
 
 # MUST run before any import that reaches the engine: ``src.env.rules`` decides
@@ -447,6 +448,12 @@ def main():
     parser = argparse.ArgumentParser(description="Train MaskablePPO agent with self-play.")
     parser.add_argument("--total-steps", type=int, default=500_000)
     parser.add_argument("--eval-interval", type=int, default=100_000)
+    parser.add_argument("--max-hours", type=float, default=None,
+                        help="Wall-clock budget. Training stops at the end of "
+                             "the first rollout past this many hours, so the "
+                             "run ends cleanly with its checkpoints written "
+                             "rather than being killed. --total-steps still "
+                             "applies; whichever comes first wins.")
     parser.add_argument("--w-b-project", type=str, default="catan-ai")
     parser.add_argument("--run-name", type=str, default=None,
                         help="Subdirectory under checkpoints/ for this run. "
@@ -530,6 +537,12 @@ def main():
                              "because at 8 VP it was a fifth of the win "
                              "condition and drove road-spam; on for the "
                              "colonist.io 1v1 target ruleset.")
+    parser.add_argument("--dev-cards", action=argparse.BooleanOptionalAction,
+                        default=ruleset.DEV_CARDS,
+                        help="Deal a development deck at all. --no-dev-cards "
+                             "removes them from the game: no Largest Army, no "
+                             "VP cards, so buildings (cap 9 VP) and Longest "
+                             "Road are the only points there are.")
     parser.add_argument("--max-turns", type=int, default=ruleset.MAX_TURNS,
                         help="Turn cap before a game is truncated as a draw. A "
                              "truncated episode pays 0 -- neither win nor loss "
@@ -619,8 +632,9 @@ def main():
     # disagrees with it, the pre-pass did not see these flags -- main() called in
     # process, say -- and the run would silently train under the wrong rules
     # while reporting the requested ones. Fail loudly instead.
-    requested = (args.vps_to_win, args.longest_road, args.max_turns)
-    active = (ruleset.VPS_TO_WIN, ruleset.LONGEST_ROAD_VP, ruleset.MAX_TURNS)
+    requested = (args.vps_to_win, args.longest_road, args.max_turns, args.dev_cards)
+    active = (ruleset.VPS_TO_WIN, ruleset.LONGEST_ROAD_VP, ruleset.MAX_TURNS,
+              ruleset.DEV_CARDS)
     if requested != active:
         raise SystemExit(
             f"ruleset mismatch: requested {requested}, engine imported with "
@@ -778,6 +792,12 @@ def main():
     rating = 0.0
 
     eval_step = 0
+    # A wall-clock budget can only be honoured at eval-interval granularity:
+    # stopping mid-``learn`` would leave the interval's checkpoint unwritten and
+    # its eval unrun, which is the only record an interval produces. Size
+    # --eval-interval accordingly -- the run overshoots the budget by at most
+    # one interval, and produces at most (budget / interval) checkpoints.
+    deadline = None if args.max_hours is None else time.monotonic() + args.max_hours * 3600
     while steps_done < args.total_steps:
         interval = min(args.eval_interval, args.total_steps - steps_done)
         print(f"\n[Training] Steps {steps_done}->{steps_done + interval} / {args.total_steps}")
@@ -855,6 +875,11 @@ def main():
             print(f"  new best ({label}) -> {best_path}")
         metrics["eval/best_score"] = best_score
         wandb.log({"step": steps_done, "checkpoint/step": steps_done, **metrics})
+
+        if deadline is not None and time.monotonic() >= deadline:
+            print(f"[Budget] {args.max_hours}h elapsed after {steps_done} steps; "
+                  f"stopping (--total-steps was {args.total_steps}).")
+            break
 
         if args.opponent in ("pool", "selfplay"):
             if args.opponent == "pool":

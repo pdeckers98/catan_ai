@@ -1,6 +1,6 @@
 """Per-run rule settings that must survive a process boundary.
 
-Three settings vary per run and are read by code that executes in *other
+Four settings vary per run and are read by code that executes in *other
 processes*: ``SubprocVecEnv`` rollout workers, and the worker pool
 ``src.agent.arena`` fans matches across. On Windows those are spawned, not
 forked, so every module is re-imported from scratch in the child and any value
@@ -15,6 +15,7 @@ same mechanism ``src.env.determinism`` already uses to pin ``PYTHONHASHSEED``:
 - ``CATAN_VPS_TO_WIN``   -- victory points to win (default 8)
 - ``CATAN_MAX_TURNS``    -- turn cap before a game is called a draw (default 1000)
 - ``CATAN_LONGEST_ROAD`` -- 1 to award Longest Road its +2 VP (default 0, off)
+- ``CATAN_DEV_CARDS``    -- 0 to remove development cards entirely (default 1, on)
 
 The cost of that convenience is a global: a variable left over from a previous
 command silently applies to the next one. Two guards. :func:`describe` is logged
@@ -31,6 +32,7 @@ _DEFAULTS = {
     "CATAN_VPS_TO_WIN": "8",
     "CATAN_MAX_TURNS": "1000",
     "CATAN_LONGEST_ROAD": "0",
+    "CATAN_DEV_CARDS": "1",
 }
 
 _TRUE = {"1", "true", "yes", "on"}
@@ -46,10 +48,11 @@ def _int(name: str) -> int:
 
 def _read_env() -> None:
     """(Re)read the ruleset from the environment into this module's globals."""
-    global VPS_TO_WIN, MAX_TURNS, LONGEST_ROAD_VP
+    global VPS_TO_WIN, MAX_TURNS, LONGEST_ROAD_VP, DEV_CARDS
     VPS_TO_WIN = _int("CATAN_VPS_TO_WIN")
     MAX_TURNS = _int("CATAN_MAX_TURNS")
     LONGEST_ROAD_VP = _flag("CATAN_LONGEST_ROAD")
+    DEV_CARDS = _flag("CATAN_DEV_CARDS")
 
 
 # Read at import. Everything downstream imports these names by value, so a change
@@ -57,6 +60,7 @@ def _read_env() -> None:
 # for the lifetime of the process, and every process in a run agrees on it.
 VPS_TO_WIN = MAX_TURNS = 0
 LONGEST_ROAD_VP = False
+DEV_CARDS = True
 _read_env()
 
 
@@ -91,6 +95,10 @@ def apply_cli_overrides(argv=None) -> None:
             os.environ["CATAN_LONGEST_ROAD"] = "1"
         elif name == "--no-longest-road":
             os.environ["CATAN_LONGEST_ROAD"] = "0"
+        elif name == "--dev-cards":
+            os.environ["CATAN_DEV_CARDS"] = "1"
+        elif name == "--no-dev-cards":
+            os.environ["CATAN_DEV_CARDS"] = "0"
 
     # Setting the variables is not enough. This module's constants were read at
     # *its* import -- which is the line that imported this function, one
@@ -103,7 +111,8 @@ def apply_cli_overrides(argv=None) -> None:
 def describe() -> str:
     """One-line summary of the active ruleset, for logs."""
     road = "on" if LONGEST_ROAD_VP else "off"
-    return (f"{VPS_TO_WIN} VP, longest-road {road}, "
+    dev = "on" if DEV_CARDS else "off"
+    return (f"{VPS_TO_WIN} VP, longest-road {road}, dev-cards {dev}, "
             f"turn cap {MAX_TURNS}")
 
 
@@ -113,4 +122,5 @@ def as_config() -> dict:
         "vps_to_win": VPS_TO_WIN,
         "max_turns": MAX_TURNS,
         "longest_road_vp": LONGEST_ROAD_VP,
+        "dev_cards": DEV_CARDS,
     }
