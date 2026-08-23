@@ -41,7 +41,8 @@ from typing import Any, Dict, List, Optional
 
 from src.bridge.moves import (  # noqa: F401  -- re-exported, see the note below
     PROBE_ACTIONS, SEND_BUY_DEV_CARD, SEND_CITY, SEND_CONFIRM_CARDS,
-    SEND_END_TURN, SEND_INITIAL_ROAD, SEND_INITIAL_SETTLEMENT, SEND_MOVE_ROBBER,
+    SEND_END_TURN, SEND_INITIAL_ROAD, SEND_INITIAL_SETTLEMENT, SEND_LEAVE_GAME,
+    SEND_MOVE_ROBBER,
     SEND_PLAY_DEV_CARD, SEND_ROAD, SEND_ROLL, SEND_SELECT_CARDS,
     SEND_SETTLEMENT, SEND_TRADE,
 )
@@ -259,6 +260,17 @@ class FrameCodec:
         if self.last_sequence is None:
             self.last_sequence = 0
         return True
+
+    def reset(self) -> None:
+        """Forget the connection entirely, as a page reload does.
+
+        ``rebind`` keeps the sequence counter because the connection is the
+        same one. A reload is the other case: colonist opens a *new* socket,
+        and its counter starts over, so carrying ours across would put every
+        frame in a gap the server has to resync away.
+        """
+        self.header = None
+        self.last_sequence = None
 
     @property
     def ready(self) -> bool:

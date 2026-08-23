@@ -55,6 +55,7 @@ SEND_OPEN_PANEL = 47          # payload: true          no log of its own
 SEND_PLAY_DEV_CARD = 48       # payload: card enum     -> log 20, played
 SEND_TRADE = 49               # payload: trade object  -> log 116, bank trade
 SEND_TRADE_RESPONSE = 50      # payload: {id, response}   answer a player's offer
+SEND_LEAVE_GAME = 64          # payload: true          the end screen's "continue"
 
 #: Declining an offer. Observed: the page's own client sent ``response: 1``,
 #: the server moved ``playerResponses`` to 2, the offer closed and **no cards

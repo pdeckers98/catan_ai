@@ -548,6 +548,7 @@ class DryRun:
                  log: Optional[Path] = None, seed: Optional[int] = None,
                  check_lobby: bool = True):
         self.live = LiveGame(seed=seed, check_lobby=check_lobby)
+        self._live_args = {"seed": seed, "check_lobby": check_lobby}
         self.simulations = simulations
         self._artifacts = (model_path, placement_path, bundle_path)
         self.player = None
@@ -591,6 +592,29 @@ class DryRun:
         self._idle_since: Optional[float] = None
         self._idle_reported = -1
 
+    def reset_for_next_game(self) -> None:
+        """Forget this game, keep the run's tallies.
+
+        A broken reconstruction latches deliberately -- every later answer
+        would be off a fiction -- but it latched for the whole *session*, and a
+        session is now several games. The next game is a fresh board the
+        failure says nothing about, so the fiction is discarded here rather
+        than carried into it. The counters are not reset: they describe the
+        run, and a game that broke is part of what the run did.
+        """
+        self.live = LiveGame(**self._live_args)
+        self.player = None
+        self.broken = None
+        self._pending = None
+        self._asked_at = -1
+        self._deferred.clear()
+        self._declined.clear()
+        self._phantoms = 0
+        self._sent_at = None
+        self._stalled = False
+        self._idle_since = None
+        self._idle_reported = -1
+
     def arm(self, page_sender, delay: float = 0.0) -> None:
         """Let the agent play its decisions rather than only report them."""
         self.sender = page_sender
@@ -604,6 +628,15 @@ class DryRun:
     # -- driving ------------------------------------------------------------
     def feed_frame(self, record: dict) -> None:
         if self.broken is not None:
+            # Still following the stream, just no longer acting on it. The
+            # decoder reads the win entry straight off the server, so a
+            # session that has to know when this game ended -- to press
+            # continue and queue the next -- can still find out. Errors from
+            # the wrecked replay are expected and say nothing new.
+            try:
+                self.live.feed_frame(record)
+            except Exception:
+                pass
             return
         try:
             progress = self.live.feed_frame(record)
@@ -987,33 +1020,105 @@ class NextGamePolicy:
     """When a finished game becomes another one, or the last one.
 
     Split out of the live loop because the loop needs a browser and this needs
-    only a clock. The rule: once *the server* says the game is over, wait out
-    the end-of-game screen, then either queue the next game or stop. It fires
-    at most once per game, so a win message repeated across frames cannot
-    queue twice.
+    only a clock, a socket count and a game count.
+
+    **"Next game" is three steps, not one**, which two auto-queue runs found
+    out the hard way. The end screen's *continue* leaves the game room; the
+    page then has to be back at the lobby before a queue frame has anywhere to
+    land, because a frame addressed to a finished room is dropped silently;
+    and the queue itself can go unanswered, so it has to be repeatable.
+
+    The second run's lesson is the reload. Left to itself the page wandered
+    somewhere that was not the matchmaking lobby -- it rebuilt a private room
+    -- and the queue frame went nowhere. ``page.goto`` is the one state we can
+    put it in without knowing what it did, and it costs a fresh socket, which
+    is exactly what the queue frame wants: the lobby carries no sequence, so a
+    new connection has nothing to get wrong.
+
+    Stages advance on evidence where there is any -- a socket coming back, a
+    game starting -- and on a clock only where there is none. ``start_timeout``
+    is the retry: a queue that produced no game inside it is queued again, up
+    to ``attempts``, because a session that waits forever is the failure this
+    whole object exists to prevent.
     """
 
     queue_delay: float = 8.0
+    settle_delay: float = 2.0
+    reopen_timeout: float = 30.0
+    start_timeout: float = 60.0
+    attempts: int = 5
     max_games: Optional[int] = None
-    finished_at: Optional[float] = None
-    fired: bool = False
+    stage: str = "playing"
+    at: Optional[float] = None
+    sockets_at: int = 0
+    reopened_at: Optional[float] = None
+    games_at_finish: int = 0
+    tries: int = 0
 
-    def tick(self, over: bool, games: int, now: float) -> Optional[str]:
-        """``"queue"``, ``"stop"`` or ``None`` -- nothing to do yet."""
-        if not over:
-            self.finished_at, self.fired = None, False
+    def _restart(self) -> None:
+        self.stage = "playing"
+        self.at = None
+        self.reopened_at = None
+        self.tries = 0
+
+    def tick(self, over: bool, games: int, sockets: int,
+             now: float) -> Optional[str]:
+        """``"continue"``, ``"reload"``, ``"queue"``, ``"stop"``, or None.
+
+        ``over`` is only consulted while playing. Once a game has ended the
+        session tears its own reconstruction down, and that clears the flag --
+        so past this point the honest "we are playing again" signal is the
+        *game count*, not the decoder.
+        """
+        if self.stage == "playing":
+            if not over:
+                return None
+            if self.at is None:
+                self.at = now
+                self.games_at_finish = games
+                return None
+            if now - self.at < self.queue_delay:
+                return None
+            if self.max_games is not None and games >= self.max_games:
+                self.stage = "done"
+                return "stop"
+            self.stage = "continued"
+            self.at = now
+            return "continue"
+        if games > self.games_at_finish:
+            self._restart()          # the next game is up; nothing left to do
             return None
-        if self.fired:
+        if self.stage == "continued":
+            if now - self.at < self.settle_delay:
+                return None
+            self.stage = "reloaded"
+            self.at = now
+            self.sockets_at = sockets
+            self.reopened_at = None
+            return "reload"
+        if self.stage == "reloaded":
+            if sockets > self.sockets_at:
+                if self.reopened_at is None:
+                    self.reopened_at = now
+                    return None
+                if now - self.reopened_at < self.settle_delay:
+                    return None
+            elif now - self.at < self.reopen_timeout:
+                return None
+            self.stage = "queued"
+            self.at = now
+            self.tries += 1
+            return "queue"
+        if self.stage == "queued":
+            if now - self.at < self.start_timeout:
+                return None
+            if self.tries >= self.attempts:
+                self.stage = "done"
+                return "stop"
+            self.stage = "continued"   # round again, reload included
+            self.at = now
             return None
-        if self.finished_at is None:
-            self.finished_at = now
-            return None
-        if now - self.finished_at < self.queue_delay:
-            return None
-        self.fired = True
-        if self.max_games is not None and games >= self.max_games:
-            return "stop"
-        return "queue"
+        return None
 
 
 def _run_command(command: str, page_sender: "sender.PageSender") -> None:
@@ -1090,6 +1195,7 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
 
     handle = record_to.open("w", encoding="utf-8") if record_to else None
     sockets: Dict[str, str] = {}
+    opened: List[str] = []
     codec = sender.FrameCodec()
     commands: "Queue[str]" = Queue()
 
@@ -1113,6 +1219,10 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
             # Recorded because iter_colonist_frames identifies the game socket by
             # url; without these lines the capture cannot be replayed at all.
             sockets[event.get("requestId")] = event.get("url", "")
+            if "colonist" in (event.get("url") or ""):
+                # How the session knows the page has left the end screen and
+                # come back to the lobby: colonist opens a new socket to do it.
+                opened.append(event.get("requestId"))
             write({"kind": "socket", "id": event.get("requestId"),
                    "url": event.get("url")})
             print(f"  websocket opened: {event.get('url')}")
@@ -1200,25 +1310,51 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
         print("watching. play a game by hand; close the window when done.")
         policy = NextGamePolicy(queue_delay=queue_delay, max_games=max_games)
         try:
-            while context.pages and not context.pages[0].is_closed():
-                context.pages[0].wait_for_timeout(500)
+            while True:
+                live = [pg for pg in context.pages if not pg.is_closed()]
+                if not live:
+                    print("  the browser window is gone; stopping.")
+                    break
+                if live[0] is not page:
+                    # A reload can hand back a different page object. The
+                    # sender holds one, and a stale one fails every send with
+                    # "page.evaluate failed" -- which reads like a colonist
+                    # problem and is not.
+                    page = live[0]
+                    if page_sender is not None:
+                        page_sender.page = page
+                    print("  following the browser's new page")
+                page.wait_for_timeout(500)
                 # Drained here rather than on the reader thread: Playwright's
                 # sync API belongs to the thread that created the browser.
                 dry.check_stall()
-                decision = policy.tick(
-                    dry.live.decoder.game_over and dry.broken is None,
-                    dry.games, time.time())
+                decision = policy.tick(dry.live.decoder.game_over, dry.games,
+                                       len(opened), time.time())
                 if decision == "stop":
                     print(f"  {dry.games} game(s) played; stopping.")
                     break
-                if (decision == "queue" and auto_queue is not None
+                if (decision is not None and auto_queue is not None
                         and page_sender is not None):
                     try:
-                        page_sender.queue_match(auto_queue)
-                        print(f"  queued game {dry.games + 1} "
-                              f"(matchType {auto_queue})")
-                    except sender.SendError as exc:
-                        print(f"  !! could not queue: {exc}")
+                        if decision == "continue":
+                            page_sender.send(sender.SEND_LEAVE_GAME, True)
+                            print("  pressed continue")
+                        elif decision == "reload":
+                            page.goto(url)
+                            codec.reset()
+                            # The next game is a fresh board on a fresh
+                            # connection, and whatever went wrong on the last
+                            # one says nothing about it.
+                            dry.reset_for_next_game()
+                            print("  back to the lobby; waiting for its socket")
+                        elif decision == "queue":
+                            page_sender.queue_match(auto_queue)
+                            print(f"  queued game {dry.games + 1} "
+                                  f"(matchType {auto_queue}, try {policy.tries})")
+                    except Exception as exc:
+                        # Losing one step must not end the session: the policy
+                        # retries the whole sequence on its own clock.
+                        print(f"  !! could not {decision}: {exc}")
                 while page_sender is not None and not commands.empty():
                     command = commands.get()
                     if command:
@@ -1228,6 +1364,10 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
         except Exception as exc:  # the window was closed mid-wait
             if "closed" not in str(exc).lower():
                 raise
+            # Printed because the first auto-queue run ended here in silence,
+            # and a session that stops without saying why is indistinguishable
+            # from one that is still watching.
+            print(f"  the browser went away mid-wait: {exc}")
         finally:
             if handle is not None:
                 handle.close()

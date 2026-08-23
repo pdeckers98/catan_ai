@@ -783,32 +783,136 @@ def test_rebinding_follows_the_new_room_and_keeps_the_counter():
     assert codec.last_sequence == before, "the counter is per connection"
 
 
-def test_the_next_game_waits_out_the_end_screen_then_queues():
-    policy = NextGamePolicy(queue_delay=8.0)
+def test_the_next_game_is_continue_reload_then_queue():
+    """Two runs died here: one queued into a finished room, one into no room."""
+    policy = NextGamePolicy(queue_delay=8.0, settle_delay=2.0)
 
-    assert policy.tick(False, 1, 100.0) is None, "a live game is not a decision"
-    assert policy.tick(True, 1, 200.0) is None, "the clock starts, nothing else"
-    assert policy.tick(True, 1, 205.0) is None, "still inside the delay"
-    assert policy.tick(True, 1, 208.0) == "queue"
+    assert policy.tick(False, 1, 1, 100.0) is None, "a live game is not a decision"
+    assert policy.tick(True, 1, 1, 200.0) is None, "the clock starts, nothing else"
+    assert policy.tick(True, 1, 1, 205.0) is None, "still inside the end screen"
+    assert policy.tick(True, 1, 1, 208.0) == "continue"
+
+    # Continue only leaves the game. Where the page lands is its business, so
+    # the session puts it back at the lobby itself.
+    assert policy.tick(True, 1, 1, 209.0) is None, "the end screen is still up"
+    assert policy.tick(True, 1, 1, 211.0) == "reload"
+
+    assert policy.tick(True, 1, 1, 212.0) is None, "no socket yet"
+    assert policy.tick(True, 1, 2, 213.0) is None, "back, but mid-handshake"
+    assert policy.tick(True, 1, 2, 216.0) == "queue"
 
 
-def test_the_next_game_is_queued_once_however_often_the_win_is_repeated():
+def test_the_decoder_reset_does_not_restart_the_sequence():
+    """``reload`` tears the reconstruction down, and that clears ``game_over``.
+
+    Reading that as "we are playing again" is how the second run stalled: the
+    policy went back to stage one and pressed continue forever.
+    """
+    policy = NextGamePolicy(queue_delay=0.0, settle_delay=0.0)
+    assert policy.tick(True, 1, 1, 0.0) is None
+    assert policy.tick(True, 1, 1, 1.0) == "continue"
+    assert policy.tick(False, 1, 1, 2.0) == "reload", "over is False; carry on"
+    assert policy.tick(False, 1, 2, 3.0) is None
+    assert policy.tick(False, 1, 2, 4.0) == "queue"
+
+
+def test_the_queue_goes_out_anyway_if_the_socket_never_comes_back():
+    """Waiting forever is worse than trying the socket we have."""
+    policy = NextGamePolicy(queue_delay=0.0, settle_delay=0.0,
+                            reopen_timeout=30.0)
+    assert policy.tick(True, 1, 1, 0.0) is None
+    assert policy.tick(True, 1, 1, 1.0) == "continue"
+    assert policy.tick(True, 1, 1, 2.0) == "reload"
+    assert policy.tick(True, 1, 1, 20.0) is None, "still hoping"
+    assert policy.tick(True, 1, 1, 33.0) == "queue"
+
+
+def test_a_queue_that_started_no_game_is_sent_again():
+    """The queue frame is fire-and-forget, so the retry is the only check."""
+    policy = NextGamePolicy(queue_delay=0.0, settle_delay=0.0,
+                            start_timeout=60.0, attempts=2)
+    assert policy.tick(True, 1, 1, 0.0) is None
+    assert policy.tick(True, 1, 1, 1.0) == "continue"
+    assert policy.tick(True, 1, 2, 2.0) == "reload"
+    assert policy.tick(True, 1, 3, 3.0) is None, "the socket is back"
+    assert policy.tick(True, 1, 3, 4.0) == "queue"
+
+    assert policy.tick(True, 1, 3, 30.0) is None, "give the server a minute"
+    assert policy.tick(True, 1, 3, 70.0) is None, "round again, from continue"
+    assert policy.tick(True, 1, 3, 71.0) == "reload"
+    assert policy.tick(True, 1, 4, 72.0) is None
+    assert policy.tick(True, 1, 4, 73.0) == "queue"
+
+    # Out of tries: stop rather than hammer the lobby forever.
+    assert policy.tick(True, 1, 4, 140.0) == "stop"
+
+
+def test_each_step_of_the_next_game_happens_once():
     """A win arrives as a log entry, and log entries repeat across frames."""
-    policy = NextGamePolicy(queue_delay=0.0)
-    assert policy.tick(True, 1, 0.0) is None
-    assert policy.tick(True, 1, 1.0) == "queue"
-    assert [policy.tick(True, 1, t) for t in (2.0, 3.0, 4.0)] == [None] * 3
+    policy = NextGamePolicy(queue_delay=0.0, settle_delay=0.0)
+    assert policy.tick(True, 1, 1, 0.0) is None
+    assert policy.tick(True, 1, 1, 1.0) == "continue"
+    assert policy.tick(True, 1, 1, 2.0) == "reload"
+    assert policy.tick(True, 1, 2, 3.0) is None
+    assert policy.tick(True, 1, 2, 4.0) == "queue"
+    assert [policy.tick(True, 1, 2, t) for t in (5.0, 6.0, 7.0)] == [None] * 3
 
 
-def test_the_game_cap_stops_the_session_instead_of_queueing():
+def test_the_next_game_resets_the_policy():
+    """The game *count*, not the decoder, is what says play has resumed."""
+    policy = NextGamePolicy(queue_delay=0.0, settle_delay=0.0)
+    for now, sockets in ((0.0, 1), (1.0, 1), (2.0, 1), (3.0, 2), (4.0, 2)):
+        policy.tick(True, 1, sockets, now)
+    assert policy.stage == "queued"
+
+    assert policy.tick(True, 2, 2, 10.0) is None, "game two is under way"
+    assert policy.stage == "playing"
+    assert policy.tick(True, 2, 2, 20.0) is None
+    assert policy.tick(True, 2, 2, 21.0) == "continue", "and it can end too"
+
+
+def test_the_game_cap_stops_the_session_without_pressing_continue():
+    """At the cap there is no next game to reach, so the end screen stays up."""
     policy = NextGamePolicy(queue_delay=0.0, max_games=2)
-    assert policy.tick(True, 1, 0.0) is None
-    assert policy.tick(True, 1, 1.0) == "queue", "one game in, keep going"
+    assert policy.tick(True, 1, 1, 0.0) is None
+    assert policy.tick(True, 1, 1, 1.0) == "continue", "one game in, keep going"
 
-    # The next game starts, and finishing it reaches the cap.
-    assert policy.tick(False, 2, 2.0) is None
-    assert policy.tick(True, 2, 3.0) is None
-    assert policy.tick(True, 2, 4.0) == "stop"
+    assert policy.tick(False, 2, 2, 2.0) is None
+    assert policy.tick(True, 2, 2, 3.0) is None
+    assert policy.tick(True, 2, 2, 4.0) == "stop"
+
+
+def test_year_of_plenty_comes_back_in_the_engine_s_own_order():
+    """A live game died at turn 96 on ('ORE', 'WHEAT') vs ('WHEAT', 'ORE').
+
+    The two cards are a set, but ``year_of_plenty_possibilities`` enumerates
+    the pair as ``(RESOURCES[i], RESOURCES[j])`` with ``i <= j``, so any other
+    order matches no legal action and the replay calls a legal card a desync.
+    """
+    from catanatron.models.enums import RESOURCES
+    from catanatron.models.actions import year_of_plenty_possibilities
+
+    colors = {1: Color.BLUE, 2: Color.RED}
+    decoder = protocol._ActionDecoder(
+        protocol.CoordinateMap({}, {}, {}, {}), colors, Color.RED)
+    decoder.pending_dev_card = protocol.DEV_YEAR_OF_PLENTY
+    decoder._year_of_plenty({"playerColor": 1, "cardEnums": [5, 4]}, {})
+
+    action = decoder.actions[-1]
+    assert action.value == ("WHEAT", "ORE"), action.value
+    offered = {a.value for a in
+               year_of_plenty_possibilities(Color.BLUE, [19] * len(RESOURCES))}
+    assert action.value in offered
+
+
+def test_a_reload_forgets_the_connection_counter():
+    """A new socket starts its sequence over; carrying ours across is a gap."""
+    codec = sender.FrameCodec()
+    codec.bootstrap("074C1C")
+    codec.build(6, True)
+    assert codec.ready
+    codec.reset()
+    assert not codec.ready, "nothing is known about a connection not yet seen"
 
 
 def test_the_codec_will_not_speak_before_it_has_listened():
@@ -1255,6 +1359,7 @@ def test_a_mid_game_resync_does_not_restart_the_reconstruction():
     if not resynced:
         pytest.skip("no capture contains a resync")
 
+    exercised = []
     for path in resynced:
         decoder = protocol.MessageDecoder()
         for record in protocol.iter_colonist_frames(path):
@@ -1271,8 +1376,14 @@ def test_a_mid_game_resync_does_not_restart_the_reconstruction():
         # property of the capture.
         games = _games_announced(path) or 1
         assert decoder.game_id == games, f"{path.name} restarted mid-session"
-        if _full_states(path) > games:
-            assert decoder.resyncs >= 1, path.name
+        exercised.append(decoder.resyncs)
+
+    # Per file the extra full states are not a count of resyncs: a session that
+    # reloads its way to the next game carries a full state belonging to no
+    # game at all, and a decode can stop early on a message we cannot read.
+    # Across the corpus at least one resync has to have been walked, or this
+    # test asserts nothing.
+    assert any(exercised), "no capture exercised a resync"
 
 
 def _games_announced(path):
