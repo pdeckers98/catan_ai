@@ -73,7 +73,7 @@ from src.agent.elo import Ladder, elo_delta
 from src.agent import pool as opponent_pool
 from src.env.catan_env import (
     MAX_TURNS, make_1v1_env, valid_action_mask, TurnLimitWrapper,
-    EpisodeStatsWrapper, PotentialShapingWrapper,
+    EpisodeStatsWrapper, PotentialShapingWrapper, SettlementBonusWrapper,
 )
 from src.env import ruleset
 
@@ -218,7 +218,7 @@ def _opponent_opens_with_scorer(enemy) -> bool:
 def make_vec_env(num_envs: int, enemy=None, enemies=None,
                  placement_model=None, lookahead: bool = False,
                  bundle_model=None, shaping_weight: float = 0.0,
-                 gamma: float = 0.999):
+                 gamma: float = 0.999, settlement_bonus: float = 0.0):
     """Create a vectorized environment with num_envs parallel games.
 
     Args:
@@ -248,6 +248,10 @@ def make_vec_env(num_envs: int, enemy=None, enemies=None,
         gamma: the trainer's discount. Only read when ``shaping_weight`` is
             non-zero, and it must match ``--gamma`` or the shaping stops
             telescoping and stops being policy-invariant.
+        settlement_bonus: flat reward per settlement built past the opening
+            (:class:`~src.env.catan_env.SettlementBonusWrapper`). Unlike
+            ``shaping_weight`` this is **not** policy-invariant -- it is meant
+            to move the optimum toward expanding. Zero by default.
 
     Returns:
         SubprocVecEnv with num_envs workers.
@@ -291,6 +295,8 @@ def make_vec_env(num_envs: int, enemy=None, enemies=None,
             )
             if shaping_weight:
                 env = PotentialShapingWrapper(env, shaping_weight, gamma)
+            if settlement_bonus:
+                env = SettlementBonusWrapper(env, settlement_bonus)
             return EpisodeStatsWrapper(env)
         return _init
 
@@ -460,6 +466,16 @@ def main():
                              "Defaults to the W&B run name.")
     parser.add_argument("--seed", type=int, default=None,
                         help="RNG seed. Omit to pick one randomly.")
+    parser.add_argument("--settlement-bonus", type=float, default=0.0,
+                        help="Flat reward per settlement built past the opening, "
+                             "capped at 3 a game. 0 (the default) is the sparse "
+                             "reward. This is NOT policy-invariant -- unlike "
+                             "--shaping-weight it deliberately moves the optimum "
+                             "toward expanding, which is what the VP-differential "
+                             "potential could not do (Longest Road makes that "
+                             "potential pay +2 for a road spree). Benchmark any "
+                             "run using it WITH search on. See "
+                             "src.env.catan_env.SettlementBonusWrapper.")
     parser.add_argument("--shaping-weight", type=float, default=0.0,
                         help="Potential-based reward shaping on the victory-point "
                              "differential, in units of the terminal +/-1 reward "
@@ -663,6 +679,7 @@ def main():
             "gamma": args.gamma,
             "ent_coef": args.ent_coef,
             "shaping_weight": args.shaping_weight,
+            "settlement_bonus": args.settlement_bonus,
             **ruleset.as_config(),
             "placement_model": args.placement_model,
             "bundle_model": args.bundle_model,
@@ -718,6 +735,7 @@ def main():
             placement_model=args.placement_model, lookahead=args.lookahead,
             bundle_model=args.bundle_model,
             shaping_weight=args.shaping_weight, gamma=args.gamma,
+            settlement_bonus=args.settlement_bonus,
         )
     else:
         env = make_vec_env(
@@ -725,6 +743,7 @@ def main():
             placement_model=args.placement_model, lookahead=args.lookahead,
             bundle_model=args.bundle_model,
             shaping_weight=args.shaping_weight, gamma=args.gamma,
+            settlement_bonus=args.settlement_bonus,
         )
 
     if args.resume:
@@ -896,6 +915,7 @@ def main():
                     placement_model=args.placement_model,
                     lookahead=args.lookahead, bundle_model=args.bundle_model,
                     shaping_weight=args.shaping_weight, gamma=args.gamma,
+                    settlement_bonus=args.settlement_bonus,
                 )
             else:
                 opponent = sample_opponent(checkpoint_dir)
@@ -905,6 +925,7 @@ def main():
                     placement_model=args.placement_model,
                     lookahead=args.lookahead, bundle_model=args.bundle_model,
                     shaping_weight=args.shaping_weight, gamma=args.gamma,
+                    settlement_bonus=args.settlement_bonus,
                 )
             model.set_env(new_env)
             # The old vector env owns ``num_envs`` live subprocesses. Rebinding

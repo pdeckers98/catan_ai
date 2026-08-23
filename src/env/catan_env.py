@@ -244,6 +244,93 @@ class PotentialShapingWrapper(Wrapper):
         return obs, reward + shaping, terminated, truncated, info
 
 
+class SettlementBonusWrapper(Wrapper):
+    """A flat bonus each time the agent builds a settlement past the opening.
+
+    **This is not potential-based and it is not policy-invariant.** That is the
+    point: :class:`PotentialShapingWrapper` telescopes to a constant and
+    therefore *cannot* make the agent prefer settlements, only learn the same
+    preference sooner. This wrapper deliberately moves the optimum, which makes
+    it a close relative of the deleted ``RewardShapingWrapper`` and subject to
+    the same suspicion. It exists to answer one question the VP-differential
+    potential could not.
+
+    Why the VP potential could not. Its ``Phi`` is the victory-point
+    differential, and at this project's ruleset Longest Road is worth **+2 VP**
+    -- so that potential pays *twice as much* for a road spree that takes the
+    award as for a settlement. A settlement-specific term has no such hole.
+    Live games show the behaviour it targets: 7 roads built and 0 settlements
+    across 28 turns, with every road costing a brick a settlement also needed.
+
+    Three deliberate limits, because a flat bonus can be gamed in a way a
+    potential cannot:
+
+    - **Settlements only, never cities.** A city bonus would re-import the
+      blind spot above -- cities are already the agent's preferred spend.
+    - **Capped at ``max_bonuses``.** Buildings cap at 5 settlements and 2 are
+      placed in the opening, so 3 is every settlement the agent can ever build
+      by its own choice. Without the cap the bonus would also pay for
+      settlements rebuilt after an upgrade returns the piece.
+    - **The opening is excluded for free.** Under ``PlacementWrapper`` the
+      opening is played inside ``reset()``, so those settlements never pass
+      through ``step()``. The cap makes that robust rather than incidental.
+
+    A run using this **must be benchmarked with search on**. The critic learns a
+    value inflated by expected future bonuses while ``src.agent.mcts`` evaluates
+    leaves in the unshaped game; the last reward change to skip that check read
+    50.3% bare and 42.2% under search.
+
+    Place it INSIDE :class:`EpisodeStatsWrapper` and OUTSIDE
+    :class:`TurnLimitWrapper`, matching :class:`PotentialShapingWrapper`.
+
+    Args:
+        env: the base environment.
+        bonus: reward added per settlement, in units of the terminal +/-1.
+        max_bonuses: how many settlements may be paid for in one episode.
+        agent_color: whose settlements count.
+    """
+
+    def __init__(self, env, bonus: float, max_bonuses: int = 3,
+                 agent_color=Color.BLUE):
+        super().__init__(env)
+        self.bonus = bonus
+        self.max_bonuses = max_bonuses
+        self.agent_color = agent_color
+        self._paid = 0
+        self._prev_settlements_avail = 5
+
+    def _settlements_available(self) -> int:
+        state = self.env.unwrapped.game.state
+        key = f"P{state.color_to_index[self.agent_color]}"
+        return state.player_state[f"{key}_SETTLEMENTS_AVAILABLE"]
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._paid = 0
+        self._prev_settlements_avail = self._settlements_available()
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        # The piece pool falling is what a build looks like from here. An
+        # upgrade to a city *returns* the piece, so the pool rises again and a
+        # rebuilt settlement would otherwise be paid for twice; the cap is what
+        # stops that, not this counter.
+        avail = self._settlements_available()
+        if avail < self._prev_settlements_avail:
+            built = self._prev_settlements_avail - avail
+            payable = max(0, min(built, self.max_bonuses - self._paid))
+            if payable:
+                reward += self.bonus * payable
+                self._paid += payable
+        self._prev_settlements_avail = avail
+
+        if terminated or truncated:
+            info["settlement_bonus_paid"] = self._paid * self.bonus
+        return obs, reward, terminated, truncated, info
+
+
 class EpisodeStatsWrapper(Wrapper):
     """Record end-of-episode VP and build counts in ``info``. Reward untouched.
 
