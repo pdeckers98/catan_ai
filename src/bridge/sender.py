@@ -68,6 +68,48 @@ ROOM_GAME = 3
 #: the client has not yet demonstrated.
 GAME_CHANNEL = 1
 
+#: The lobby's matchmaking sub-channel. A lobby room uses several channel bytes
+#: for different concerns -- 7 for session and notifications, 2 and 11 for
+#: settings -- and matchmaking is 4. Read straight off the frame the client
+#: sends when a queue button is clicked: ``02 04 05 "lobby"``.
+LOBBY_MATCH_CHANNEL = 4
+
+#: The ``clientVersion`` colonist's own queue frame carries. The server has
+#: accepted only this value here; if a colonist update rejects the frame, this
+#: is the first thing to re-read off a fresh capture.
+CLIENT_VERSION = 318
+
+#: ``matchType`` by name, each one observed in a capture of that button being
+#: clicked. Anything not listed can still be queued by number.
+MATCH_TYPES = {"ranked": 15, "casual": 13}
+
+
+def match_frame(match_type: int, client_version: int = CLIENT_VERSION) -> bytes:
+    """The frame colonist's client sends to join a matchmaking queue.
+
+    This is how a session starts its *next* game without a human clicking. It
+    is addressed to the lobby, not to the game room, and carries **no
+    sequence** -- the per-connection counter the game room shares is untouched,
+    so queueing cannot fork it the way an in-game click does.
+    """
+    header = RoutingHeader(ROOM_LOBBY, LOBBY_MATCH_CHANNEL, "lobby")
+    return encode_frame(header, 1,
+                        {"clientVersion": client_version, "matchType": match_type})
+
+
+def resolve_match_type(name: str) -> int:
+    """``"ranked"``, ``"casual"`` or a raw number -> a ``matchType``."""
+    key = str(name).strip().lower()
+    if key in MATCH_TYPES:
+        return MATCH_TYPES[key]
+    try:
+        return int(key)
+    except ValueError:
+        raise SendError(
+            f"unknown match type {name!r}; try one of "
+            f"{sorted(MATCH_TYPES)} or a number"
+        ) from None
+
 
 class SendError(RuntimeError):
     """A frame could not be built, or the page would not put it on the wire."""
@@ -202,6 +244,21 @@ class FrameCodec:
             # -- proven live, when ours and the client's both used 21 and both
             # were accepted. Starting from zero is therefore safe.
             self.last_sequence = 0
+
+    def rebind(self, room: str) -> bool:
+        """Point at a new game room, keeping the connection's sequence counter.
+
+        A session that queues its own next game outlives the room it learned,
+        and a frame addressed to a finished game is silently dropped -- the
+        failure looks like the agent going quiet, not like an error. Returns
+        True when the room actually changed.
+        """
+        if self.header is not None and self.header.room == room:
+            return False
+        self.header = RoutingHeader(ROOM_GAME, GAME_CHANNEL, room)
+        if self.last_sequence is None:
+            self.last_sequence = 0
+        return True
 
     @property
     def ready(self) -> bool:
@@ -365,6 +422,11 @@ class PageSender:
             raise SendError(f"unknown probe {name!r}; try one of {sorted(PROBE_ACTIONS)}")
         action, payload = PROBE_ACTIONS[name]
         return self.send(action, payload)
+
+    def queue_match(self, match_type: int,
+                    client_version: int = CLIENT_VERSION) -> dict:
+        """Join a matchmaking queue. Needs no codec -- the lobby is stateless."""
+        return self.send_frame(match_frame(match_type, client_version))
 
     def send_raw(self, action: int, payload_json: str) -> dict:
         """Send an arbitrary action, payload given as JSON. For hand testing."""

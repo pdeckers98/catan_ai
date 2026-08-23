@@ -34,7 +34,8 @@ from src.bridge.capture import decode_payload, message_type, shape
 from src.bridge.player import build_bridge_player
 from src.bridge.replay import DesyncError, GameReplay, blank_outcome
 from src.bridge.session import (
-    DryRun, LiveGame, LobbyMismatch, determinize_purchases, draw_card,
+    DryRun, LiveGame, LobbyMismatch, NextGamePolicy, determinize_purchases,
+    draw_card,
 )
 from src.env.catan_env import make_1v1_game
 
@@ -722,6 +723,94 @@ def test_the_codec_learns_its_routing_by_watching_the_client():
     assert codec.last_sequence and codec.last_sequence > 0
 
 
+def queue_frames():
+    """Every matchmaking frame our own client sent, across all local captures."""
+    return [f for f in client_frames()
+            if isinstance(f.get("payload"), dict)
+            and isinstance(f["payload"].get("payload"), dict)
+            and "matchType" in f["payload"]["payload"]]
+
+
+@pytest.mark.skipif(not queue_frames(), reason="no queue click recorded locally")
+def test_the_queue_frame_is_byte_identical_to_the_client_s_own():
+    """"Next game" is a frame like any other, and this is the proof.
+
+    The in-game round-trip above says nothing about the lobby: it is a
+    different room kind, a different channel, and carries no sequence. This
+    checks the one lobby frame we actually synthesize against the bytes the
+    page produced when the button was clicked.
+    """
+    for entry in queue_frames():
+        observed = entry["payload"]["payload"]
+        rebuilt = sender.match_frame(observed["matchType"],
+                                     observed["clientVersion"])
+        assert rebuilt == base64.b64decode(entry["raw"]), observed
+
+
+def test_match_types_resolve_by_name_or_by_number():
+    assert sender.resolve_match_type("ranked") == 15
+    assert sender.resolve_match_type("CASUAL") == 13
+    assert sender.resolve_match_type("42") == 42
+    with pytest.raises(sender.SendError, match="unknown match type"):
+        sender.resolve_match_type("blitz")
+
+
+def test_the_queue_frame_carries_no_sequence():
+    """The lobby is not the game room, and must not touch its counter.
+
+    One counter per *connection* is the rule the whole codec is built around;
+    a queue frame that claimed a number would fork it exactly the way a human
+    click does.
+    """
+    msgpack = pytest.importorskip("msgpack")
+    body = msgpack.unpackb(sender.match_frame(15)[8:], raw=False)
+    assert "sequence" not in body
+    assert body == {"action": 1,
+                    "payload": {"clientVersion": sender.CLIENT_VERSION,
+                                "matchType": 15}}
+
+
+def test_rebinding_follows_the_new_room_and_keeps_the_counter():
+    """A session that queues its own next game outlives the room it learned."""
+    codec = sender.FrameCodec()
+    codec.bootstrap("074C1C")
+    codec.build(sender.SEND_ROLL, True)
+    before = codec.last_sequence
+
+    assert codec.rebind("074C1C") is False, "same room is not a change"
+    assert codec.rebind("0A1B2C") is True
+    assert codec.header is not None and codec.header.room == "0A1B2C"
+    assert codec.last_sequence == before, "the counter is per connection"
+
+
+def test_the_next_game_waits_out_the_end_screen_then_queues():
+    policy = NextGamePolicy(queue_delay=8.0)
+
+    assert policy.tick(False, 1, 100.0) is None, "a live game is not a decision"
+    assert policy.tick(True, 1, 200.0) is None, "the clock starts, nothing else"
+    assert policy.tick(True, 1, 205.0) is None, "still inside the delay"
+    assert policy.tick(True, 1, 208.0) == "queue"
+
+
+def test_the_next_game_is_queued_once_however_often_the_win_is_repeated():
+    """A win arrives as a log entry, and log entries repeat across frames."""
+    policy = NextGamePolicy(queue_delay=0.0)
+    assert policy.tick(True, 1, 0.0) is None
+    assert policy.tick(True, 1, 1.0) == "queue"
+    assert [policy.tick(True, 1, t) for t in (2.0, 3.0, 4.0)] == [None] * 3
+
+
+def test_the_game_cap_stops_the_session_instead_of_queueing():
+    policy = NextGamePolicy(queue_delay=0.0, max_games=2)
+    assert policy.tick(True, 1, 0.0) is None
+    assert policy.tick(True, 1, 1.0) == "queue", "one game in, keep going"
+
+    # The next game starts, and finishing it reaches the cap.
+    assert policy.tick(False, 2, 2.0) is None
+    assert policy.tick(True, 2, 3.0) is None
+    assert policy.tick(True, 2, 4.0) == "stop"
+
+
 def test_the_codec_will_not_speak_before_it_has_listened():
     """A guessed header would route a move nowhere, silently."""
     with pytest.raises(sender.SendError, match="no game frame observed"):
@@ -1175,8 +1264,38 @@ def test_a_mid_game_resync_does_not_restart_the_reconstruction():
                     decoder.feed(*message)
                 except protocol.ProtocolError:
                     break
-        assert decoder.game_id == 1, f"{path.name} restarted mid-session"
-        assert decoder.resyncs >= 1, path.name
+        # Ground truth for "how many games" comes from the server, not from
+        # the decoder being asked to check itself: colonist stamps a fresh
+        # databaseGameId on each one. A session is no longer one game --
+        # --auto-queue plays several on one connection -- so the count is a
+        # property of the capture.
+        games = _games_announced(path) or 1
+        assert decoder.game_id == games, f"{path.name} restarted mid-session"
+        if _full_states(path) > games:
+            assert decoder.resyncs >= 1, path.name
+
+
+def _games_announced(path):
+    """Distinct ``databaseGameId``s the server named in this capture."""
+    seen = set()
+
+    def walk(value):
+        if isinstance(value, dict):
+            game = value.get("databaseGameId")
+            if isinstance(game, (str, int)):
+                seen.add(str(game))
+            for nested in value.values():
+                walk(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                walk(nested)
+
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            entry = json.loads(line)
+            if entry.get("kind") == "frame" and entry.get("dir") == "recv":
+                walk(entry.get("payload"))
+    return len(seen)
 
 
 def _full_states(path):

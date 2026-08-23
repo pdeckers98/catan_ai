@@ -555,6 +555,10 @@ class DryRun:
         self.decisions = 0
         self.agreements = 0
         self.comparable = 0
+        #: Games the server has started on this connection. A session can now
+        #: outlive one game, so "how many" is a property of the run, not a
+        #: constant, and it is what ``--max-games`` bounds.
+        self.games = 0
         self._pending: Optional[Action] = None  # our move, awaiting the real one
         self._asked_at = -1
         #: The error that stopped the reconstruction, or ``None``. Once set, the
@@ -612,7 +616,9 @@ class DryRun:
             self.player = self._build_player(self.live.our_color)
             self._pending = None
             self._asked_at = -1
-            print(f"game started: we are {self.live.our_color.value}, "
+            self.games += 1
+            print(f"game {self.games} started: we are "
+                  f"{self.live.our_color.value}, "
                   f"seats {[c.value for c in self.live.decoder.seating]}")
         if progress.repaired:
             print(f"  [repair] redrew the opponent's unseen cards "
@@ -930,6 +936,8 @@ send console -- rung 2's first question, asked by hand.
   roll            send action 2 (roll dice)
   end             send action 6 (end turn)
   send <n> <json> send action <n> with a JSON payload, e.g. `send 12 53`
+  queue [what]    join a matchmaking queue: `queue ranked`, `queue casual`,
+                  or a raw matchType number. This is the "next game" button.
   status          what the codec has learned from the client so far
   help            this
   (blank line)    nothing
@@ -974,6 +982,40 @@ def _file_reader(path: Path, queue: "Queue[str]") -> None:
         time.sleep(0.5)
 
 
+@dataclass
+class NextGamePolicy:
+    """When a finished game becomes another one, or the last one.
+
+    Split out of the live loop because the loop needs a browser and this needs
+    only a clock. The rule: once *the server* says the game is over, wait out
+    the end-of-game screen, then either queue the next game or stop. It fires
+    at most once per game, so a win message repeated across frames cannot
+    queue twice.
+    """
+
+    queue_delay: float = 8.0
+    max_games: Optional[int] = None
+    finished_at: Optional[float] = None
+    fired: bool = False
+
+    def tick(self, over: bool, games: int, now: float) -> Optional[str]:
+        """``"queue"``, ``"stop"`` or ``None`` -- nothing to do yet."""
+        if not over:
+            self.finished_at, self.fired = None, False
+            return None
+        if self.fired:
+            return None
+        if self.finished_at is None:
+            self.finished_at = now
+            return None
+        if now - self.finished_at < self.queue_delay:
+            return None
+        self.fired = True
+        if self.max_games is not None and games >= self.max_games:
+            return "stop"
+        return "queue"
+
+
 def _run_command(command: str, page_sender: "sender.PageSender") -> None:
     """Execute one console line. Never raises: a typo must not end the game."""
     parts = command.split(maxsplit=2)
@@ -990,6 +1032,11 @@ def _run_command(command: str, page_sender: "sender.PageSender") -> None:
         elif verb == "send" and len(parts) >= 2:
             payload = parts[2] if len(parts) > 2 else "true"
             print(f"  -> {page_sender.send_raw(int(parts[1]), payload)}")
+        elif verb == "queue":
+            match_type = sender.resolve_match_type(parts[1] if len(parts) > 1
+                                                   else "ranked")
+            print(f"  -> queued matchType {match_type}: "
+                  f"{page_sender.queue_match(match_type)}")
         else:
             print(f"  ? {command!r} -- type `help`")
     except (sender.SendError, ValueError) as exc:
@@ -998,7 +1045,10 @@ def _run_command(command: str, page_sender: "sender.PageSender") -> None:
 
 def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
              allow_send: bool = False, send_file: Optional[Path] = None,
-             auto_play: bool = False, send_delay: float = 0.0) -> None:
+             auto_play: bool = False, send_delay: float = 0.0,
+             auto_queue: Optional[int] = None,
+             queue_delay: float = 8.0,
+             max_games: Optional[int] = None) -> None:
     """Attach to a browser you drive by hand and follow the game in real time.
 
     The same CDP plumbing :mod:`src.bridge.capture` uses, writing a capture in
@@ -1017,6 +1067,18 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
     a synthesized frame at all -- and it is answered. Commands arrive on stdin,
     or, when the session was started detached and stdin is not a keyboard, by
     appending a line to ``send_file``.
+
+    ``auto_queue`` closes the loop over more than one game: when the board
+    finishes, the session sends colonist's own matchmaking frame and plays
+    whatever it is matched into. The frame is the lobby's, not the game room's
+    -- see :func:`~src.bridge.sender.match_frame` -- and the routing header is
+    re-bound to the new room when the server announces it, because a frame
+    addressed to a finished game is dropped in silence.
+
+    ``max_games`` ends the session once that many games have started and the
+    last of them has finished. It is the stop on an otherwise unbounded loop,
+    and it bounds a hand-clicked session too -- the count is of games the
+    *server* started, not of queues we sent.
 
     ``auto_play`` is the rung after: the agent sends its own decisions and the
     game plays itself. The console stays available on top of it, which is the
@@ -1080,14 +1142,14 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
                             "   frame after. Ours is re-synced to the page's; "
                             "avoid clicking.\n", file=sys.stderr)
                     return
-                if not codec.ready:
-                    # A game the agent plays start to finish has no human
-                    # clicking, so the client may never send a frame to copy.
-                    # The server names the room itself when it starts the game.
-                    room = sender.room_from_server_frame(entry.get("payload"))
-                    if room:
-                        codec.bootstrap(room)
-                        print(f"  routing: game room {room!r}")
+                # A game the agent plays start to finish has no human
+                # clicking, so the client may never send a frame to copy. The
+                # server names the room itself when it starts the game -- and
+                # names the *next* one the same way, which is what lets a
+                # queued rematch be routed without a click either.
+                room = sender.room_from_server_frame(entry.get("payload"))
+                if room and codec.rebind(room):
+                    print(f"  routing: game room {room!r}")
                 if "colonist" not in sockets.get(event.get("requestId"), ""):
                     return
                 try:
@@ -1130,13 +1192,33 @@ def run_live(dry: DryRun, url: str, channel: str, record_to: Optional[Path],
                                  daemon=True).start()
                 print(f"send channel: append a command to {send_file}")
             print(SEND_HELP)
+        if auto_queue is not None and page_sender is not None:
+            print(f"AUTO-QUEUE ARMED: matchType {auto_queue}, "
+                  f"{queue_delay:.0f}s after each game ends.")
+        if max_games is not None:
+            print(f"stopping after {max_games} game(s).")
         print("watching. play a game by hand; close the window when done.")
+        policy = NextGamePolicy(queue_delay=queue_delay, max_games=max_games)
         try:
             while context.pages and not context.pages[0].is_closed():
                 context.pages[0].wait_for_timeout(500)
                 # Drained here rather than on the reader thread: Playwright's
                 # sync API belongs to the thread that created the browser.
                 dry.check_stall()
+                decision = policy.tick(
+                    dry.live.decoder.game_over and dry.broken is None,
+                    dry.games, time.time())
+                if decision == "stop":
+                    print(f"  {dry.games} game(s) played; stopping.")
+                    break
+                if (decision == "queue" and auto_queue is not None
+                        and page_sender is not None):
+                    try:
+                        page_sender.queue_match(auto_queue)
+                        print(f"  queued game {dry.games + 1} "
+                              f"(matchType {auto_queue})")
+                    except sender.SendError as exc:
+                        print(f"  !! could not queue: {exc}")
                 while page_sender is not None and not commands.empty():
                     command = commands.get()
                     if command:
@@ -1181,6 +1263,17 @@ def main() -> int:
                              "--allow-send. Throwaway account, supervised.")
     parser.add_argument("--send-delay", type=float, default=1.5,
                         help="seconds to pause before each move (default 1.5)")
+    parser.add_argument("--auto-queue", metavar="WHAT",
+                        help="when a game ends, join a queue for the next one "
+                             "instead of waiting for a click: 'ranked', "
+                             "'casual', or a raw colonist matchType number")
+    parser.add_argument("--queue-delay", type=float, default=8.0,
+                        help="seconds to wait after a game ends before queueing "
+                             "the next (default 8)")
+    parser.add_argument("--max-games", type=int, metavar="N",
+                        help="end the session once N games have been played. "
+                             "The stop on --auto-queue's otherwise unbounded "
+                             "loop; counts games the server started")
     # Declared so --help lists them; they were already read at import time by
     # ruleset.apply_cli_overrides(), which has to run above the engine imports.
     parser.add_argument("--vps-to-win", type=int)
@@ -1201,9 +1294,12 @@ def main() -> int:
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
             record_to = CAPTURE_DIR / f"dryrun-{stamp}.jsonl"
             print(f"recording to {record_to}")
+        auto_queue = (sender.resolve_match_type(args.auto_queue)
+                      if args.auto_queue else None)
         run_live(dry, args.url, args.channel, record_to,
                  args.allow_send or args.auto_play, args.send_file,
-                 args.auto_play, args.send_delay)
+                 args.auto_play, args.send_delay, auto_queue,
+                 args.queue_delay, args.max_games)
 
     print(dry.summary())
     return 1 if dry.broken is not None else 0
