@@ -29,9 +29,11 @@ The VP target, the Longest Road award and the turn cap are **per-run**, selected
 `src/env/ruleset.py` (`--vps-to-win` / `--longest-road` / `--max-turns`, or the matching `CATAN_*`
 environment variables). Defaults reproduce the historical setup: 8 VP, no Longest Road, 1000 turns.
 
-**Why 15 VP is a different game.** Buildings cap at **9 VP** — 5 settlements, 4 of them upgraded to
-cities. So 12 VP is unreachable without Largest Army or Longest Road, and 15 is unreachable without
-VP cards on top. Road-building stops being the pathology the old 8-VP rules made it and becomes
+**Why 15 VP is a different game.** Buildings cap at **13 VP** — the piece limits are 5 settlements
+*and* 4 cities, and upgrading returns the settlement piece to the supply, so a maxed-out player
+holds 9 buildings at once (5x1 + 4x2). In practice nothing here comes close — the agent builds ~3
+settlements and ~3.5 cities — so 12 and 15 VP are still games about Longest Road, Largest Army and
+VP cards. Road-building stops being the pathology the old 8-VP rules made it and becomes
 mandatory. Raise `--max-turns` to 1500 at 15 VP: the default 1000 is already binding there, and a
 truncated episode pays 0, so capped games teach nothing. Raise `--gamma` too — games run ~2.4x
 longer at 15 VP than at 8 (median 417 turns vs 172, over 30 WeightedRandom mirror games).

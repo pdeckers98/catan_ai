@@ -34,7 +34,7 @@ the agent and, later, the web integration.
   it was always the value head, and that argument is still open. Don't rebuild it casually.
 - **The nodev curriculum, and what it did and did not buy** (2026-08-23). The current agent was
   not fine-tuned from a 15 VP model; it came up a ladder with **development cards switched off**:
-  9 VP no-LR -> 11 VP with LR (the ceiling without cards) -> 15 VP with cards on. Two findings.
+  9 VP no-LR -> 11 VP with LR -> 15 VP with cards on. Two findings.
   **The card mechanic transfers essentially for free**: one 150k-step interval against greedy took
   a 5.2M-step nodev policy — whose dev-card logits had *never received a gradient*, still at
   random init — to 96% vs greedy with 4.6 knights a game. Budget ~10 minutes for that rung, not an
@@ -76,7 +76,7 @@ the agent and, later, the web integration.
      when the deck is empty, so no card action is ever legal and Largest Army is
      unreachable. **The action space is unchanged**, so a model trained with dev
      cards still loads. Its purpose is a curriculum rung: without cards the
-     reachable ceiling is **11 VP** (9 from buildings, 2 from Longest Road), and
+     reachable ceiling is **15 VP** (13 from buildings, 2 from Longest Road), and
      an agent has to learn expansion there rather than papering over it with the
      card economy. See the nodev ladder in `checkpoints/archive/`.
 - **Opening placement**: a separate self-trained specialist (`src/placement/`). Initial settlement
@@ -218,10 +218,13 @@ mechanism `determinism.py` uses for `PYTHONHASHSEED`. Entry points call
 so a run can never quietly train under the wrong rules. This is why `.flake8` grants E402 to
 `train.py` and `benchmark.py`.
 
-**Why 15 VP is a different game.** Buildings cap at **9 VP** (5 settlements, 4 of them
-upgraded to cities). So 12 VP is unreachable without Largest Army or Longest Road, and 15 is
-unreachable without VP cards on top. Road-building stops being the pathology the old rules
-made it and becomes mandatory.
+**Why 15 VP is a different game.** Buildings cap at **13 VP** — the piece limits are 5
+settlements *and* 4 cities, and upgrading returns the settlement piece to the supply
+(`state_functions.build_city` does `SETTLEMENTS_AVAILABLE += 1`), so a maxed-out player holds
+9 buildings at once: 5x1 + 4x2. In practice nothing here comes close — the agent builds ~3
+settlements and ~3.5 cities — so 12 and 15 VP are still games about Longest Road, Largest Army
+and VP cards. Road-building stops being the pathology the old rules made it and becomes
+mandatory.
 
 **Train the placement scorer**: generate, then fit each target off the same data:
 
@@ -305,7 +308,7 @@ else). **None of these can place their own opening** — see the Caveats below.
 | file | rules | notes |
 | --- | --- | --- |
 | `ppo-15vp-dev-step7550000.zip` | 15 VP, LR, dev | **current agent.** The first archived model trained under rules that match colonist (corrected friendly robber, Road Building while broke). Elo +242; run it with `--agent ppo-mcts --simulations 50` |
-| `ppo-11vp-lr-nodev-best4850000.zip` | 11 VP, LR, **no dev** | its parent, and the tip of the nodev curriculum. 11 VP is the ceiling without cards |
+| `ppo-11vp-lr-nodev-best4850000.zip` | 11 VP, LR, **no dev** | its parent, and the tip of the nodev curriculum. 11 VP was picked as a rung, not a cap — buildings alone reach 13 |
 | `ppo-9vp-nodev-step4400000.zip` | 9 VP, no LR, **no dev** | the rung below that; where the nodev ladder started |
 | `ppo-15vp-lr-step400000.zip` | 15 VP, LR | the previous agent. Fine-tuned from the 12 VP trunk model; trained under the **wrong** friendly-robber rule |
 | `ppo-12vp-trunk-step2000000.zip` | 12 VP, LR | shared trunk, 932k params; the 400k model's parent |
